@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import inspect
 
 from rca_v2.config import APP_MODE
 from rca_v2.ui import render_sidebar, sessions_table_single_select
@@ -17,7 +18,20 @@ from rca_v2.constants import get_evse_display
 
 from rca_v2.admintab import render_admin_tab
 
+
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
+
+# Helper: future‑proof sizing for st.dataframe across Streamlit versions
+# Uses width="stretch" on newer Streamlit; falls back to use_container_width=True on older.
+
+def _df_stretch_kwargs():
+    try:
+        sig = inspect.signature(st.dataframe)
+        if "width" in sig.parameters:
+            return {"width": "stretch"}
+    except Exception:
+        pass
+    return {"use_container_width": True}
 
 with st.sidebar:
     stations, start_utc, end_utc = render_sidebar()
@@ -231,7 +245,7 @@ with t2:
         ]
         final = [c for c in wanted if c in display.columns]
         display = display.sort_values("_ts", ascending=False, kind="mergesort")
-        st.dataframe(display[final], use_container_width=True, hide_index=True)
+        st.dataframe(display[final], hide_index=True, **_df_stretch_kwargs())
 
 with t3:
     st.subheader("Connectivity")
@@ -299,7 +313,7 @@ with t3:
         })
         display = display.assign(__ts=df["_ts"]).sort_values("__ts", ascending=False, kind="mergesort").drop(columns="__ts")
 
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, hide_index=True, **_df_stretch_kwargs())
 
 with t4:
     st.subheader("Data Export")

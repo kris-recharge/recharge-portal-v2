@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, date, time
 from typing import Optional
 from .config import AK_TZ, UTC
 from .constants import EVSE_DISPLAY, display_name, get_all_station_ids
+import inspect
 
 def _round_up_to_hour(dt: datetime) -> datetime:
     base = dt.replace(minute=0, second=0, microsecond=0)
@@ -30,11 +31,23 @@ def _find_logo_path() -> Optional[str]:
             return p
     return None
 
+# Helper: future‑proof sizing for data_editor across Streamlit versions
+def _editor_stretch_kwargs():
+    """Return kwargs for st.data_editor that stretch to container on new Streamlit,
+    and fall back to use_container_width=True on older versions."""
+    try:
+        sig = inspect.signature(st.data_editor)
+        if "width" in sig.parameters:
+            return {"width": "stretch"}
+    except Exception:
+        pass
+    return {"use_container_width": True}
+
 def render_sidebar():
     # Logo
     logo_path = _find_logo_path()
     if logo_path:
-        st.image(logo_path, use_column_width=True)
+        st.image(logo_path, use_container_width=True)
     else:
         st.markdown("### ReCharge Alaska")
 
@@ -145,7 +158,6 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     edited = st.data_editor(
         df[["__sel__"] + show_cols],
         hide_index=True,
-        use_container_width=True,
         column_config={
             "__sel__": st.column_config.CheckboxColumn(
                 " ", help="Select a session to show details below", default=False
@@ -160,6 +172,7 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
         disabled=[c for c in show_cols],
         height=480,
         key="v2_sessions_editor",
+        **_editor_stretch_kwargs(),
     )
 
     # Enforce single-select: take the last True row if multiple are checked
