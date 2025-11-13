@@ -15,11 +15,16 @@ from rca_v2.loaders import (
 from rca_v2.sessions import build_sessions
 from rca_v2.charts import session_detail_figure, heatmap_count, heatmap_duration
 from rca_v2.constants import get_evse_display
+from rca_v2.auth import require_auth
 
 from rca_v2.admintab import render_admin_tab
 
 
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
+
+# Gate the web build behind a simple login (disabled for local runs)
+if APP_MODE != "local":
+    require_auth()
 
 # Helper: future‑proof sizing for st.dataframe across Streamlit versions
 # Uses width="stretch" on newer Streamlit; falls back to use_container_width=True on older.
