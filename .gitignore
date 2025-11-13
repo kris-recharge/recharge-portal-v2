@@ -1,0 +1,12 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+# macOS
+.DS_Store
+# local data
+*.db
+*.sqlite
+# Streamlit
+.streamlit/secrets.toml
