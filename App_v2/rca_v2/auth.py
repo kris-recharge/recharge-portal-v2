@@ -7,6 +7,7 @@ from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
 import requests
+from streamlit.components.v1 import html
 
 # Session keys
 _SESSION_OK = "_auth_ok"
@@ -120,6 +121,40 @@ def _get_query_params() -> Dict[str, str]:
     _dbg("Parsed query params", {"raw": raw_qp, "normalized": out})
     return out
 
+def _promote_hash_token_to_query_from_hash() -> None:
+    """If the auth token arrives in the URL fragment (e.g. #sb=TOKEN),
+    convert it to a query param (?sb=TOKEN) and reload once. This helps
+    avoid loops when the front door uses a hash-based redirect."""
+    # Inject a tiny JS shim; no-op if there is no hash token.
+    js = r"""
+    <script>
+    (function () {
+      try {
+        var h = window.location.hash || "";
+        if (!h) return;
+        var m = h.match(/[#&](sb|access_token|token)=([^&]+)/);
+        if (!m) return;
+        var key = m[1];
+        var val = m[2];
+        var u = new URL(window.location.href);
+        // Only promote if no token already in the query string
+        if (!u.searchParams.get('sb') && !u.searchParams.get('access_token') && !u.searchParams.get('token')) {
+          // Normalize to ?sb=
+          u.searchParams.set('sb', val);
+          u.hash = '';
+          window.location.replace(u.toString());
+        }
+      } catch (e) {
+        // swallow
+      }
+    })();
+    </script>
+    """
+    try:
+      html(js, height=0)
+    except Exception:
+      pass
+
 def _bootstrap_auth_from_query_params() -> Optional[str]:
     """
     Reads ?sb= / ?access_token= / ?token= from the URL, verifies with Supabase,
@@ -203,6 +238,9 @@ def require_auth() -> None:
         st.sidebar.markdown("**Auth Debug:** ON")
     now = int(time.time())
 
+    # Promote hash token (if any) to query string before we attempt to parse
+    _promote_hash_token_to_query_from_hash()
+
     # Existing valid session?
     if st.session_state.get(_SESSION_OK) and st.session_state.get(_SESSION_TS):
         age = now - int(st.session_state[_SESSION_TS])
@@ -240,4 +278,11 @@ def require_auth() -> None:
             "SB_URL": SB_URL,
             "LOGIN_URL": LOGIN_URL,
         })
+
+    # Debug escape: visit with ?noredirect=1 to inspect without bouncing
+    qp = _get_query_params()
+    if str(qp.get("noredirect", "")).lower() in {"1", "true", "yes"}:
+        st.warning("Auth redirect suppressed by ?noredirect=1. You are not signed in.")
+        return
+
     _redirect_to_login()
