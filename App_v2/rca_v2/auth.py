@@ -1,7 +1,9 @@
 import os
 import hmac
 import time
+import json
 from typing import Dict, Optional, Set
+from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
 import requests
@@ -11,6 +13,9 @@ _SESSION_OK = "_auth_ok"
 _SESSION_USER = "_auth_user"
 _SESSION_TS = "_auth_ts"
 _LOGIN_REDIRECT_TS = "_login_redirect_ts"
+
+# Debug flag (turn on in Render env: DEBUG_AUTH=1)
+DEBUG_AUTH = os.getenv("DEBUG_AUTH", os.getenv("PORTAL_DEBUG_AUTH", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 # Default 12 hours, override via env var PORTAL_SESSION_MAX_AGE (seconds)
 _MAX_AGE = int(os.getenv("PORTAL_SESSION_MAX_AGE", "43200"))
@@ -27,10 +32,27 @@ LOGIN_URL = (
     or "https://recharge-portal.onrender.com/login"
 )
 
+def _dbg(msg: str, obj: Optional[object] = None) -> None:
+    if not DEBUG_AUTH:
+        return
+    try:
+        if obj is not None:
+            try:
+                pretty = json.dumps(obj, indent=2, default=str)[:4000]
+            except Exception:
+                pretty = str(obj)[:4000]
+            st.write(f"🔎 {msg}:\n\n```\n{pretty}\n```")
+        else:
+            st.write(f"🔎 {msg}")
+    except Exception:
+        # Best-effort log to console
+        print(f"[AUTH-DEBUG] {msg}: {obj!r}")
+
 def _redirect_to_login() -> None:
     """Hard redirect to the front-door login; guard against tight loops."""
     now = int(time.time())
     last = st.session_state.get(_LOGIN_REDIRECT_TS)
+    _dbg("Redirecting to login", {"login_url": LOGIN_URL, "last_redirect_ts": last})
     if last and (now - int(last) < 8):
         # We just redirected recently → show a button instead of looping
         st.warning("We just tried to send you to the sign-in page. Click below to continue.")
@@ -57,40 +79,45 @@ def _verify_supabase_token_and_get_email(token: str) -> Optional[str]:
     if not token or not SB_URL or not SB_ANON:
         return None
     try:
+        _dbg("Verifying token against Supabase", {"SB_URL": SB_URL, "has_ANON": bool(SB_ANON), "token_preview": (token[:12] + "...") if token else None})
         r = requests.get(
             f"{SB_URL}/auth/v1/user",
             headers={"Authorization": f"Bearer {token}", "apikey": SB_ANON},
             timeout=8,
         )
+        data = r.json() or {}
+        _dbg("Supabase /auth/v1/user response", {"status": r.status_code, "json": data})
         if r.status_code == 200:
-            data = r.json() or {}
             email = (data.get("email") or "").strip().lower()
             return email or None
-    except Exception:
-        pass
+    except Exception as e:
+        _dbg("Token verify exception", str(e))
     return None
 
 def _get_query_params() -> Dict[str, str]:
     """Return URL query params as a simple dict[str, str] across Streamlit versions."""
+    raw_qp = {}
     try:
         if hasattr(st, "query_params"):
-            raw = st.query_params
-            # In modern Streamlit this is a QueryParams proxy with .to_dict()
-            if hasattr(raw, "to_dict"):
-                d = raw.to_dict()
+            qp = st.query_params
+            if hasattr(qp, "to_dict"):
+                raw_qp = qp.to_dict()
             else:
                 try:
-                    d = dict(raw)  # best-effort
+                    raw_qp = dict(qp)
                 except Exception:
-                    d = {}
+                    raw_qp = {}
         else:
-            d = st.experimental_get_query_params() or {}
+            raw_qp = st.experimental_get_query_params() or {}
     except Exception:
-        d = {}
+        raw_qp = {}
 
+    # Normalize to single-value dict
     out: Dict[str, str] = {}
-    for k, v in d.items():
+    for k, v in raw_qp.items():
         out[k] = v[0] if isinstance(v, list) else v
+
+    _dbg("Parsed query params", {"raw": raw_qp, "normalized": out})
     return out
 
 def _bootstrap_auth_from_query_params() -> Optional[str]:
@@ -99,6 +126,7 @@ def _bootstrap_auth_from_query_params() -> Optional[str]:
     stores session, and scrubs the token from the URL bar.
     """
     qp = _get_query_params()
+    _dbg("Bootstrap from query", qp)
     raw = qp.get("sb") or qp.get("access_token") or qp.get("token")
     email = _verify_supabase_token_and_get_email(raw) if raw else None
     if email:
@@ -171,6 +199,8 @@ def require_auth() -> None:
       2) If ?sb / ?access_token / ?token present → verify via Supabase and allow
       3) Else → redirect to the Next.js login (no local form)
     """
+    if DEBUG_AUTH:
+        st.sidebar.markdown("**Auth Debug:** ON")
     now = int(time.time())
 
     # Existing valid session?
@@ -183,14 +213,17 @@ def require_auth() -> None:
                     st.caption(f"Signed in as **{user}**")
                 if st.button("Sign out"):
                     logout()
+            _dbg("Existing session valid", {"user": st.session_state.get(_SESSION_USER), "age": age, "max_age": _MAX_AGE})
             return
         else:
             for k in (_SESSION_OK, _SESSION_USER, _SESSION_TS):
                 st.session_state.pop(k, None)
+            _dbg("Session expired; cleared")
 
     # Supabase SSO pass-through via query params
     email = _bootstrap_auth_from_query_params()
     if email:
+        _dbg("Signed in via URL token", {"email": email})
         with st.sidebar:
             st.caption(f"Signed in as **{email}**")
             if st.button("Sign out"):
@@ -198,4 +231,13 @@ def require_auth() -> None:
         return
 
     # No valid session and no token → send to login
+    if DEBUG_AUTH:
+        qp = _get_query_params()
+        st.warning("No valid session and no token found; redirecting to sign‑in.")
+        _dbg("Final state before redirect", {
+            "has_session": bool(st.session_state.get(_SESSION_OK)),
+            "qp": qp,
+            "SB_URL": SB_URL,
+            "LOGIN_URL": LOGIN_URL,
+        })
     _redirect_to_login()
