@@ -57,7 +57,8 @@ with st.sidebar:
         try:
             conn = get_conn()
             st.success("DB connected")
-            cur = conn.cursor()
+
+            # Use pandas.read_sql so this works with SQLAlchemy *or* DB-API connections
             table_order = [
                 "sessions",
                 "session_logs",
@@ -71,8 +72,9 @@ with st.sidebar:
             counts = {}
             for t in table_order:
                 try:
-                    cur.execute(f"SELECT COUNT(*) FROM {t}")
-                    counts[t] = int(cur.fetchone()[0])
+                    # Double quotes are acceptable for both Postgres and SQLite identifiers
+                    df_cnt = pd.read_sql(f'SELECT COUNT(*) AS c FROM "{t}"', conn)
+                    counts[t] = int(df_cnt.iloc[0, 0])
                 except Exception:
                     # table may not exist; skip silently
                     continue
