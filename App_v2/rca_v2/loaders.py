@@ -17,6 +17,36 @@ def _make_placeholders(n: int) -> str:
     # default: sqlite
     return ",".join(["?"] * n)
 
+def _table_exists(cur, name: str) -> bool:
+    try:
+        if DB_BACKEND == "postgres":
+            # to_regclass returns the OID (as regclass) or NULL if it doesn't exist
+            cur.execute("SELECT to_regclass(%s)", (name,))
+            return cur.fetchone()[0] is not None
+        else:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+            return cur.fetchone() is not None
+    except Exception:
+        return False
+
+def _first_existing(conn, names):
+    cur = conn.cursor()
+    for n in names:
+        if _table_exists(cur, n):
+            return n
+    return None
+
+def _normalize_ids(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    # Ensure a 'station_id' column exists for downstream code
+    if "station_id" not in df.columns:
+        for alt in ("evse_id", "external_id"):
+            if alt in df.columns:
+                df = df.rename(columns={alt: "station_id"})
+                break
+    return df
+
 # -----------------------------
 # Meter values + Authorize data
 # -----------------------------
@@ -25,33 +55,40 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     Load realtime_meter_values for the given stations and UTC window.
     Returns a DataFrame with parsed dtypes.
     """
-    if not stations:
-        return pd.DataFrame()
-
-    placeholders = _make_placeholders(len(stations))
-    sql = f"""
-      SELECT station_id, connector_id, transaction_id, {_ts_col()} AS timestamp,
-             power_w, energy_wh, soc, amperage_offered, amperage_import, power_offered_w, voltage_v
-      FROM realtime_meter_values
-      WHERE station_id IN ({placeholders})
-        AND {_ts_col()} BETWEEN ? AND ?
-      ORDER BY station_id, connector_id, transaction_id, {_ts_col()}
-    """
-    params = list(stations) + [start_utc, end_utc]
+    # If stations is empty/None, we will query all stations in the time window
+    ph = param_placeholder()
     conn = get_conn()
     try:
+        table = _first_existing(conn, ["realtime_meter_values", "meter_values"])
+        if not table:
+            conn.close()
+            return pd.DataFrame()
+        where_in = ""
+        params = []
+        if stations:
+            where_in = f"station_id IN ({_make_placeholders(len(stations))}) AND "
+            params.extend(list(stations))
+        sql = f"""
+          SELECT station_id, connector_id, transaction_id, {_ts_col()} AS timestamp,
+                 power_w, energy_wh, soc, amperage_offered, amperage_import, power_offered_w, voltage_v
+          FROM {table}
+          WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
+          ORDER BY station_id, connector_id, transaction_id, {_ts_col()}
+        """
+        params.extend([start_utc, end_utc])
         try:
             df = pd.read_sql(sql, conn, params=params)
+            df = _normalize_ids(df)
             # Fallback: if a multi-station query returns empty but single-station queries succeed,
             # run per-EVSE and concatenate (addresses IN-clause driver quirks).
-            if (df is None or df.empty) and len(stations) > 1:
+            if (df is None or df.empty) and stations and len(stations) > 1:
                 frames = []
                 single_sql = f"""
                   SELECT station_id, connector_id, transaction_id, {_ts_col()} AS timestamp,
                          power_w, energy_wh, soc, amperage_offered, amperage_import, power_offered_w, voltage_v
-                  FROM realtime_meter_values
+                  FROM {table}
                   WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN ? AND ?
+                    AND {_ts_col()} BETWEEN {ph} AND {ph}
                   ORDER BY station_id, connector_id, transaction_id, {_ts_col()}
                 """
                 for sid in stations:
@@ -60,17 +97,18 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         frames.append(f)
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
+                    df = _normalize_ids(df)
         except Exception:
             # As an additional hard fallback, also attempt per-station queries
             df = pd.DataFrame()
-            if len(stations) >= 1:
+            if stations and len(stations) >= 1:
                 frames = []
                 single_sql = f"""
                   SELECT station_id, connector_id, transaction_id, {_ts_col()} AS timestamp,
                          power_w, energy_wh, soc, amperage_offered, amperage_import, power_offered_w, voltage_v
-                  FROM realtime_meter_values
+                  FROM {table}
                   WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN ? AND ?
+                    AND {_ts_col()} BETWEEN {ph} AND {ph}
                   ORDER BY station_id, connector_id, transaction_id, {_ts_col()}
                 """
                 for sid in stations:
@@ -82,6 +120,7 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         pass
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
+                    df = _normalize_ids(df)
     finally:
         conn.close()
 
@@ -96,33 +135,40 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_authorize rows (VID: id_tags) with a small time pad around the window.
     """
-    if not stations:
-        return pd.DataFrame()
-
+    # If stations is empty/None, we will query all stations in the time window
     start_pad = (pd.to_datetime(start_utc) - pd.Timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_pad   = (pd.to_datetime(end_utc)   + pd.Timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    placeholders = _make_placeholders(len(stations))
-    sql = f"""
-      SELECT station_id, {_ts_col()} AS timestamp, id_tag
-      FROM realtime_authorize
-      WHERE station_id IN ({placeholders})
-        AND {_ts_col()} BETWEEN ? AND ?
-      ORDER BY station_id, {_ts_col()}
-    """
-    params = list(stations) + [start_pad, end_pad]
+    ph = param_placeholder()
     conn = get_conn()
     try:
+        table = _first_existing(conn, ["realtime_authorize", "authorize"])
+        if not table:
+            conn.close()
+            return pd.DataFrame()
+        where_in = ""
+        params = []
+        if stations:
+            where_in = f"station_id IN ({_make_placeholders(len(stations))}) AND "
+            params.extend(list(stations))
+        sql = f"""
+          SELECT station_id, {_ts_col()} AS timestamp, id_tag
+          FROM {table}
+          WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
+          ORDER BY station_id, {_ts_col()}
+        """
+        params.extend([start_pad, end_pad])
         try:
             df = pd.read_sql(sql, conn, params=params)
+            df = _normalize_ids(df)
             # Fallback: if a multi-station query returns empty but single-station queries succeed,
             # run per-EVSE and concatenate (addresses IN-clause driver quirks).
-            if (df is None or df.empty) and len(stations) > 1:
+            if (df is None or df.empty) and stations and len(stations) > 1:
                 frames = []
                 single_sql = f"""
                   SELECT station_id, {_ts_col()} AS timestamp, id_tag
-                  FROM realtime_authorize
+                  FROM {table}
                   WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN ? AND ?
+                    AND {_ts_col()} BETWEEN {ph} AND {ph}
                   ORDER BY station_id, {_ts_col()}
                 """
                 for sid in stations:
@@ -131,16 +177,17 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         frames.append(f)
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
+                    df = _normalize_ids(df)
         except Exception:
             # As an additional hard fallback, also attempt per-station queries
             df = pd.DataFrame()
-            if len(stations) >= 1:
+            if stations and len(stations) >= 1:
                 frames = []
                 single_sql = f"""
                   SELECT station_id, {_ts_col()} AS timestamp, id_tag
-                  FROM realtime_authorize
+                  FROM {table}
                   WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN ? AND ?
+                    AND {_ts_col()} BETWEEN {ph} AND {ph}
                   ORDER BY station_id, {_ts_col()}
                 """
                 for sid in stations:
@@ -152,6 +199,7 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         pass
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
+                    df = _normalize_ids(df)
     finally:
         conn.close()
 
@@ -166,43 +214,52 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
 # -----------------------------
 def _in_clause_and_params(stations, start_utc: str, end_utc: str):
     """
-    Build an 'IN (...) AND timestamp BETWEEN ? AND ?' clause and params
-    for SQLite (uses '?' placeholders). For Postgres we'll adapt later.
+    Build an 'IN (...)' fragment (or empty) and parameter list. BETWEEN placeholders are handled at callsites.
     """
     placeholders = _make_placeholders(len(stations)) if stations else ""
     where_in = f"station_id IN ({placeholders}) AND " if stations else ""
-    return where_in, list(stations) + [start_utc, end_utc]
+    base_params = list(stations) if stations else []
+    return where_in, base_params
 
 def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_status_notifications for the window; newest first; AKDT strings + friendly names.
     Includes vendor_error_code if the column exists (falls back cleanly if not).
     """
-    where_in, params = _in_clause_and_params(stations, start_utc, end_utc)
-
-    # Try selecting vendor_error_code if present; fallback to a reduced column set if not
-    base_cols = 'station_id, connector_id, {_ts} AS timestamp, status, error_code'.format(_ts=_ts_col())
-    try_cols = base_cols + ', vendor_error_code'
-
-    sql_try = f"""
-      SELECT {try_cols}
-      FROM realtime_status_notifications
-      WHERE {where_in} {_ts_col()} BETWEEN ? AND ?
-      ORDER BY {_ts_col()} DESC
-    """
-    sql_fallback = f"""
-      SELECT {base_cols}
-      FROM realtime_status_notifications
-      WHERE {where_in} {_ts_col()} BETWEEN ? AND ?
-      ORDER BY {_ts_col()} DESC
-    """
-
+    ph = param_placeholder()
     conn = get_conn()
     try:
+        table = _first_existing(conn, ["realtime_status_notifications", "status_notifications"])
+        if not table:
+            conn.close()
+            return pd.DataFrame(columns=["AKDT","Location","station_id","connector_id","status","error_code","vendor_error_code"])
+
+        where_in, base_params = _in_clause_and_params(stations, start_utc, end_utc)
+
+        # Try selecting vendor_error_code if present; fallback to a reduced column set if not
+        base_cols = 'station_id, connector_id, {_ts} AS timestamp, status, error_code'.format(_ts=_ts_col())
+        try_cols = base_cols + ', vendor_error_code'
+
+        sql_try = f"""
+          SELECT {try_cols}
+          FROM {table}
+          WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
+          ORDER BY {_ts_col()} DESC
+        """
+        sql_fallback = f"""
+          SELECT {base_cols}
+          FROM {table}
+          WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
+          ORDER BY {_ts_col()} DESC
+        """
+        params = base_params + [start_utc, end_utc]
+
         try:
             df = pd.read_sql(sql_try, conn, params=params)
+            df = _normalize_ids(df)
         except Exception:
             df = pd.read_sql(sql_fallback, conn, params=params)
+            df = _normalize_ids(df)
     finally:
         conn.close()
 
@@ -223,16 +280,24 @@ def load_connectivity(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_websocket CONNECT/DISCONNECT events; newest first; AKDT strings + friendly names.
     """
-    where_in, params = _in_clause_and_params(stations, start_utc, end_utc)
-    sql = f"""
-      SELECT station_id, connection_id, event, {_ts_col()} AS timestamp
-      FROM realtime_websocket
-      WHERE {where_in} {_ts_col()} BETWEEN ? AND ?
-      ORDER BY {_ts_col()} DESC
-    """
+    ph = param_placeholder()
     conn = get_conn()
     try:
+        table = _first_existing(conn, ["realtime_websocket", "connectivity_logs"])
+        if not table:
+            conn.close()
+            return pd.DataFrame(columns=["AKDT","Location","station_id","connection_id","Connectivity"])
+
+        where_in, base_params = _in_clause_and_params(stations, start_utc, end_utc)
+        sql = f"""
+          SELECT station_id, connection_id, event, {_ts_col()} AS timestamp
+          FROM {table}
+          WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
+          ORDER BY {_ts_col()} DESC
+        """
+        params = base_params + [start_utc, end_utc]
         df = pd.read_sql(sql, conn, params=params)
+        df = _normalize_ids(df)
     finally:
         conn.close()
 

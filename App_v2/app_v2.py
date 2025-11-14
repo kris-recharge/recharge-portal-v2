@@ -15,6 +15,7 @@ from rca_v2.loaders import (
 from rca_v2.sessions import build_sessions
 from rca_v2.charts import session_detail_figure, heatmap_count, heatmap_duration
 from rca_v2.constants import get_evse_display
+from rca_v2.db import get_conn
 from rca_v2.auth import require_auth
 
 from rca_v2.admintab import render_admin_tab
@@ -25,6 +26,16 @@ st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
 # Gate the web build behind a simple login (disabled for local runs)
 if APP_MODE != "local":
     require_auth()
+
+# Admin wildcard propagated by auth.require_auth: {"*"} means unrestricted
+_admin_all = False
+try:
+    _allowed = st.session_state.get("_allowed_evse")
+    if isinstance(_allowed, set) and ("*" in _allowed):
+        _admin_all = True
+except Exception:
+    _admin_all = False
+st.session_state["_admin_all"] = _admin_all
 
 # Helper: future‑proof sizing for st.dataframe across Streamlit versions
 # Uses width="stretch" on newer Streamlit; falls back to use_container_width=True on older.
@@ -40,6 +51,42 @@ def _df_stretch_kwargs():
 
 with st.sidebar:
     stations, start_utc, end_utc = render_sidebar()
+
+    # Optional diagnostics to verify DB connectivity & table counts on Render
+    with st.expander("Diagnostics", expanded=False):
+        try:
+            conn = get_conn()
+            st.success("DB connected")
+            cur = conn.cursor()
+            table_order = [
+                "sessions",
+                "session_logs",
+                "meter_values",
+                "realtime_meter_values",
+                "status_notifications",
+                "realtime_status_notifications",
+                "realtime_websocket",
+                "connectivity_logs",
+            ]
+            counts = {}
+            for t in table_order:
+                try:
+                    cur.execute(f"SELECT COUNT(*) FROM {t}")
+                    counts[t] = int(cur.fetchone()[0])
+                except Exception:
+                    # table may not exist; skip silently
+                    continue
+            if counts:
+                st.json(counts)
+            else:
+                st.write("No known telemetry tables were found.")
+        except Exception as e:
+            st.error(f"DB error: {e}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 EVSE_DISPLAY = get_evse_display()
 
@@ -88,7 +135,7 @@ with t1:
         auth = _load_per_evse(load_authorize, stations, start_utc, end_utc)
     sess, heat = build_sessions(mv, auth)
     # Defensive: re-apply EVSE filter at the session level (guards against loader quirks)
-    if isinstance(stations, (list, tuple, set)) and len(stations) > 0 and "station_id" in sess.columns:
+    if (not st.session_state.get("_admin_all")) and (not st.session_state.get("__v2_all_evse", False)) and isinstance(stations, (list, tuple, set)) and len(stations) > 0 and "station_id" in sess.columns:
         _wanted = {str(s) for s in stations}
         sess = sess[sess["station_id"].astype(str).isin(_wanted)]
     if sess.empty:

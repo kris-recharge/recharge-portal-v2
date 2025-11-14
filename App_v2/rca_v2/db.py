@@ -23,7 +23,13 @@ def get_conn():
         conn.row_factory = sqlite3.Row
         return conn
 
-def param_placeholder(n: int) -> str:
-    # psycopg2 uses %s; SQLite uses ?
+def param_placeholder(n: int = 1) -> str:
+    """
+    Return a DB-appropriate placeholder token.
+    - For a single value: '?' (SQLite) or '%s' (Postgres)
+    - For N values (IN clause): '?, ?, ?' or '%s, %s, %s'
+    """
     token = "%s" if DB_BACKEND == "postgres" else "?"
+    if n <= 1:
+        return token
     return ",".join([token] * n)
