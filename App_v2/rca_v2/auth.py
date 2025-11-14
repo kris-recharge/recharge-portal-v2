@@ -18,6 +18,25 @@ _MAX_AGE = int(os.getenv("PORTAL_SESSION_MAX_AGE", "43200"))
 SB_URL = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SB_ANON = os.getenv("SUPABASE_ANON_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
 
+# Where to send users to sign in (Next.js front door).
+# You can override with PORTAL_LOGIN_URL, else we fall back to NEXT_PUBLIC_PORTAL_URL, else a sensible default.
+LOGIN_URL = (
+    os.getenv("PORTAL_LOGIN_URL")
+    or os.getenv("NEXT_PUBLIC_PORTAL_URL")
+    or "https://recharge-portal.onrender.com/login"
+)
+
+def _redirect_to_login() -> None:
+    """Hard redirect to the front-door login; no local login fallback."""
+    # Meta refresh (works on Render) + a visible button as backup.
+    st.markdown(f'<meta http-equiv="refresh" content="0; url={LOGIN_URL}">', unsafe_allow_html=True)
+    st.info("Redirecting to sign‑in… If nothing happens, click below.")
+    try:
+        st.link_button("Go to sign‑in", LOGIN_URL)
+    except Exception:
+        st.markdown(f"[Go to sign‑in]({LOGIN_URL})")
+    st.stop()
+
 def _verify_supabase_token_and_get_email(token: str) -> Optional[str]:
     """
     Validate a Supabase access token by calling /auth/v1/user.
@@ -125,12 +144,12 @@ def logout() -> None:
 
 
 def require_auth() -> None:
-    """Supabase-first gating for the web build.
+    """SSO-only gating.
 
     Order:
       1) If existing session valid → allow
       2) If ?sb / ?access_token / ?token present → verify via Supabase and allow
-      3) Else, fallback to env-based login if configured; if not configured, allow (local dev)
+      3) Else → redirect to the Next.js login (no local form)
     """
     now = int(time.time())
 
@@ -158,31 +177,5 @@ def require_auth() -> None:
                 logout()
         return
 
-    # Fallback: env-backed login (useful for local/dev)
-    users = _load_users_from_env()
-    if not users:
-        # No env users configured → allow through
-        return
-
-    # --- Local login form ---
-    st.title("🔒 ReCharge Alaska — Portal v2")
-    with st.form("login"):
-        u = st.text_input("Username", autocomplete="username")
-        p = st.text_input("Password", type="password", autocomplete="current-password")
-        ok = st.form_submit_button("Sign in")
-
-    if ok:
-        pw = users.get(u)
-        if pw and hmac.compare_digest(p, pw):
-            st.session_state[_SESSION_OK] = True
-            st.session_state[_SESSION_USER] = u.strip().lower()
-            st.session_state[_SESSION_TS] = now
-            seed = _seed_allowed_evse()
-            if seed is not None:
-                st.session_state["_allowed_evse"] = seed
-            st.experimental_rerun()
-        else:
-            st.error("Invalid credentials")
-            st.stop()
-    else:
-        st.stop()
+    # No valid session and no token → send to login
+    _redirect_to_login()
