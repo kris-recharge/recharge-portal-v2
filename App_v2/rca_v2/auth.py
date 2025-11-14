@@ -10,6 +10,7 @@ import requests
 _SESSION_OK = "_auth_ok"
 _SESSION_USER = "_auth_user"
 _SESSION_TS = "_auth_ts"
+_LOGIN_REDIRECT_TS = "_login_redirect_ts"
 
 # Default 12 hours, override via env var PORTAL_SESSION_MAX_AGE (seconds)
 _MAX_AGE = int(os.getenv("PORTAL_SESSION_MAX_AGE", "43200"))
@@ -27,14 +28,25 @@ LOGIN_URL = (
 )
 
 def _redirect_to_login() -> None:
-    """Hard redirect to the front-door login; no local login fallback."""
-    # Meta refresh (works on Render) + a visible button as backup.
+    """Hard redirect to the front-door login; guard against tight loops."""
+    now = int(time.time())
+    last = st.session_state.get(_LOGIN_REDIRECT_TS)
+    if last and (now - int(last) < 8):
+        # We just redirected recently → show a button instead of looping
+        st.warning("We just tried to send you to the sign-in page. Click below to continue.")
+        try:
+            st.link_button("Go to sign-in", LOGIN_URL)
+        except Exception:
+            st.markdown(f"[Go to sign-in]({LOGIN_URL})")
+        st.stop()
+
+    st.session_state[_LOGIN_REDIRECT_TS] = now
     st.markdown(f'<meta http-equiv="refresh" content="0; url={LOGIN_URL}">', unsafe_allow_html=True)
-    st.info("Redirecting to sign‑in… If nothing happens, click below.")
+    st.info("Redirecting to sign-in… If nothing happens, click below.")
     try:
-        st.link_button("Go to sign‑in", LOGIN_URL)
+        st.link_button("Go to sign-in", LOGIN_URL)
     except Exception:
-        st.markdown(f"[Go to sign‑in]({LOGIN_URL})")
+        st.markdown(f"[Go to sign-in]({LOGIN_URL})")
     st.stop()
 
 def _verify_supabase_token_and_get_email(token: str) -> Optional[str]:
@@ -59,19 +71,27 @@ def _verify_supabase_token_and_get_email(token: str) -> Optional[str]:
     return None
 
 def _get_query_params() -> Dict[str, str]:
-    # Streamlit introduced st.query_params; fall back to experimental API if needed
-    if hasattr(st, "query_params"):
-        qp = st.query_params
-    else:
-        qp = st.experimental_get_query_params()
-    # Normalize to simple dict[str, str]
-    norm: Dict[str, str] = {}
-    for k, v in (qp.items() if isinstance(qp, dict) else []):
-        if isinstance(v, list):
-            norm[k] = v[0] if v else ""
+    """Return URL query params as a simple dict[str, str] across Streamlit versions."""
+    try:
+        if hasattr(st, "query_params"):
+            raw = st.query_params
+            # In modern Streamlit this is a QueryParams proxy with .to_dict()
+            if hasattr(raw, "to_dict"):
+                d = raw.to_dict()
+            else:
+                try:
+                    d = dict(raw)  # best-effort
+                except Exception:
+                    d = {}
         else:
-            norm[k] = v
-    return norm
+            d = st.experimental_get_query_params() or {}
+    except Exception:
+        d = {}
+
+    out: Dict[str, str] = {}
+    for k, v in d.items():
+        out[k] = v[0] if isinstance(v, list) else v
+    return out
 
 def _bootstrap_auth_from_query_params() -> Optional[str]:
     """
