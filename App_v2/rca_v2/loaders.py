@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+from typing import Sequence, Optional
+from sqlalchemy import inspect
+from sqlalchemy.engine import Engine, Connection
 from .config import DB_BACKEND, AK_TZ
 from .db import get_conn, param_placeholder
 from .constants import EVSE_DISPLAY
@@ -17,23 +20,44 @@ def _make_placeholders(n: int) -> str:
     # default: sqlite
     return ",".join(["?"] * n)
 
-def _table_exists(cur, name: str) -> bool:
-    try:
-        if DB_BACKEND == "postgres":
-            # to_regclass returns the OID (as regclass) or NULL if it doesn't exist
-            cur.execute("SELECT to_regclass(%s)", (name,))
-            return cur.fetchone()[0] is not None
-        else:
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
-            return cur.fetchone() is not None
-    except Exception:
-        return False
 
-def _first_existing(conn, names):
-    cur = conn.cursor()
-    for n in names:
-        if _table_exists(cur, n):
-            return n
+def _sa_engine(conn_or_engine) -> Optional[Engine]:
+    """Return a SQLAlchemy Engine if `conn_or_engine` is an Engine or Connection; otherwise None."""
+    try:
+        # If it's already an Engine
+        if isinstance(conn_or_engine, Engine):
+            return conn_or_engine
+        # If it's a SQLAlchemy Connection, return its bound engine
+        if isinstance(conn_or_engine, Connection):
+            return conn_or_engine.engine
+    except Exception:
+        pass
+    return None
+
+def _first_existing(conn, names: Sequence[str]) -> Optional[str]:
+    """Return the first table name that exists from `names` for the current backend.
+    Works with SQLAlchemy (Postgres) and raw sqlite3 connections.
+    """
+    # Prefer SQLAlchemy inspector when available (e.g., Postgres on Render)
+    eng = _sa_engine(conn)
+    if eng is not None:
+        try:
+            insp = inspect(eng)
+            schema = "public" if eng.dialect.name in ("postgresql", "postgres") else None
+            for n in names:
+                if insp.has_table(n, schema=schema):
+                    return n
+        except Exception:
+            pass
+    # Fallback: try sqlite master table using DB-API cursor
+    try:
+        cur = conn.cursor()
+        for n in names:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (n,))
+            if cur.fetchone() is not None:
+                return n
+    except Exception:
+        pass
     return None
 
 def _normalize_ids(df: pd.DataFrame) -> pd.DataFrame:
