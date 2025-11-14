@@ -36,28 +36,67 @@ def _sa_engine(conn_or_engine) -> Optional[Engine]:
 
 def _first_existing(conn, names: Sequence[str]) -> Optional[str]:
     """Return the first table name that exists from `names` for the current backend.
-    Works with SQLAlchemy (Postgres) and raw sqlite3 connections.
+
+    Strategy:
+      • If we have a SQLAlchemy Engine/Connection (Postgres path on Render):
+          1) Try SQLAlchemy inspector with schema="public" (Postgres).
+          2) If not found, probe with a lightweight "SELECT 1 FROM ..." for each candidate.
+      • Otherwise, fall back to sqlite's sqlite_master check (raw sqlite3 path).
     """
-    # Prefer SQLAlchemy inspector when available (e.g., Postgres on Render)
     eng = _sa_engine(conn)
+
+    # ---------- Postgres / SQLAlchemy path ----------
     if eng is not None:
         try:
             insp = inspect(eng)
-            schema = "public" if eng.dialect.name in ("postgresql", "postgres") else None
-            for n in names:
-                if insp.has_table(n, schema=schema):
-                    return n
+        except Exception:
+            insp = None
+
+        # Determine schema hint for Postgres
+        schema = None
+        try:
+            dname = eng.dialect.name.lower()
+            if dname.startswith("postgres"):
+                schema = "public"
         except Exception:
             pass
-    # Fallback: try sqlite master table using DB-API cursor
+
+        for n in names:
+            # 1) Inspector check
+            try:
+                if insp is not None and insp.has_table(n, schema=schema):
+                    return n
+            except Exception:
+                # inspector may fail under certain permission/driver combos; fall through to probe
+                pass
+
+            # 2) Lightweight probe: SELECT 1 FROM {target} LIMIT 1
+            if schema:
+                targets = [f'{schema}."{n}"', f'{schema}.{n}']
+            else:
+                targets = [n]
+
+            for target in targets:
+                try:
+                    if isinstance(conn, Connection):
+                        conn.exec_driver_sql(f"SELECT 1 FROM {target} LIMIT 1")
+                    else:
+                        with eng.connect() as c2:
+                            c2.exec_driver_sql(f"SELECT 1 FROM {target} LIMIT 1")
+                    return n
+                except Exception:
+                    continue  # try next target rendition
+
+    # ---------- sqlite fallback ----------
     try:
-        cur = conn.cursor()
+        cur = conn.cursor()  # raw sqlite3 connection
         for n in names:
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (n,))
             if cur.fetchone() is not None:
                 return n
     except Exception:
         pass
+
     return None
 
 def _normalize_ids(df: pd.DataFrame) -> pd.DataFrame:
