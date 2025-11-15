@@ -1,7 +1,57 @@
 import plotly.graph_objects as go
 import numpy as np
 import pandas as pd
+
 from .config import AK_TZ
+
+# --- Helpers for heatmaps: tolerant timestamp/duration discovery ---
+def _to_ak(series, ak_hint: bool = False) -> pd.Series:
+    """
+    Convert any datetime-like series to Alaska tz.
+    - If tz-aware, convert to AK_TZ.
+    - If tz-naive: treat *_ak as already in AK; otherwise assume UTC then convert.
+    """
+    s = pd.to_datetime(series, errors="coerce", utc=False)
+    if pd.api.types.is_datetime64tz_dtype(s):
+        return s.dt.tz_convert(AK_TZ)
+    try:
+        if ak_hint:
+            return s.dt.tz_localize(AK_TZ)
+        else:
+            return s.dt.tz_localize("UTC").dt.tz_convert(AK_TZ)
+    except Exception:
+        # Last-resort: parse as UTC then convert
+        return pd.to_datetime(series, errors="coerce", utc=True).dt.tz_convert(AK_TZ)
+
+def _start_local_series(df: pd.DataFrame) -> pd.Series:
+    """
+    Return a single Alaska-local timestamp series from any of the known columns.
+    Prefers *_ak columns, then UTC-like ones.
+    """
+    candidates = [
+        ("_start_ak", True),
+        ("start_ak", True),
+        ("start_local", True),
+        ("start_ts", False),
+        ("timestamp", False),
+        ("_start", False),
+        ("start", False),
+    ]
+    for name, ak_hint in candidates:
+        if name in df.columns:
+            return _to_ak(df[name], ak_hint)
+    # No viable column
+    return pd.Series(dtype="datetime64[ns]")
+
+def _duration_minutes_series(df: pd.DataFrame) -> pd.Series:
+    """
+    Return a duration (minutes) series from any known name; coerces to numeric.
+    Missing -> empty float series.
+    """
+    for name in ["dur_min", "Duration (min)", "duration_min", "duration_minutes", "duration", "dur"]:
+        if name in df.columns:
+            return pd.to_numeric(df[name], errors="coerce")
+    return pd.Series(index=df.index, dtype=float)
 
 def _first_col(df, names):
     for n in names:
@@ -200,28 +250,32 @@ def heatmap_count(heat, title):
         return go.Figure()
 
     h = heat.copy()
-    # Normalize time → AK local then derive day/hour bins
-    h["start_local"] = h["start_ts"].dt.tz_convert(AK_TZ)
-    h["dow"] = h["start_local"].dt.dayofweek
-    h["hour"] = h["start_local"].dt.hour
 
-    # 7×24 matrix, fill missing with 0 so we always render a full grid
+    # Normalize time → Alaska local robustly (accepts *_ak, UTC, or naive)
+    s_local = _start_local_series(h)
+    if s_local.empty or s_local.isna().all():
+        return go.Figure()
+
+    h["_start_local"] = s_local
+    h["_dow"] = s_local.dt.dayofweek    # Mon=0 .. Sun=6
+    h["_hour"] = s_local.dt.hour
+
+    # 7×24 matrix (Sun..Sat x 0..23), fill missing with 0 so we always render a full grid
     mat = (
-        h.groupby(["dow", "hour"]).size().unstack(fill_value=0)
-        .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0)
-        .reindex(columns=range(24), fill_value=0)
+        h.groupby(["_dow", "_hour"]).size().unstack(fill_value=0)
+         .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0)
+         .reindex(columns=range(24), fill_value=0)
     )
     mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-    # Ensure numeric array (avoid object dtype rendering issues). Also cap zmax
+    # Ensure numeric array and stable color range
     z = mat.to_numpy(dtype=float)
-    # Guard against the all‑zero window (plotly auto with zmax=0 -> weird/blank).  
     zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
 
-    # Explicit white→blue ramp so zero really looks white on dark background
+    # Explicit white→blue ramp (good contrast on dark Streamlit theme)
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
-    heatmap = go.Heatmap(
+    fig = go.Figure(go.Heatmap(
         z=z.tolist(),
         x=list(mat.columns),
         y=list(mat.index),
@@ -230,22 +284,13 @@ def heatmap_count(heat, title):
         zmax=zmax,
         colorbar=dict(title="Starts"),
         hoverongaps=False,
-        # Black borders via gaps (background shows through in Streamlit dark theme)
+        # Black "borders" using gaps (background shows through)
         xgap=1,
         ygap=1,
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Starts: %{z:.0f}<extra></extra>",
-    )
+    ))
 
-    fig = go.Figure(data=heatmap)
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        title=title,
-        xaxis=dict(title="Hour (0-23)", type="category"),
-        yaxis=dict(title="Day", type="category"),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-    )
-    # Overlay numeric labels so they render across Plotly versions
+    # Overlay numeric labels via a text trace so Plotly versions render consistently
     xs, ys, labels = [], [], []
     cols = list(mat.columns)
     rows = list(mat.index)
@@ -262,6 +307,15 @@ def heatmap_count(heat, title):
         textfont=dict(color="black", size=12),
         hoverinfo="skip", showlegend=False
     ))
+
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=30, b=10),
+        title=title,
+        xaxis=dict(title="Hour (0-23)", type="category"),
+        yaxis=dict(title="Day", type="category"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
     return fig
 
 def heatmap_duration(heat, title):
@@ -270,25 +324,30 @@ def heatmap_duration(heat, title):
         return go.Figure()
 
     h = heat.copy()
-    h["start_local"] = h["start_ts"].dt.tz_convert(AK_TZ)
-    h["dow"] = h["start_local"].dt.dayofweek
-    h["hour"] = h["start_local"].dt.hour
+
+    # Time bins
+    s_local = _start_local_series(h)
+    if s_local.empty or s_local.isna().all():
+        return go.Figure()
+    h["_start_local"] = s_local
+    h["_dow"] = s_local.dt.dayofweek
+    h["_hour"] = s_local.dt.hour
+
+    # Duration series (minutes), tolerant to column name differences
+    h["_dur"] = _duration_minutes_series(h)
 
     mat = (
-        h.groupby(["dow", "hour"])  # mean minutes per bin
-         ["dur_min"].mean().unstack(fill_value=0.0)
+        h.groupby(["_dow", "_hour"])["_dur"].mean().unstack(fill_value=0.0)
          .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0.0)
          .reindex(columns=range(24), fill_value=0.0)
     )
     mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
     z = mat.to_numpy(dtype=float)
-    # Robust color range (avoid all‑black/blank when values are tiny or all zeros)
     zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
-
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
-    heatmap = go.Heatmap(
+    fig = go.Figure(go.Heatmap(
         z=z.tolist(),
         x=list(mat.columns),
         y=list(mat.index),
@@ -300,18 +359,9 @@ def heatmap_duration(heat, title):
         xgap=1,
         ygap=1,
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Avg min: %{z:.1f}<extra></extra>",
-    )
+    ))
 
-    fig = go.Figure(data=heatmap)
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        title=title,
-        xaxis=dict(title="Hour (0-23)", type="category"),
-        yaxis=dict(title="Day", type="category"),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-    )
-    # Overlay numeric labels (one decimal) for reliability across Plotly versions
+    # Overlay numeric labels with one decimal
     xs, ys, labels = [], [], []
     cols = list(mat.columns)
     rows = list(mat.index)
@@ -328,4 +378,13 @@ def heatmap_duration(heat, title):
         textfont=dict(color="black", size=12),
         hoverinfo="skip", showlegend=False
     ))
+
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=30, b=10),
+        title=title,
+        xaxis=dict(title="Hour (0-23)", type="category"),
+        yaxis=dict(title="Day", type="category"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
     return fig
