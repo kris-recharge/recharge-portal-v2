@@ -25,6 +25,9 @@ _MAX_AGE = int(os.getenv("PORTAL_SESSION_MAX_AGE", "43200"))
 SB_URL = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SB_ANON = os.getenv("SUPABASE_ANON_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
 
+# Treat anyone on this domain as admin (wildcard EVSE access)
+ADMIN_DOMAIN = os.getenv("PORTAL_ADMIN_DOMAIN", "rechargealaska.net").strip().lower()
+
 # Where to send users to sign in (Next.js front door).
 # You can override with PORTAL_LOGIN_URL, else we fall back to NEXT_PUBLIC_PORTAL_URL, else a sensible default.
 LOGIN_URL = (
@@ -171,6 +174,13 @@ def _bootstrap_auth_from_query_params() -> Optional[str]:
         seed = _seed_allowed_evse()
         if seed is not None:
             st.session_state["_allowed_evse"] = seed
+        # If email is on the admin domain, grant wildcard EVSE access
+        try:
+            email_l = email.strip().lower()
+            if ADMIN_DOMAIN and email_l.endswith("@" + ADMIN_DOMAIN):
+                st.session_state["_allowed_evse"] = {"*"}
+        except Exception:
+            pass
         # Remove token-bearing params from the browser URL
         try:
             st.experimental_set_query_params()
@@ -245,8 +255,14 @@ def require_auth() -> None:
     if st.session_state.get(_SESSION_OK) and st.session_state.get(_SESSION_TS):
         age = now - int(st.session_state[_SESSION_TS])
         if age < _MAX_AGE:
+            user = st.session_state.get(_SESSION_USER, "") or ""
+            # Ensure admin wildcard is present on every refresh
+            try:
+                if ADMIN_DOMAIN and isinstance(user, str) and user.lower().endswith("@" + ADMIN_DOMAIN):
+                    st.session_state.setdefault("_allowed_evse", {"*"})
+            except Exception:
+                pass
             with st.sidebar:
-                user = st.session_state.get(_SESSION_USER, "")
                 if user:
                     st.caption(f"Signed in as **{user}**")
                 if st.button("Sign out"):
