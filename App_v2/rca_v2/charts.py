@@ -39,6 +39,26 @@ def _blank_or_float1(v):
         return ""
 
 
+def _scatter_text_for_grid(grid: "pd.DataFrame", value_to_text) -> tuple[list[int], list[str], list[str]]:
+    """
+    Build x (hours), y (day labels), and text arrays for a scatter layer that writes numbers
+    in the center of each heatmap cell. Empty strings are skipped.
+    """
+    xs: list[int] = []
+    ys: list[str] = []
+    ts: list[str] = []
+    # grid index is 0..6 (Sun..Sat), columns 0..23
+    for i, dow in enumerate(grid.index):
+        for j, hour in enumerate(grid.columns):
+            val = grid.iat[i, j]
+            txt = value_to_text(val)
+            if txt != "":
+                xs.append(int(hour))
+                ys.append(DAY_LABELS[int(dow)])
+                ts.append(txt)
+    return xs, ys, ts
+
+
 def _heatmap_from_grid(
     grid: "pd.DataFrame",
     title: str,
@@ -49,19 +69,19 @@ def _heatmap_from_grid(
 ) -> go.Figure:
     """
     Build a Plotly heatmap from a (7 x 24) DataFrame whose index is 0..6 (Sun..Sat)
-    and columns are 0..23 (hours).
+    and columns are 0..23 (hours). We render the color map with a Heatmap trace
+    and place the per-cell numbers using a separate Scatter(text) overlay so we
+    avoid any Plotly/texttemplate inconsistencies across environments.
     """
-    # Force fixed shape and numeric array for z
+    # Ensure a fixed 7x24 numeric grid
     grid = (
         grid.reindex(index=range(7), fill_value=0)
             .reindex(columns=range(24), fill_value=0)
             .copy()
     )
-
-    # z must be pure numeric; text must be pure strings
     z = grid.to_numpy(dtype=float, copy=True)
-    text = grid.applymap(value_to_text).astype(str).replace("nan", "").to_numpy()
 
+    # Heat layer
     fig = go.Figure(
         data=go.Heatmap(
             z=z,
@@ -70,19 +90,33 @@ def _heatmap_from_grid(
             colorscale=colorscale,
             zmin=zmin,
             zmax=zmax,
-            text=text,
-            texttemplate="%{text}",
-            hovertemplate="Day: %{y}<br>Hour: %{x}<br>Value: %{z:.1f}<extra></extra>",
             colorbar=dict(title=None),
             xgap=1,
             ygap=1,
+            hovertemplate="Day: %{y}<br>Hour: %{x}<br>Value: %{z:.1f}<extra></extra>",
             showscale=True,
         )
     )
-    fig.update_traces(textfont=dict(color="black"))
+
+    # Overlay text labels (only non-empty cells)
+    xs, ys, ts = _scatter_text_for_grid(grid, value_to_text)
+    if ts:
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="text",
+                text=ts,
+                textposition="middle center",
+                textfont=dict(color="black"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
     fig.update_layout(
         title=title,
-        xaxis=dict(title="Hour (0–23)"),
+        xaxis=dict(title="Hour (0–23)", dtick=1),
         yaxis=dict(title="Day"),
         plot_bgcolor="white",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -218,6 +252,7 @@ def session_detail_figure(*args, title: str = "Charge Session Details", **kwargs
         yaxis_title="kW / A / V / %",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=40, r=40, t=50, b=40),
+        hovermode="x unified",
     )
 
     if df is None or df.empty:
