@@ -1,368 +1,331 @@
-from __future__ import annotations
-from typing import Optional
+import plotly.graph_objects as go
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
+from .config import AK_TZ
 
-# Day labels with Sunday at index 0 to match your UI
-DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+def _first_col(df, names):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
 
-
-def _to_ak(ts: pd.Series) -> pd.Series:
+def session_detail_figure(mv, sid, tx):
     """
-    Coerce a timestamp-like Series to tz-aware UTC then convert to Alaska time.
-    Returns a tz-aware Series.
+    Build the Charge Session Details figure from raw MeterValues without fabricating data.
+    - Filters by EVSE (station) and transaction id when present
+    - Parses UTC timestamps and converts to Alaska time
+    - Aligns by timestamp index to avoid any accidental reindexing
+    - Converts Power W→kW and Energy Wh→kWh where appropriate
+    - Baselines energy to session start (so the curve starts at 0)
+    - Plots kW & A on left axis; SoC/energy/volts on right axis
     """
-    s = pd.to_datetime(ts, errors="coerce", utc=True)
-    try:
-        return s.dt.tz_convert("America/Anchorage")
-    except Exception:
-        # Fallback: return as-is (still tz-aware UTC) if conversion fails
-        return s
+    fig = go.Figure()
+    if mv is None or mv.empty:
+        return fig
 
+    df = mv.copy()
 
-def _blank_or_int(v):
-    if pd.isna(v) or v == 0:
-        return ""
-    try:
-        return str(int(v))
-    except Exception:
-        return ""
+    # -------------------------
+    # Filter by EVSE + tx id
+    # -------------------------
+    sid_col = _first_col(df, ["station_id", "evse_id", "station", "EVSE"])
+    if sid_col:
+        df = df[df[sid_col].astype(str) == str(sid)]
 
+    tx_col = _first_col(df, ["transaction_id", "tx_id", "transaction", "transactionId"])
+    if tx_col and pd.notna(tx):
+        df = df[df[tx_col].astype(str) == str(tx)]
 
-def _blank_or_float1(v):
-    if pd.isna(v) or v == 0:
-        return ""
-    try:
-        return f"{float(v):.1f}"
-    except Exception:
-        return ""
+    if df.empty:
+        return fig
 
+    # -------------------------
+    # Timestamps → AK local
+    # -------------------------
+    ts_col = _first_col(df, ["timestamp", "ts", "time"])
+    if ts_col is None:
+        return fig
 
-def _scatter_text_for_grid(grid: "pd.DataFrame", value_to_text) -> tuple[list[int], list[str], list[str]]:
-    """
-    Build x (hours), y (day labels), and text arrays for a scatter layer that writes numbers
-    in the center of each heatmap cell. Empty strings are skipped.
-    """
-    xs: list[int] = []
-    ys: list[str] = []
-    ts: list[str] = []
-    # grid index is 0..6 (Sun..Sat), columns 0..23
-    for i, dow in enumerate(grid.index):
-        for j, hour in enumerate(grid.columns):
-            val = grid.iat[i, j]
-            txt = value_to_text(val)
-            if txt != "":
-                xs.append(int(hour))
-                ys.append(DAY_LABELS[int(dow)])
-                ts.append(txt)
-    return xs, ys, ts
+    # Parse to UTC (handles tz‑naive by assuming UTC), then convert to AK
+    ts = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
+    ts_ak = ts.dt.tz_convert(AK_TZ)
 
+    # Stable, time‑indexed frame for aligned numeric extraction
+    df = df.assign(_t=ts_ak).sort_values("_t")
+    dti = df["_t"]
+    f = df.set_index("_t")
+    # If duplicates exist at exactly the same instant, keep the last reading
+    f = f[~f.index.duplicated(keep="last")]
 
-def _heatmap_from_grid(
-    grid: "pd.DataFrame",
-    title: str,
-    value_to_text,
-    colorscale: str = "Blues",
-    zmin: Optional[float] = None,
-    zmax: Optional[float] = None,
-) -> go.Figure:
-    """
-    Build a Plotly heatmap from a (7 x 24) DataFrame whose index is 0..6 (Sun..Sat)
-    and columns are 0..23 (hours). We render the color map with a Heatmap trace
-    and place the per-cell numbers using a separate Scatter(text) overlay so we
-    avoid any Plotly/texttemplate inconsistencies across environments.
-    """
-    # Ensure a fixed 7x24 numeric grid
-    grid = (
-        grid.reindex(index=range(7), fill_value=0)
-            .reindex(columns=range(24), fill_value=0)
-            .copy()
-    )
-    z = grid.to_numpy(dtype=float, copy=True)
+    # -------------------------
+    # Column discovery (prefer local wide schema names first)
+    # -------------------------
+    if all(c in f.columns for c in ["power_w", "amperage_offered", "soc", "energy_wh", "voltage_v"]):
+        power_col  = "power_w"
+        amps_col   = "amperage_offered"
+        soc_col    = "soc"
+        energy_col = "energy_wh"
+        hvb_col    = "voltage_v"
+    else:
+        power_col  = _first_col(f, ["power_kw", "Power (kW)", "kW", "active_power_kw", "power_w", "Power (W)"])
+        amps_col   = _first_col(f, ["amps_offered", "Amps Offered", "current_a", "offered_current_a", "amperage_offered"]) 
+        soc_col    = _first_col(f, ["soc_pct", "SoC (%)", "soc", "soc_percent"]) 
+        hvb_col    = _first_col(f, ["hvb_volts", "HVB (V)", "voltage_v", "pack_volts", "Voltage (V)"]) 
+        energy_col = _first_col(f, [
+            "energy_kwh", "Energy (kWh)", "energy_wh", "Energy (Wh)",
+            "Energy.Active.Import.Register", "Energy.Active.Import.Register (Wh)"
+        ])
 
-    # Heat layer
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=z,
-            x=list(grid.columns),
-            y=[DAY_LABELS[i] for i in grid.index],
-            colorscale=colorscale,
-            zmin=zmin,
-            zmax=zmax,
-            colorbar=dict(title=None),
-            xgap=1,
-            ygap=1,
-            hovertemplate="Day: %{y}<br>Hour: %{x}<br>Value: %{z:.1f}<extra></extra>",
-            showscale=True,
-        )
-    )
+    def col_to_numeric(col_name):
+        if not col_name:
+            return pd.Series(index=f.index, dtype=float)
+        return pd.to_numeric(f[col_name], errors="coerce")
 
-    # Overlay text labels (only non-empty cells)
-    xs, ys, ts = _scatter_text_for_grid(grid, value_to_text)
-    if ts:
+    # Power (prefer kW; convert from W when needed)
+    P = col_to_numeric(power_col)
+    if power_col:
+        low = power_col.lower()
+        if power_col == "power_w" or ("power" in low and ("(w)" in low or low.endswith("_w"))) or (P.dropna().quantile(0.95) > 1000):
+            P = P / 1000.0
+
+    # Current, SoC, Voltage
+    A   = col_to_numeric(amps_col)
+    SOC = col_to_numeric(soc_col)
+    V   = col_to_numeric(hvb_col)
+
+    # Energy: convert to kWh if expressed in Wh; baseline to session start
+    E = col_to_numeric(energy_col)
+    if energy_col:
+        low = energy_col.lower()
+        if ("wh" in low and "kwh" not in low) or (E.dropna().quantile(0.95) > 1000):
+            E = E / 1000.0
+        first_valid = E.dropna().iloc[0] if E.dropna().size else pd.NA
+        if pd.notna(first_valid):
+            E = E - float(first_valid)
+        E = E.mask(E < 0)
+
+    # Build aligned numeric matrix (no synthetic interpolation)
+    s = pd.DataFrame(index=f.index)
+    s["P"]   = P
+    s["A"]   = A
+    s["SOC"] = SOC
+    s["E"]   = E
+    s["V"]   = V
+
+    # Light forward‑fill only for slowly‑changing signals
+    s["SOC"] = s["SOC"].ffill(limit=3)
+    s["E"]   = s["E"].ffill(limit=3)
+
+    # Drop rows where everything is NaN to prevent odd hover behaviour
+    s = s.dropna(how="all")
+    if s.empty:
+        return fig
+
+    def add_line(col, name, axis="y", hover_fmt="%{y}"):
+        series = s[col].dropna()
+        if series.empty:
+            return
         fig.add_trace(
             go.Scatter(
-                x=xs,
-                y=ys,
-                mode="text",
-                text=ts,
-                textposition="middle center",
-                textfont=dict(color="black"),
-                hoverinfo="skip",
-                showlegend=False,
+                x=series.index,
+                y=series.values,
+                name=name,
+                mode="lines",
+                yaxis=axis,
+                hovertemplate=hover_fmt + "<br>%{x|%b %-d, %H:%M:%S}<extra></extra>",
             )
         )
 
+    # Separate axes per series
+    add_line("P",   "Power (kW)",   axis="y",  hover_fmt="%{y:.2f} kW")
+    add_line("A",   "Amps Offered", axis="y2", hover_fmt="%{y:.0f} A")
+    add_line("SOC", "SoC (%)",      axis="y3", hover_fmt="%{y:.0f} %")
+    add_line("E",   "Energy (kWh)", axis="y4", hover_fmt="%{y:.2f} kWh")
+    add_line("V",   "HVB (V)",      axis="y5", hover_fmt="%{y:.0f} V")
+
     fig.update_layout(
-        title=title,
-        xaxis=dict(title="Hour (0–23)", dtick=1),
-        yaxis=dict(title="Day"),
-        plot_bgcolor="white",
-        paper_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=40, r=10, t=30, b=40),
+        margin=dict(l=10, r=200, t=30, b=10),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis=dict(title="Time (AK)"),
+        # y (left): Power
+        yaxis=dict(title="Power (kW)", autorange=True, fixedrange=False),
+        # y2..y5 (right): Amps, SoC, Energy, HVB
+        yaxis2=dict(
+            title="Amps (A)",
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=1.00,
+            autorange=True,
+            fixedrange=False,
+            title_standoff=6,
+        ),
+        yaxis3=dict(
+            title="SoC (%)",
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=0.98,
+            autorange=True,
+            fixedrange=False,
+            title_standoff=6,
+        ),
+        yaxis4=dict(
+            title="Energy (kWh)",
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=0.96,
+            autorange=True,
+            fixedrange=False,
+            title_standoff=6,
+        ),
+        yaxis5=dict(
+            title="HVB (V)",
+            overlaying="y",
+            side="right",
+            anchor="free",
+            position=0.94,
+            autorange=True,
+            fixedrange=False,
+            title_standoff=6,
+        ),
     )
     return fig
 
+def heatmap_count(heat, title):
+    """Session start counts per day/hour with white→blue cells, black borders and labels."""
+    if heat is None or heat.empty:
+        return go.Figure()
 
-def heatmap_count(starts_df: pd.DataFrame, title: str = "Session Start Density (by Day & Hour)") -> go.Figure:
-    """
-    Expect a DataFrame with a single column 'start_ts' (tz-naive or tz-aware).
-    Returns a Plotly heatmap where each cell is the number of starts for (day, hour).
-    """
-    if starts_df is None or starts_df.empty or "start_ts" not in starts_df.columns:
-        empty = pd.DataFrame(0, index=range(7), columns=range(24))
-        return _heatmap_from_grid(empty, title, _blank_or_int)
+    h = heat.copy()
+    # Normalize time → AK local then derive day/hour bins
+    h["start_local"] = h["start_ts"].dt.tz_convert(AK_TZ)
+    h["dow"] = h["start_local"].dt.dayofweek
+    h["hour"] = h["start_local"].dt.hour
 
-    ts_ak = _to_ak(starts_df["start_ts"])
-    base = pd.DataFrame({
-        "dow": (ts_ak.dt.dayofweek + 1) % 7,  # Sun=0..Sat=6
-        "hour": ts_ak.dt.hour,
-    }).dropna()
+    # 7×24 matrix, fill missing with 0 so we always render a full grid
+    mat = (
+        h.groupby(["dow", "hour"]).size().unstack(fill_value=0)
+        .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0)
+        .reindex(columns=range(24), fill_value=0)
+    )
+    mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-    if base.empty:
-        empty = pd.DataFrame(0, index=range(7), columns=range(24))
-        return _heatmap_from_grid(empty, title, _blank_or_int)
+    # Ensure numeric array (avoid object dtype rendering issues). Also cap zmax
+    z = mat.to_numpy(dtype=float)
+    # Guard against the all‑zero window (plotly auto with zmax=0 -> weird/blank).  
+    zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
 
-    grid = (
-        base.groupby(["dow", "hour"])
-        .size()
-        .unstack(fill_value=0)
-        .reindex(index=range(7), columns=range(24), fill_value=0)
+    # Explicit white→blue ramp so zero really looks white on dark background
+    blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
+
+    heatmap = go.Heatmap(
+        z=z.tolist(),
+        x=list(mat.columns),
+        y=list(mat.index),
+        colorscale=blues,
+        zmin=0,
+        zmax=zmax,
+        colorbar=dict(title="Starts"),
+        hoverongaps=False,
+        # Black borders via gaps (background shows through in Streamlit dark theme)
+        xgap=1,
+        ygap=1,
+        hovertemplate="Day: %{y}<br>Hour: %{x}<br>Starts: %{z:.0f}<extra></extra>",
     )
 
-    cmax = float(np.nanmax(grid.to_numpy(dtype=float))) if grid.size else 0.0
-    cmax = max(cmax, 1.0)
-
-    return _heatmap_from_grid(grid, title, _blank_or_int, zmin=0, zmax=cmax)
-
-
-def heatmap_duration(sessions_df: pd.DataFrame, title: str = "Average Session Duration (min)") -> go.Figure:
-    """
-    Expect a DataFrame with a start timestamp and a duration column.
-    - Start column can be one of: 'start_ts', '_start', 'Start (UTC)', 'start_time'
-    - Duration column can be one of: 'Duration (min)', 'duration_min', 'duration_mins', 'duration', 'dur_min'
-    Cells with 0/NaN are left blank.
-    """
-    if sessions_df is None or sessions_df.empty:
-        empty = pd.DataFrame(np.nan, index=range(7), columns=range(24))
-        return _heatmap_from_grid(empty, title, _blank_or_float1)
-
-    # Resolve columns
-    ts_col = next((c for c in ["start_ts", "_start", "Start (UTC)", "start_time"] if c in sessions_df.columns), None)
-    dur_col = next((c for c in ["Duration (min)", "duration_min", "duration_mins", "duration", "dur_min"] if c in sessions_df.columns), None)
-
-    if ts_col is None or dur_col is None:
-        empty = pd.DataFrame(np.nan, index=range(7), columns=range(24))
-        return _heatmap_from_grid(empty, title, _blank_or_float1)
-
-    ts_ak = _to_ak(sessions_df[ts_col])
-    dur = pd.to_numeric(sessions_df[dur_col], errors="coerce")
-
-    df = pd.DataFrame(
-        {
-            "dow": (ts_ak.dt.dayofweek + 1) % 7,  # Sun=0 .. Sat=6
-            "hour": ts_ak.dt.hour,
-            "dur": dur,
-        }
-    ).dropna(subset=["dur"])
-
-    # Remove zeros/negatives from averaging
-    df = df[df["dur"] > 0]
-
-    # Clip colors at the 95th percentile (min 30, max 240 minutes for readability)
-    zmax = float(np.nanpercentile(df["dur"], 95)) if not df.empty else 0.0
-    zmax = float(np.clip(zmax, 30.0, 240.0)) if zmax else 60.0
-
-    grid = df.groupby(["dow", "hour"])["dur"].mean().unstack()
-    grid = grid.reindex(index=range(7), columns=range(24), fill_value=np.nan)
-    return _heatmap_from_grid(grid, title, _blank_or_float1, zmin=0, zmax=zmax)
-
-
-def session_detail_figure(*args, title: str = "Charge Session Details", **kwargs) -> go.Figure:
-    """
-    Compatibility wrapper for session details plotting.
-
-    Supported call patterns:
-      1) session_detail_figure(df)
-      2) session_detail_figure(mv, selected_sid, selected_tx)
-      3) session_detail_figure(mv=..., station_id=..., transaction_id=...)
-
-    The dataframe rows used for plotting should include some combination of:
-      - timestamp column: one of ["timestamp", "ts", "time", "_time", "start_ts", "Start (UTC)"]
-      - power column: "power_w"
-      - energy column: "energy_wh"
-
-    The chart shows Power (kW) on the primary Y axis and Energy (kWh) on a secondary Y axis
-    when available. If energy_wh is not present, a trapezoidal integral of power is used
-    to approximate cumulative energy.
-    """
-    # ---- Parse inputs to obtain a dataframe of the selected session ----
-    df: Optional[pd.DataFrame] = None
-
-    if len(args) == 1 and isinstance(args[0], pd.DataFrame):
-        # New style: just pass the filtered session frame
-        df = args[0]
-    elif len(args) >= 3 and isinstance(args[0], pd.DataFrame):
-        # Legacy style: (mv, selected_sid, selected_tx)
-        mv = args[0]
-        selected_sid = args[1]
-        selected_tx = args[2]
-        try:
-            df = mv[(mv["station_id"] == selected_sid) & (mv["transaction_id"] == selected_tx)].copy()
-        except Exception:
-            df = pd.DataFrame()
-    else:
-        # kwargs style
-        if "df" in kwargs and isinstance(kwargs["df"], pd.DataFrame):
-            df = kwargs["df"]
-        elif {"mv", "station_id", "transaction_id"} <= set(kwargs):
-            mv = kwargs.get("mv")
-            selected_sid = kwargs.get("station_id")
-            selected_tx = kwargs.get("transaction_id")
-            try:
-                df = mv[(mv["station_id"] == selected_sid) & (mv["transaction_id"] == selected_tx)].copy()
-            except Exception:
-                df = pd.DataFrame()
-
-    fig = go.Figure()
+    fig = go.Figure(data=heatmap)
     fig.update_layout(
+        margin=dict(l=10, r=10, t=30, b=10),
         title=title,
-        xaxis_title="Time (AK)",
-        yaxis_title="kW / A / V / %",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=40, r=40, t=50, b=40),
-        hovermode="x unified",
+        xaxis=dict(title="Hour (0-23)", type="category"),
+        yaxis=dict(title="Day", type="category"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    # Overlay numeric labels so they render across Plotly versions
+    xs, ys, labels = [], [], []
+    cols = list(mat.columns)
+    rows = list(mat.index)
+    for yi, row in enumerate(rows):
+        for xi, col in enumerate(cols):
+            val = z[yi, xi]
+            if np.isfinite(val) and val != 0:
+                xs.append(col)
+                ys.append(row)
+                labels.append(f"{int(round(val))}")
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="text", text=labels,
+        textposition="middle center",
+        textfont=dict(color="black", size=12),
+        hoverinfo="skip", showlegend=False
+    ))
+    return fig
+
+def heatmap_duration(heat, title):
+    """Average session duration (minutes) per day/hour with white→blue cells, black borders and labels."""
+    if heat is None or heat.empty:
+        return go.Figure()
+
+    h = heat.copy()
+    h["start_local"] = h["start_ts"].dt.tz_convert(AK_TZ)
+    h["dow"] = h["start_local"].dt.dayofweek
+    h["hour"] = h["start_local"].dt.hour
+
+    mat = (
+        h.groupby(["dow", "hour"])  # mean minutes per bin
+         ["dur_min"].mean().unstack(fill_value=0.0)
+         .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0.0)
+         .reindex(columns=range(24), fill_value=0.0)
+    )
+    mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+    z = mat.to_numpy(dtype=float)
+    # Robust color range (avoid all‑black/blank when values are tiny or all zeros)
+    zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
+
+    blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
+
+    heatmap = go.Heatmap(
+        z=z.tolist(),
+        x=list(mat.columns),
+        y=list(mat.index),
+        colorscale=blues,
+        zmin=0,
+        zmax=zmax,
+        colorbar=dict(title="Avg min"),
+        hoverongaps=False,
+        xgap=1,
+        ygap=1,
+        hovertemplate="Day: %{y}<br>Hour: %{x}<br>Avg min: %{z:.1f}<extra></extra>",
     )
 
-    if df is None or df.empty:
-        return fig
-
-    # ---- Detect timestamp column and convert to Alaska time for display ----
-    tcol = next((c for c in ["timestamp", "ts", "time", "_time", "start_ts", "Start (UTC)"] if c in df.columns), None)
-    if tcol is None:
-        return fig
-
-    t = pd.to_datetime(df[tcol], errors="coerce", utc=True)
-    try:
-        t_ak = t.dt.tz_convert("America/Anchorage")
-    except Exception:
-        t_ak = t
-
-    # ---- Add traces if available ----
-    added = 0
-
-    # Power (kW)
-    if "power_w" in df.columns:
-        y_kw = pd.to_numeric(df["power_w"], errors="coerce") / 1000.0
-        fig.add_trace(
-            go.Scatter(x=t_ak, y=y_kw, mode="lines", name="Power (kW)")
-        )
-        added += 1
-
-    # Energy (kWh) or approximate from power
-    if "energy_wh" in df.columns:
-        y_kwh = pd.to_numeric(df["energy_wh"], errors="coerce") / 1000.0
-        fig.add_trace(
-            go.Scatter(x=t_ak, y=y_kwh, mode="lines", name="Energy (kWh)", yaxis="y2")
-        )
-        added += 1
-    elif "power_w" in df.columns:
-        # Approximate cumulative energy from power
-        s = df[[tcol, "power_w"]].copy()
-        s[tcol] = pd.to_datetime(s[tcol], errors="coerce", utc=True)
-        s = s.sort_values(tcol)
-        ts = (s[tcol].astype("int64") // 10**9).to_numpy()
-        p_kw = pd.to_numeric(s["power_w"], errors="coerce").fillna(0).to_numpy() / 1000.0
-        if len(p_kw) > 1:
-            dt_h = np.diff(ts) / 3600.0
-            e_kwh = np.concatenate([[0.0], np.cumsum(p_kw[:-1] * dt_h)])
-            fig.add_trace(
-                go.Scatter(
-                    x=pd.to_datetime(s[tcol], utc=True).tz_convert("America/Anchorage"),
-                    y=e_kwh,
-                    mode="lines",
-                    name="Energy (kWh)",
-                    yaxis="y2",
-                )
-            )
-            added += 1
-
-    # Current (A)
-    for col in ["amperage_import", "current_a"]:
-        if col in df.columns:
-            y_a = pd.to_numeric(df[col], errors="coerce")
-            fig.add_trace(
-                go.Scatter(x=t_ak, y=y_a, mode="lines", name="Amps (A)")
-            )
-            added += 1
-            break
-
-    # Offered current (A)
-    for col in ["amperage_offered", "offered_current_a"]:
-        if col in df.columns:
-            y_oa = pd.to_numeric(df[col], errors="coerce")
-            fig.add_trace(
-                go.Scatter(x=t_ak, y=y_oa, mode="lines", name="Offered A")
-            )
-            added += 1
-            break
-
-    # Voltage (V) — charger DC bus
-    for col in ["voltage_v", "dc_voltage_v"]:
-        if col in df.columns:
-            y_v = pd.to_numeric(df[col], errors="coerce")
-            fig.add_trace(
-                go.Scatter(x=t_ak, y=y_v, mode="lines", name="Voltage (V)")
-            )
-            added += 1
-            break
-
-    # HV Battery Voltage (V) if available
-    if "hbv_v" in df.columns:
-        y_hbv = pd.to_numeric(df["hbv_v"], errors="coerce")
-        fig.add_trace(
-            go.Scatter(x=t_ak, y=y_hbv, mode="lines", name="HBV (V)")
-        )
-        added += 1
-
-    # State of Charge (%) if available
-    for col in ["soc", "SoC", "SoC (%)"]:
-        if col in df.columns:
-            y_soc = pd.to_numeric(df[col], errors="coerce")
-            fig.add_trace(
-                go.Scatter(x=t_ak, y=y_soc, mode="lines", name="SoC (%)")
-            )
-            added += 1
-            break
-
-    # ---- Axes config ----
-    if added >= 2:
-        fig.update_layout(
-            yaxis=dict(title="Power (kW)"),
-            yaxis2=dict(title="Energy (kWh)", overlaying="y", side="right", showgrid=False),
-        )
-    else:
-        fig.update_layout(yaxis=dict(title="Value"))
-
+    fig = go.Figure(data=heatmap)
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=30, b=10),
+        title=title,
+        xaxis=dict(title="Hour (0-23)", type="category"),
+        yaxis=dict(title="Day", type="category"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    # Overlay numeric labels (one decimal) for reliability across Plotly versions
+    xs, ys, labels = [], [], []
+    cols = list(mat.columns)
+    rows = list(mat.index)
+    for yi, row in enumerate(rows):
+        for xi, col in enumerate(cols):
+            val = z[yi, xi]
+            if np.isfinite(val) and val != 0:
+                xs.append(col)
+                ys.append(row)
+                labels.append(f"{val:.1f}")
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="text", text=labels,
+        textposition="middle center",
+        textfont=dict(color="black", size=12),
+        hoverinfo="skip", showlegend=False
+    ))
     return fig
