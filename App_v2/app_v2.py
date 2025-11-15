@@ -55,10 +55,60 @@ with st.sidebar:
     # Optional diagnostics to verify DB connectivity & table counts on Render
     with st.expander("Diagnostics", expanded=False):
         try:
-            conn = get_conn()
-            st.success("DB connected")
-            cur = conn.cursor()
-            table_order = [
+            raw_conn = get_conn()
+
+            # Open an executable connection across both SQLAlchemy Engines and sqlite3 connections
+            exec_conn = raw_conn
+            if hasattr(raw_conn, "connect") and not hasattr(raw_conn, "cursor"):
+                # SQLAlchemy Engine -> Connection
+                exec_conn = raw_conn.connect()
+
+            def _run(sql: str, params=None):
+                """Best-effort SQL runner that works for SQLAlchemy (exec_driver_sql/execute) and sqlite3."""
+                params = params or {}
+                # SQLAlchemy Connection (preferred)
+                if hasattr(exec_conn, "exec_driver_sql"):
+                    res = exec_conn.exec_driver_sql(sql, params)
+                    try:
+                        return res.fetchall()
+                    except Exception:
+                        return []
+                if hasattr(exec_conn, "execute"):
+                    res = exec_conn.execute(sql, params)
+                    try:
+                        return res.fetchall()
+                    except Exception:
+                        return []
+                # Raw DB-API (e.g., sqlite3)
+                cur = exec_conn.cursor()
+                if isinstance(params, (list, tuple)):
+                    cur.execute(sql, params)
+                elif isinstance(params, dict):
+                    # Fall back to tuple of dict values for sqlite3
+                    cur.execute(sql, tuple(params.values()))
+                else:
+                    cur.execute(sql)
+                rows = cur.fetchall()
+                return rows
+
+            # Detect backend
+            backend = "unknown"
+            try:
+                v = _run("select version()")
+                if v and "PostgreSQL" in str(v[0][0]):
+                    backend = "postgres"
+                elif v and "SQLite" in str(v[0][0]):
+                    backend = "sqlite"
+            except Exception:
+                try:
+                    _ = _run("pragma user_version")
+                    backend = "sqlite"
+                except Exception:
+                    pass
+
+            st.success(f"DB connected ({backend})")
+
+            expected_tables = [
                 "sessions",
                 "session_logs",
                 "meter_values",
@@ -68,23 +118,104 @@ with st.sidebar:
                 "realtime_websocket",
                 "connectivity_logs",
             ]
-            counts = {}
-            for t in table_order:
-                try:
-                    cur.execute(f"SELECT COUNT(*) FROM {t}")
-                    counts[t] = int(cur.fetchone()[0])
-                except Exception:
-                    # table may not exist; skip silently
-                    continue
-            if counts:
-                st.json(counts)
+
+            # Enumerate tables present
+            if backend == "postgres":
+                tbl_rows = _run("select table_name from information_schema.tables where table_schema='public'")
+                present_tables = {r[0] for r in tbl_rows}
             else:
-                st.write("No known telemetry tables were found.")
+                tbl_rows = _run("select name from sqlite_master where type='table'")
+                present_tables = {r[0] for r in tbl_rows}
+
+            st.write("**Tables present**")
+            st.json(sorted(present_tables))
+
+            missing_tables = [t for t in expected_tables if t not in present_tables]
+            if missing_tables:
+                st.warning(f"Missing tables: {', '.join(missing_tables)}")
+
+            # Helper to list columns for a table
+            def _list_columns(table_name: str):
+                if backend == "postgres":
+                    rows = _run(
+                        "select column_name, data_type from information_schema.columns where table_schema='public' and table_name=%(t)s",
+                        {"t": table_name},
+                    )
+                    return [r[0] for r in rows]
+                else:
+                    # sqlite PRAGMA table_info returns: cid, name, type, ...
+                    rows = _run(f"pragma table_info({table_name})")
+                    return [r[1] for r in rows]
+
+            # Column inventory for meter tables (check for 'hbv_v')
+            expected_meter_cols = [
+                "station_id","connector_id","transaction_id","timestamp",
+                "power_w","energy_wh","soc","amperage_offered","amperage_import",
+                "power_offered_w","voltage_v","hbv_v"
+            ]
+            col_report = {}
+            for tbl in ["realtime_meter_values", "meter_values"]:
+                if tbl in present_tables:
+                    cols = _list_columns(tbl)
+                    miss = [c for c in expected_meter_cols if c not in cols]
+                    col_report[tbl] = {"columns": cols, "missing_expected": miss}
+            if col_report:
+                st.write("**Column inventory (meter tables)**")
+                st.json(col_report)
+                if any("hbv_v" in v.get("missing_expected", []) for v in col_report.values()):
+                    st.info(
+                        "Hint: your Postgres tables are missing 'hbv_v'. To match the local SQLite schema, run:\n"
+                        "```sql\n"
+                        "ALTER TABLE public.realtime_meter_values ADD COLUMN hbv_v double precision;\n"
+                        "ALTER TABLE public.meter_values ADD COLUMN hbv_v double precision;\n"
+                        "```"
+                    )
+
+            # Window sanity counts (uses current sidebar date range)
+            def _window_counts(table_name: str):
+                if backend == "postgres":
+                    sql = f"""
+                    select
+                      min((regexp_replace("timestamp",'Z$','+00:00'))::timestamptz) as min_ts,
+                      max((regexp_replace("timestamp",'Z$','+00:00'))::timestamptz) as max_ts,
+                      count(*) as n
+                    from public.{table_name}
+                    where "timestamp" ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}T'
+                      and (regexp_replace("timestamp",'Z$','+00:00'))::timestamptz
+                          between %(s)s and %(e)s
+                    """
+                    rows = _run(sql, {"s": start_utc, "e": end_utc})
+                else:
+                    sql = f"""
+                    select min(timestamp), max(timestamp), count(*)
+                    from {table_name}
+                    where timestamp between ? and ?
+                    """
+                    rows = _run(sql, [start_utc, end_utc])
+                return rows[0] if rows else None
+
+            window_report = {}
+            for tname in ["realtime_meter_values","meter_values","sessions","status_notifications","realtime_websocket"]:
+                if tname in present_tables:
+                    r = _window_counts(tname)
+                    if r:
+                        window_report[tname] = {"min": str(r[0]), "max": str(r[1]), "rows": int(r[2]) if r[2] is not None else None}
+            if window_report:
+                st.write("**Rows in current window**")
+                st.json(window_report)
+
         except Exception as e:
             st.error(f"DB error: {e}")
         finally:
+            # Close connections if applicable
             try:
-                conn.close()
+                if 'exec_conn' in locals() and hasattr(exec_conn, "close"):
+                    exec_conn.close()
+            except Exception:
+                pass
+            try:
+                if 'raw_conn' in locals() and hasattr(raw_conn, "close"):
+                    raw_conn.close()
             except Exception:
                 pass
 
