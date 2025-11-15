@@ -369,8 +369,21 @@ with t1:
                 s2 = s2.sort_values("_start_ak").drop_duplicates(subset=dedupe_keys, keep="first")
 
         # ---------- Count heatmap: session starts by day/hour ----------
-        # Use crosstab to build a stable (dow x hour) grid and avoid any edge-cases with groupby/unstack.
-        counts = pd.crosstab(s2["_dow"], s2["_hour"]).astype(int)
+        # Use explicit groupby(size) instead of crosstab to avoid dtype/engine quirks seen on Render.
+        # Ensure day-of-week and hour are clean integers first.
+        _d = pd.to_numeric(s2["_dow"], errors="coerce").astype("Int64")
+        _h = pd.to_numeric(s2["_hour"], errors="coerce").astype("Int64")
+        tmp = (
+            pd.DataFrame({"dow": _d, "hour": _h})
+            .dropna()
+            .astype({"dow": int, "hour": int})
+        )
+
+        counts = (
+            tmp.groupby(["dow", "hour"])
+               .size()
+               .unstack(fill_value=0)
+        )
 
         # Stable grid Sun..Sat and hours 0..23
         sun_first = [6, 0, 1, 2, 3, 4, 5]
@@ -386,12 +399,7 @@ with t1:
         count_text = np.where(count_vals > 0, counts.values.astype(int).astype(str), "")
 
         # Upper bound for color scale (avoid a flat palette when all zeros)
-        zmax_count = 1
-        if counts.size:
-            try:
-                zmax_count = int(max(1, float(np.nanmax(counts.values))))
-            except Exception:
-                zmax_count = 1
+        zmax_count = int(max(1, int(np.nanmax(counts.values)))) if counts.size else 1
 
         fig_count = go.Figure(
             data=go.Heatmap(
