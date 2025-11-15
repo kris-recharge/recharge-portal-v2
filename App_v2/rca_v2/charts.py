@@ -62,6 +62,8 @@ def _heatmap_from_grid(
     z = grid.to_numpy(dtype=float, copy=True)
     text = grid.applymap(value_to_text).to_numpy()
 
+    # Use customdata for annotations to avoid Plotly falling back to x/y labels
+    customdata = text
     y_labels = [DAY_LABELS[i] for i in grid.index]
     x_labels = list(grid.columns)
 
@@ -73,10 +75,12 @@ def _heatmap_from_grid(
             colorscale=colorscale,
             zmin=zmin,
             zmax=zmax,
-            text=text,
-            texttemplate="%{text}",
-            hovertemplate="Day: %{y}<br>Hour: %{x}<br>Value: %{z:.0f}<extra></extra>",
+            customdata=customdata,
+            texttemplate="%{customdata}",
+            hovertemplate="Day: %{y}<br>Hour: %{x}<br>Value: %{z:.1f}<extra></extra>",
             colorbar=dict(title=None),
+            xgap=1,
+            ygap=1,
         )
     )
     fig.update_layout(
@@ -116,7 +120,10 @@ def heatmap_count(starts_df: pd.DataFrame, title: str = "Session Start Density (
         .reindex(index=range(7), columns=range(24), fill_value=0)
     )
 
-    return _heatmap_from_grid(grid, title, _blank_or_int)
+    cmax = float(np.nanmax(grid.to_numpy(dtype=float))) if grid.size else 0.0
+    cmax = max(cmax, 1.0)
+
+    return _heatmap_from_grid(grid, title, _blank_or_int, zmin=0, zmax=cmax)
 
 
 def heatmap_duration(sessions_df: pd.DataFrame, title: str = "Average Session Duration (min)") -> go.Figure:
@@ -152,9 +159,13 @@ def heatmap_duration(sessions_df: pd.DataFrame, title: str = "Average Session Du
     # Remove zeros/negatives from averaging
     df = df[df["dur"] > 0]
 
+    # Clip colors at the 95th percentile (min 30, max 240 minutes for readability)
+    zmax = float(np.nanpercentile(df["dur"], 95)) if not df.empty else 0.0
+    zmax = float(np.clip(zmax, 30.0, 240.0)) if zmax else 60.0
+
     grid = df.groupby(["dow", "hour"])["dur"].mean().unstack()
     grid = grid.reindex(index=range(7), columns=range(24), fill_value=np.nan)
-    return _heatmap_from_grid(grid, title, _blank_or_float1)
+    return _heatmap_from_grid(grid, title, _blank_or_float1, zmin=0, zmax=zmax)
 
 
 def session_detail_figure(*args, title: str = "Charge Session Details", **kwargs) -> go.Figure:
