@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 import inspect
+import plotly.graph_objects as go
 
 from rca_v2.config import APP_MODE
 from rca_v2.ui import render_sidebar, sessions_table_single_select
@@ -319,16 +320,107 @@ with t1:
         st.info("Select a session above to view details.")
 
     # Heatmaps — stacked full width (to match v1 layout)
-    st.plotly_chart(
-        heatmap_count(heat, "Session Start Density (by Day & Hour)"),
-        use_container_width=True,
-        config={"displaylogo": False},
-    )
-    st.plotly_chart(
-        heatmap_duration(heat, "Average Session Duration (min)"),
-        use_container_width=True,
-        config={"displaylogo": False},
-    )
+    # Rebuild heatmaps from sessions to ensure AK-local bucketing and robust de-duplication.
+    try:
+        s2 = sess.copy()
+
+        # Robust de-duplication: prefer transaction_id; fallback to (_start, station_id)
+        # Build a UTC start datetime if not already present
+        if "_start" in s2.columns:
+            starts_utc = pd.to_datetime(s2["_start"], errors="coerce", utc=True)
+        else:
+            starts_utc = pd.to_datetime(s2.get("Start Date/Time"), errors="coerce", utc=True)
+
+        # Drop rows with invalid starts
+        s2 = s2.loc[starts_utc.notna()].copy()
+        starts_utc = starts_utc.loc[starts_utc.notna()]
+
+        # Alaska-local for bucketing
+        AK = "America/Anchorage"
+        starts_ak = starts_utc.dt.tz_convert(AK)
+
+        # Attach working columns for bucketing
+        s2["_start_ak"] = starts_ak
+        s2["_dow"] = s2["_start_ak"].dt.dayofweek  # Mon=0..Sun=6
+        s2["_hour"] = s2["_start_ak"].dt.hour
+
+        # De-dupe keys
+        dedupe_keys = []
+        if "transaction_id" in s2.columns:
+            dedupe_keys = ["transaction_id"]
+        else:
+            # Fallback if tx id is unavailable
+            if "station_id" in s2.columns:
+                dedupe_keys = ["_start_ak", "station_id"]
+            elif "EVSE" in s2.columns:
+                dedupe_keys = ["_start_ak", "EVSE"]
+
+        if dedupe_keys:
+            s2 = s2.sort_values(by="_start_ak").drop_duplicates(subset=dedupe_keys, keep="first")
+
+        # ---- Count heatmap (starts per day/hour) ----
+        counts = (
+            s2.groupby(["_dow", "_hour"])
+              .size()
+              .unstack(fill_value=0)
+        )
+
+        # Reindex to Sun..Sat and hours 0..23 for a stable grid
+        sun_first = [6, 0, 1, 2, 3, 4, 5]
+        counts = counts.reindex(index=sun_first, fill_value=0).reindex(columns=range(24), fill_value=0)
+        counts.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+        fig_count = go.Figure(
+            data=go.Heatmap(
+                z=counts.values,
+                x=[f"{h:02d}" for h in counts.columns],
+                y=list(counts.index),
+                colorbar=dict(title="Starts"),
+                hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Starts: %{z}<extra></extra>",
+            )
+        )
+        fig_count.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=420)
+
+        # ---- Duration heatmap (avg minutes per day/hour) ----
+        dur = pd.to_numeric(s2.get("Duration (min)"), errors="coerce")
+        s2["_dur"] = dur
+
+        dur_pivot = (
+            s2.groupby(["_dow", "_hour"])["_dur"]
+              .mean()
+              .unstack()
+        )
+        dur_pivot = dur_pivot.reindex(index=sun_first, fill_value=np.nan).reindex(columns=range(24), fill_value=np.nan)
+        dur_pivot.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+        fig_dur = go.Figure(
+            data=go.Heatmap(
+                z=dur_pivot.values,
+                x=[f"{h:02d}" for h in dur_pivot.columns],
+                y=list(dur_pivot.index),
+                colorbar=dict(title="Avg min"),
+                hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Avg min: %{z:.1f}<extra></extra>",
+                zmin=0
+            )
+        )
+        fig_dur.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=420)
+
+        # Render both heatmaps
+        st.plotly_chart(fig_count, use_container_width=True, config={"displaylogo": False})
+        st.plotly_chart(fig_dur, use_container_width=True, config={"displaylogo": False})
+
+    except Exception:
+        # Fallback to previous implementation if anything goes sideways
+        st.plotly_chart(
+            heatmap_count(heat, "Session Start Density (by Day & Hour)"),
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
+        st.plotly_chart(
+            heatmap_duration(heat, "Average Session Duration (min)"),
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
 
     # Cache latest results for the Data Export tab
     st.session_state["__v2_last_sessions"] = sess.copy()
