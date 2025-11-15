@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from typing import Sequence, Optional
 from sqlalchemy import inspect
+from sqlalchemy import text, bindparam
 from sqlalchemy.engine import Engine, Connection
 from .config import DB_BACKEND, AK_TZ
 from .db import get_conn, param_placeholder
@@ -19,6 +20,32 @@ def _make_placeholders(n: int) -> str:
         return ",".join(["%s"] * n)
     # default: sqlite
     return ",".join(["?"] * n)
+
+
+def _ts_cast_sql() -> str:
+    """
+    Return an expression that safely casts the TEXT `timestamp` column into timestamptz on Postgres.
+    Falls back to plain column on sqlite.
+    """
+    if DB_BACKEND == "postgres":
+        # convert trailing Z to +00:00 to satisfy timestamptz
+        return '(regexp_replace("timestamp", \'Z$\', \'+00:00\'))::timestamptz'
+    return _ts_col()
+
+def _ts_has_iso_sql() -> str:
+    """Predicate ensuring the timestamp looks ISO-like before casting (Postgres safety)."""
+    if DB_BACKEND == "postgres":
+        return "\"timestamp\" ~ '^\\d{4}-\\d{2}-\\d{2}T'"
+    return "1=1"
+
+def _stations_pred_sa(stations):
+    """
+    For SQLAlchemy text() queries on Postgres: build an expanding IN predicate
+    and a matching bindparam. Returns (predicate_sql, bindparam_or_none).
+    """
+    if not stations:
+        return "1=1", None
+    return "station_id IN :stations", bindparam("stations", expanding=True)
 
 
 def _sa_engine(conn_or_engine) -> Optional[Engine]:
@@ -41,59 +68,45 @@ def _first_existing(conn, names: Sequence[str]) -> Optional[str]:
       • If we have a SQLAlchemy Engine/Connection (Postgres path on Render):
           1) Try SQLAlchemy inspector with schema="public" (Postgres).
           2) If not found, probe with a lightweight "SELECT 1 FROM ..." for each candidate.
-      • Otherwise, fall back to sqlite's sqlite_master check (raw sqlite3 path).
+      • Otherwise, fall back to sqlite's sqlite_master check (raw sqlite3 path) — only if the
+        connection actually has a .cursor() attribute (to avoid 'Connection has no cursor').
     """
     eng = _sa_engine(conn)
 
     # ---------- Postgres / SQLAlchemy path ----------
-    if eng is not None:
+    if eng is not None and DB_BACKEND == "postgres":
         try:
             insp = inspect(eng)
         except Exception:
             insp = None
 
-        # Determine schema hint for Postgres
-        schema = None
-        try:
-            dname = eng.dialect.name.lower()
-            if dname.startswith("postgres"):
-                schema = "public"
-        except Exception:
-            pass
-
+        schema = "public"
         for n in names:
             # 1) Inspector check
             try:
                 if insp is not None and insp.has_table(n, schema=schema):
                     return n
             except Exception:
-                # inspector may fail under certain permission/driver combos; fall through to probe
                 pass
-
-            # 2) Lightweight probe: SELECT 1 FROM {target} LIMIT 1
-            if schema:
-                targets = [f'{schema}."{n}"', f'{schema}.{n}']
-            else:
-                targets = [n]
-
-            for target in targets:
+            # 2) Lightweight probe
+            for target in (f'{schema}."{n}"', f"{schema}.{n}"):
                 try:
-                    if isinstance(conn, Connection):
-                        conn.exec_driver_sql(f"SELECT 1 FROM {target} LIMIT 1")
-                    else:
-                        with eng.connect() as c2:
-                            c2.exec_driver_sql(f"SELECT 1 FROM {target} LIMIT 1")
+                    with eng.connect() as c2:
+                        c2.exec_driver_sql(f"SELECT 1 FROM {target} LIMIT 1")
                     return n
                 except Exception:
-                    continue  # try next target rendition
+                    continue
+        return None  # do not fall into sqlite path with a SQLAlchemy engine
 
-    # ---------- sqlite fallback ----------
+    # ---------- sqlite fallback (local) ----------
     try:
-        cur = conn.cursor()  # raw sqlite3 connection
-        for n in names:
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (n,))
-            if cur.fetchone() is not None:
-                return n
+        # only attempt if this object actually behaves like sqlite3 connection
+        if hasattr(conn, "cursor"):
+            cur = conn.cursor()
+            for n in names:
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (n,))
+                if cur.fetchone() is not None:
+                    return n
     except Exception:
         pass
 
@@ -116,11 +129,53 @@ def _normalize_ids(df: pd.DataFrame) -> pd.DataFrame:
 def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_meter_values for the given stations and UTC window.
-    Returns a DataFrame with parsed dtypes.
+    Postgres path uses SQLAlchemy text() with proper timestamptz casting;
+    sqlite path retains the existing parameter style.
     """
-    # If stations is empty/None, we will query all stations in the time window
-    ph = param_placeholder()
     conn = get_conn()
+    eng = _sa_engine(conn)
+
+    # ---------- Postgres path (Render) ----------
+    if DB_BACKEND == "postgres" and eng is not None:
+        table = _first_existing(eng, ["realtime_meter_values", "meter_values"])
+        if not table:
+            return pd.DataFrame()
+
+        ts_cast = _ts_cast_sql()
+        ts_pred = f"{ts_cast} BETWEEN :start AND :end"
+        has_iso = _ts_has_iso_sql()
+        pred_stations, bp = _stations_pred_sa(stations)
+
+        sql = text(f"""
+            SELECT
+                station_id, connector_id, transaction_id, "timestamp",
+                power_w, energy_wh, soc, amperage_offered, amperage_import, power_offered_w, voltage_v, hbv_v
+            FROM public.{table}
+            WHERE {pred_stations}
+              AND {has_iso}
+              AND {ts_pred}
+            ORDER BY {ts_cast} ASC
+        """)
+        if bp is not None:
+            sql = sql.bindparams(bp)
+
+        params = {"start": start_utc, "end": end_utc}
+        if stations:
+            params["stations"] = tuple(stations)
+
+        with eng.connect() as c:
+            df = pd.read_sql(sql, c, params=params)
+
+        df = _normalize_ids(df)
+        if not df.empty:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            for ccol in ["power_w","energy_wh","soc","amperage_offered","amperage_import","power_offered_w","voltage_v","hbv_v"]:
+                if ccol in df.columns:
+                    df[ccol] = pd.to_numeric(df[ccol], errors="coerce")
+        return df
+
+    # ---------- sqlite fallback (local dev) ----------
+    ph = param_placeholder()
     try:
         table = _first_existing(conn, ["realtime_meter_values", "meter_values"])
         if not table:
@@ -142,8 +197,6 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
         try:
             df = pd.read_sql(sql, conn, params=params)
             df = _normalize_ids(df)
-            # Fallback: if a multi-station query returns empty but single-station queries succeed,
-            # run per-EVSE and concatenate (addresses IN-clause driver quirks).
             if (df is None or df.empty) and stations and len(stations) > 1:
                 frames = []
                 single_sql = f"""
@@ -162,7 +215,6 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                     df = pd.concat(frames, ignore_index=True)
                     df = _normalize_ids(df)
         except Exception:
-            # As an additional hard fallback, also attempt per-station queries
             df = pd.DataFrame()
             if stations and len(stations) >= 1:
                 frames = []
@@ -185,7 +237,10 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                     df = pd.concat(frames, ignore_index=True)
                     df = _normalize_ids(df)
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     if not df.empty:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -198,11 +253,50 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_authorize rows (VID: id_tags) with a small time pad around the window.
     """
-    # If stations is empty/None, we will query all stations in the time window
     start_pad = (pd.to_datetime(start_utc) - pd.Timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_pad   = (pd.to_datetime(end_utc)   + pd.Timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    ph = param_placeholder()
+
     conn = get_conn()
+    eng = _sa_engine(conn)
+
+    # ---------- Postgres path ----------
+    if DB_BACKEND == "postgres" and eng is not None:
+        table = _first_existing(eng, ["realtime_authorize", "authorize"])
+        if not table:
+            return pd.DataFrame()
+
+        ts_cast = _ts_cast_sql()
+        ts_pred = f"{ts_cast} BETWEEN :start AND :end"
+        has_iso = _ts_has_iso_sql()
+        pred_stations, bp = _stations_pred_sa(stations)
+
+        sql = text(f"""
+            SELECT station_id, "timestamp", id_tag
+            FROM public.{table}
+            WHERE {pred_stations}
+              AND {has_iso}
+              AND {ts_pred}
+            ORDER BY {ts_cast} ASC
+        """)
+        if bp is not None:
+            sql = sql.bindparams(bp)
+
+        params = {"start": start_pad, "end": end_pad}
+        if stations:
+            params["stations"] = tuple(stations)
+
+        with eng.connect() as c:
+            df = pd.read_sql(sql, c, params=params)
+
+        df = _normalize_ids(df)
+        if not df.empty:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df["id_tag"] = df["id_tag"].astype(str)
+            df = df[df["id_tag"].str.startswith("VID:", na=False)]
+        return df
+
+    # ---------- sqlite fallback ----------
+    ph = param_placeholder()
     try:
         table = _first_existing(conn, ["realtime_authorize", "authorize"])
         if not table:
@@ -220,51 +314,13 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
           ORDER BY station_id, {_ts_col()}
         """
         params.extend([start_pad, end_pad])
-        try:
-            df = pd.read_sql(sql, conn, params=params)
-            df = _normalize_ids(df)
-            # Fallback: if a multi-station query returns empty but single-station queries succeed,
-            # run per-EVSE and concatenate (addresses IN-clause driver quirks).
-            if (df is None or df.empty) and stations and len(stations) > 1:
-                frames = []
-                single_sql = f"""
-                  SELECT station_id, {_ts_col()} AS timestamp, id_tag
-                  FROM {table}
-                  WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN {ph} AND {ph}
-                  ORDER BY station_id, {_ts_col()}
-                """
-                for sid in stations:
-                    f = pd.read_sql(single_sql, conn, params=[sid, start_pad, end_pad])
-                    if f is not None and not f.empty:
-                        frames.append(f)
-                if frames:
-                    df = pd.concat(frames, ignore_index=True)
-                    df = _normalize_ids(df)
-        except Exception:
-            # As an additional hard fallback, also attempt per-station queries
-            df = pd.DataFrame()
-            if stations and len(stations) >= 1:
-                frames = []
-                single_sql = f"""
-                  SELECT station_id, {_ts_col()} AS timestamp, id_tag
-                  FROM {table}
-                  WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN {ph} AND {ph}
-                  ORDER BY station_id, {_ts_col()}
-                """
-                for sid in stations:
-                    try:
-                        f = pd.read_sql(single_sql, conn, params=[sid, start_pad, end_pad])
-                        if f is not None and not f.empty:
-                            frames.append(f)
-                    except Exception:
-                        pass
-                if frames:
-                    df = pd.concat(frames, ignore_index=True)
-                    df = _normalize_ids(df)
+        df = pd.read_sql(sql, conn, params=params)
+        df = _normalize_ids(df)
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     if not df.empty:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -287,44 +343,92 @@ def _in_clause_and_params(stations, start_utc: str, end_utc: str):
 def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_status_notifications for the window; newest first; AKDT strings + friendly names.
-    Includes vendor_error_code if the column exists (falls back cleanly if not).
+    Includes vendor_error_code if present.
     """
-    ph = param_placeholder()
     conn = get_conn()
-    try:
-        table = _first_existing(conn, ["realtime_status_notifications", "status_notifications"])
+    eng = _sa_engine(conn)
+
+    # ---------- Postgres path ----------
+    if DB_BACKEND == "postgres" and eng is not None:
+        table = _first_existing(eng, ["realtime_status_notifications", "status_notifications"])
         if not table:
-            conn.close()
             return pd.DataFrame(columns=["AKDT","Location","station_id","connector_id","status","error_code","vendor_error_code"])
 
-        where_in, base_params = _in_clause_and_params(stations, start_utc, end_utc)
+        ts_cast = _ts_cast_sql()
+        ts_pred = f"{ts_cast} BETWEEN :start AND :end"
+        has_iso = _ts_has_iso_sql()
+        pred_stations, bp = _stations_pred_sa(stations)
 
-        # Try selecting vendor_error_code if present; fallback to a reduced column set if not
-        base_cols = 'station_id, connector_id, {_ts} AS timestamp, status, error_code'.format(_ts=_ts_col())
-        try_cols = base_cols + ', vendor_error_code'
+        # Try selecting vendor_error_code if present
+        try_sql = text(f"""
+            SELECT station_id, connector_id, "timestamp", status, error_code, vendor_error_code
+            FROM public.{table}
+            WHERE {pred_stations}
+              AND {has_iso}
+              AND {ts_pred}
+            ORDER BY {ts_cast} DESC
+        """)
+        fb_sql = text(f"""
+            SELECT station_id, connector_id, "timestamp", status, error_code
+            FROM public.{table}
+            WHERE {pred_stations}
+              AND {has_iso}
+              AND {ts_pred}
+            ORDER BY {ts_cast} DESC
+        """)
+        if bp is not None:
+            try_sql = try_sql.bindparams(bp)
+            fb_sql  = fb_sql.bindparams(bp)
 
-        sql_try = f"""
-          SELECT {try_cols}
-          FROM {table}
-          WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
-          ORDER BY {_ts_col()} DESC
-        """
-        sql_fallback = f"""
-          SELECT {base_cols}
-          FROM {table}
-          WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
-          ORDER BY {_ts_col()} DESC
-        """
-        params = base_params + [start_utc, end_utc]
+        params = {"start": start_utc, "end": end_utc}
+        if stations:
+            params["stations"] = tuple(stations)
 
+        with eng.connect() as c:
+            try:
+                df = pd.read_sql(try_sql, c, params=params)
+            except Exception:
+                df = pd.read_sql(fb_sql, c, params=params)
+
+        df = _normalize_ids(df)
+    else:
+        # ---------- sqlite fallback ----------
+        ph = param_placeholder()
         try:
-            df = pd.read_sql(sql_try, conn, params=params)
-            df = _normalize_ids(df)
-        except Exception:
-            df = pd.read_sql(sql_fallback, conn, params=params)
-            df = _normalize_ids(df)
-    finally:
-        conn.close()
+            table = _first_existing(conn, ["realtime_status_notifications", "status_notifications"])
+            if not table:
+                conn.close()
+                return pd.DataFrame(columns=["AKDT","Location","station_id","connector_id","status","error_code","vendor_error_code"])
+
+            where_in, base_params = _in_clause_and_params(stations, start_utc, end_utc)
+            base_cols = 'station_id, connector_id, {_ts} AS timestamp, status, error_code'.format(_ts=_ts_col())
+            try_cols = base_cols + ', vendor_error_code'
+
+            sql_try = f"""
+              SELECT {try_cols}
+              FROM {table}
+              WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
+              ORDER BY {_ts_col()} DESC
+            """
+            sql_fallback = f"""
+              SELECT {base_cols}
+              FROM {table}
+              WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
+              ORDER BY {_ts_col()} DESC
+            """
+            params = base_params + [start_utc, end_utc]
+
+            try:
+                df = pd.read_sql(sql_try, conn, params=params)
+                df = _normalize_ids(df)
+            except Exception:
+                df = pd.read_sql(sql_fallback, conn, params=params)
+                df = _normalize_ids(df)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     if df is None or df.empty:
         return pd.DataFrame(columns=["AKDT","Location","station_id","connector_id","status","error_code","vendor_error_code"])
@@ -336,33 +440,69 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     cols = ["AKDT","Location","station_id","connector_id","status","error_code"]
     if "vendor_error_code" in df.columns:
         cols.append("vendor_error_code")
-
     return df[[c for c in cols if c in df.columns]].sort_values("AKDT", ascending=False, kind="mergesort")
 
 def load_connectivity(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_websocket CONNECT/DISCONNECT events; newest first; AKDT strings + friendly names.
     """
-    ph = param_placeholder()
     conn = get_conn()
-    try:
-        table = _first_existing(conn, ["realtime_websocket", "connectivity_logs"])
+    eng = _sa_engine(conn)
+
+    # ---------- Postgres path ----------
+    if DB_BACKEND == "postgres" and eng is not None:
+        table = _first_existing(eng, ["realtime_websocket", "connectivity_logs"])
         if not table:
-            conn.close()
             return pd.DataFrame(columns=["AKDT","Location","station_id","connection_id","Connectivity"])
 
-        where_in, base_params = _in_clause_and_params(stations, start_utc, end_utc)
-        sql = f"""
-          SELECT station_id, connection_id, event, {_ts_col()} AS timestamp
-          FROM {table}
-          WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
-          ORDER BY {_ts_col()} DESC
-        """
-        params = base_params + [start_utc, end_utc]
-        df = pd.read_sql(sql, conn, params=params)
+        ts_cast = _ts_cast_sql()
+        ts_pred = f"{ts_cast} BETWEEN :start AND :end"
+        has_iso = _ts_has_iso_sql()
+        pred_stations, bp = _stations_pred_sa(stations)
+
+        sql = text(f"""
+            SELECT station_id, connection_id, event, "timestamp"
+            FROM public.{table}
+            WHERE {pred_stations}
+              AND {has_iso}
+              AND {ts_pred}
+            ORDER BY {ts_cast} DESC
+        """)
+        if bp is not None:
+            sql = sql.bindparams(bp)
+
+        params = {"start": start_utc, "end": end_utc}
+        if stations:
+            params["stations"] = tuple(stations)
+
+        with eng.connect() as c:
+            df = pd.read_sql(sql, c, params=params)
+
         df = _normalize_ids(df)
-    finally:
-        conn.close()
+    else:
+        # ---------- sqlite fallback ----------
+        ph = param_placeholder()
+        try:
+            table = _first_existing(conn, ["realtime_websocket", "connectivity_logs"])
+            if not table:
+                conn.close()
+                return pd.DataFrame(columns=["AKDT","Location","station_id","connection_id","Connectivity"])
+
+            where_in, base_params = _in_clause_and_params(stations, start_utc, end_utc)
+            sql = f"""
+              SELECT station_id, connection_id, event, {_ts_col()} AS timestamp
+              FROM {table}
+              WHERE {where_in} {_ts_col()} BETWEEN {ph} AND {ph}
+              ORDER BY {_ts_col()} DESC
+            """
+            params = base_params + [start_utc, end_utc]
+            df = pd.read_sql(sql, conn, params=params)
+            df = _normalize_ids(df)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     if df is None or df.empty:
         return pd.DataFrame(columns=["AKDT","Location","station_id","connection_id","Connectivity"])
