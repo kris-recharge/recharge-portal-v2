@@ -1,6 +1,7 @@
 import plotly.graph_objects as go
 import numpy as np
 import pandas as pd
+import os
 
 from .config import AK_TZ
 
@@ -53,11 +54,39 @@ def _duration_minutes_series(df: pd.DataFrame) -> pd.Series:
             return pd.to_numeric(df[name], errors="coerce")
     return pd.Series(index=df.index, dtype=float)
 
+
 def _first_col(df, names):
     for n in names:
         if n in df.columns:
             return n
     return None
+
+def _maybe_subtract_constant_offset(z: np.ndarray) -> np.ndarray:
+    """
+    Some Plotly builds on Render exhibit a +16 offset in Heatmap z-values when
+    text overlays are used. If non-zero cells cluster around ~16–18, treat it as
+    the artifact and subtract 16. Clamp negative results to 0.
+
+    Set env `RCA_FORCE_HEATMAP_OFFSET=1` to force subtraction (for diagnostics).
+    """
+    z_fixed = z.copy()
+    nz = z_fixed[z_fixed > 0]
+
+    # Optional hard override via environment (useful for quick verification)
+    if os.environ.get("RCA_FORCE_HEATMAP_OFFSET") == "1":
+        z_fixed = z_fixed - 16
+    else:
+        if nz.size > 0:
+            q25, q50, q75 = np.percentile(nz, [25, 50, 75])
+            # Heuristic: your expected counts per hour are small (often 0–5).
+            # If the distribution’s core lies near 16–18 across the board,
+            # it's almost certainly the offset artifact.
+            if 12 <= q25 <= 22 and 12 <= q50 <= 22 and 12 <= q75 <= 22:
+                z_fixed = z_fixed - 16
+
+    # Clamp to keep valid non-negative counts
+    z_fixed[z_fixed < 0] = 0
+    return z_fixed
 
 def session_detail_figure(mv, sid, tx):
     """
@@ -271,10 +300,12 @@ def heatmap_count(heat, title):
     )
     mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-    # Heatmap values and labels
-    z = mat.to_numpy(dtype=float)
+    # Heatmap values and labels (auto-fix possible +16 Render artifact)
+    z_raw = mat.to_numpy(dtype=float)
+    z = _maybe_subtract_constant_offset(z_raw)
+
     text = [[(str(int(v)) if np.isfinite(v) and v > 0 else "") for v in row] for row in z]
-    zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
+    zmax = float(np.nanpercentile(z[z > 0], 95)) if np.nanmax(z) > 0 else 1.0
 
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
