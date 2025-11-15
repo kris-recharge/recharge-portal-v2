@@ -400,6 +400,9 @@ with t1:
         # "constant 16" artifact observed on Render. This matches the earlier working
         # build where the gradient was correct but cells had no numbers.
         z_counts = counts.to_numpy(dtype=float)
+        # Force no on-cell text for the count heatmap (prevents the stray "16" labels on Render)
+        empty_text = np.empty_like(z_counts, dtype=object)
+        empty_text[:] = ""
         if np.isfinite(z_counts).any():
             zmax_count = max(5.0, float(np.nanpercentile(z_counts, 98)))
         else:
@@ -413,6 +416,8 @@ with t1:
                 colorscale="Blues",
                 zmin=0,
                 zmax=zmax_count,
+                text=empty_text,
+                texttemplate="%{text}",
                 colorbar=dict(
                     title="Starts",
                     tickcolor="black",
