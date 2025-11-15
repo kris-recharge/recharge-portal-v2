@@ -278,7 +278,8 @@ def heatmap_count(heat, title):
 
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
-    fig = go.Figure(go.Heatmap(
+    # Draw heatmap first (no text template), then overlay a text-only scatter
+    heat_trace = go.Heatmap(
         z=z,
         x=list(mat.columns),
         y=list(mat.index),
@@ -289,11 +290,33 @@ def heatmap_count(heat, title):
         hoverongaps=False,
         xgap=1,
         ygap=1,
-        text=text,
-        texttemplate="%{text}",
-        textfont={"color": "black", "size": 12},
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Starts: %{z:.0f}<extra></extra>",
-    ))
+        showscale=True,
+    )
+    fig = go.Figure(data=[heat_trace])
+
+    # Build flattened text overlay (only for positive cells)
+    xs, ys, txts = [], [], []
+    for yi, ylab in enumerate(mat.index):
+        for xi, xlab in enumerate(mat.columns):
+            v = z[yi][xi]
+            if np.isfinite(v) and v > 0:
+                xs.append(xlab)
+                ys.append(ylab)
+                txts.append(str(int(v)))
+
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=ys,
+            text=txts,
+            mode="text",
+            textposition="middle center",
+            textfont={"color": "black", "size": 12},
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
 
     fig.update_layout(
         margin=dict(l=10, r=10, t=30, b=10),
@@ -337,7 +360,8 @@ def heatmap_duration(heat, title):
 
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
-    fig = go.Figure(go.Heatmap(
+    # Draw heatmap without texttemplate; overlay text with scatter for reliability on all Plotly builds
+    heat_trace = go.Heatmap(
         z=z,
         x=list(mat.columns),
         y=list(mat.index),
@@ -348,11 +372,33 @@ def heatmap_duration(heat, title):
         hoverongaps=False,
         xgap=1,
         ygap=1,
-        text=text,
-        texttemplate="%{text}",
-        textfont={"color": "black", "size": 12},
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Avg min: %{z:.1f}<extra></extra>",
-    ))
+        showscale=True,
+    )
+    fig = go.Figure(data=[heat_trace])
+
+    # Text overlay (only for positive cells)
+    xs, ys, txts = [], [], []
+    for yi, ylab in enumerate(mat.index):
+        for xi, xlab in enumerate(mat.columns):
+            v = z[yi][xi]
+            if np.isfinite(v) and v > 0:
+                xs.append(xlab)
+                ys.append(ylab)
+                txts.append(f"{v:.1f}")
+
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=ys,
+            text=txts,
+            mode="text",
+            textposition="middle center",
+            textfont={"color": "black", "size": 12},
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
 
     fig.update_layout(
         margin=dict(l=10, r=10, t=30, b=10),
