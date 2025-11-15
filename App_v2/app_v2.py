@@ -392,8 +392,87 @@ with t1:
 
         # Optional on‑screen debugging of the count grid
         with st.expander("Heatmap debug (session starts)", expanded=False):
-            st.write("Sum of counts:", int(np.nansum(counts.values)))
-            st.dataframe(counts.astype(int), use_container_width=True)
+            # High‑level row counts through the pipeline
+            try:
+                n_input = len(sess) if isinstance(sess, pd.DataFrame) else None
+            except Exception:
+                n_input = None
+            try:
+                n_valid = int(valid.sum())
+            except Exception:
+                n_valid = None
+            try:
+                n_after_dedupe = len(s2)
+            except Exception:
+                n_after_dedupe = None
+
+            st.write({
+                "rows_in_sessions_table": n_input,
+                "rows_with_valid_start": n_valid,
+                "rows_after_dedupe": n_after_dedupe,
+                "dedupe_keys": dedupe_keys or [],
+            })
+
+            # Show top (day,hour) combos from raw starts prior to pivot
+            try:
+                vc = (
+                    gh.value_counts()
+                      .rename("n")
+                      .reset_index()
+                      .sort_values("n", ascending=False)
+                )
+                st.caption("Top (day,hour) occurrences from raw starts")
+                st.dataframe(vc.head(25), use_container_width=True)
+            except Exception as _:
+                pass
+
+            # Materialize the count grid as a dataframe for inspection and totals
+            st.caption(f"Count grid (Sun..Sat x 0..23) — total starts = {int(np.nansum(counts.values))}")
+            counts_df = pd.DataFrame(
+                counts.to_numpy(dtype=int),
+                index=counts.index,
+                columns=counts.columns,
+            )
+            st.dataframe(counts_df, use_container_width=True)
+
+            # Provide a tidy CSV to download for offline analysis
+            try:
+                tidy = (
+                    counts.stack()
+                          .rename("starts")
+                          .reset_index(names=["Day", "Hour"])
+                )
+                csv_buf = BytesIO()
+                tidy.to_csv(csv_buf, index=False)
+                st.download_button(
+                    "⬇ Download count-grid CSV (debug)",
+                    data=csv_buf.getvalue(),
+                    file_name="heatmap_counts_debug.csv",
+                    mime="text/csv",
+                    help="Tidy table of session-start counts by Day/Hour."
+                )
+            except Exception:
+                pass
+
+            # Show a small sample of the deduplicated inputs that fed the grid
+            try:
+                cols = [c for c in ["station_id","connector_id","transaction_id","_start_ak","_dow","_hour"] if c in s2.columns]
+                if cols:
+                    st.caption("Sample of deduplicated start rows (first 50)")
+                    st.dataframe(s2[cols].head(50), use_container_width=True)
+            except Exception:
+                pass
+
+            # Optional: render legacy heatmap version for side‑by‑side comparison
+            try:
+                if st.checkbox("Show legacy heatmap (comparison)", value=False):
+                    st.plotly_chart(
+                        heatmap_count(heat, "LEGACY: Session Start Density (by Day & Hour)"),
+                        use_container_width=True,
+                        config={"displaylogo": False},
+                    )
+            except Exception:
+                pass
 
         # Convert to dense numeric arrays and compute a robust zmax.
         # IMPORTANT: We purposely do NOT overlay per-cell text labels here to avoid the
