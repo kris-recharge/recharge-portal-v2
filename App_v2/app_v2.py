@@ -395,9 +395,15 @@ with t1:
             st.write("Sum of counts:", int(np.nansum(counts.values)))
             st.dataframe(counts.astype(int), use_container_width=True)
 
-        # Convert to dense numeric arrays for Plotly
+        # Convert to dense numeric arrays and compute a robust zmax.
+        # IMPORTANT: We purposely do NOT overlay per-cell text labels here to avoid the
+        # "constant 16" artifact observed on Render. This matches the earlier working
+        # build where the gradient was correct but cells had no numbers.
         z_counts = counts.to_numpy(dtype=float)
-        text_counts = np.where(z_counts > 0, counts.to_numpy(dtype=int).astype(str), "")
+        if np.isfinite(z_counts).any():
+            zmax_count = max(5.0, float(np.nanpercentile(z_counts, 98)))
+        else:
+            zmax_count = 5.0
 
         fig_count = go.Figure(
             data=go.Heatmap(
@@ -413,9 +419,6 @@ with t1:
                     tickfont=dict(color="black"),
                     titlefont=dict(color="black"),
                 ),
-                text=text_counts,
-                texttemplate="%{text}",
-                textfont=dict(color="black"),
                 hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Starts: %{z:.0f}<extra></extra>",
                 xgap=1,
                 ygap=1,
