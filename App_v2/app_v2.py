@@ -380,6 +380,10 @@ with t1:
         counts = counts.reindex(index=sun_first, fill_value=0).reindex(columns=range(24), fill_value=0)
         counts.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
+        # Build text labels that hide zeros (match local style)
+        count_vals = counts.values.astype(float)
+        count_text = np.where(count_vals > 0, counts.values.astype(int).astype(str), "")
+
         # Upper bound for color scale (avoid a flat palette when all zeros)
         zmax_count = int(np.nanmax(counts.values)) if counts.size else 0
         zmax_count = max(zmax_count, 1)
@@ -392,9 +396,15 @@ with t1:
                 colorscale="Blues",
                 zmin=0,
                 zmax=zmax_count,
-                colorbar=dict(title="Starts"),
-                text=counts.values,
-                texttemplate="%{text:.0f}",
+                colorbar=dict(
+                    title="Starts",
+                    tickcolor="black",
+                    tickfont=dict(color="black"),
+                    titlefont=dict(color="black"),
+                ),
+                text=count_text,
+                texttemplate="%{text}",
+                textfont=dict(color="black"),
                 hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Starts: %{z:.0f}<extra></extra>",
                 xgap=1,
                 ygap=1,
@@ -404,7 +414,13 @@ with t1:
             margin=dict(l=10, r=10, t=10, b=10),
             height=420,
             xaxis_title="Hour (0–23)",
+            template="plotly_white",
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            font=dict(color="black"),
         )
+        fig_count.update_xaxes(showgrid=True, gridcolor="lightgray", zeroline=False, linecolor="black")
+        fig_count.update_yaxes(showgrid=True, gridcolor="lightgray", zeroline=False, linecolor="black")
 
         # ---------- Duration heatmap: average minutes by day/hour ----------
         dur = pd.to_numeric(s2.get("Duration (min)"), errors="coerce")
@@ -419,7 +435,9 @@ with t1:
         dur_pivot.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
         # Round for on‑cell annotation
-        dur_text = np.where(np.isnan(dur_pivot.values), "", np.round(dur_pivot.values, 1))
+        _vals = dur_pivot.values.astype(float)
+        # Hide NaNs and zeros in cell labels
+        dur_text = np.where(np.isnan(_vals) | (_vals <= 0), "", np.round(_vals, 1))
 
         fig_dur = go.Figure(
             data=go.Heatmap(
@@ -428,9 +446,15 @@ with t1:
                 y=list(dur_pivot.index),
                 colorscale="Blues",
                 zmin=0,
-                colorbar=dict(title="Avg min"),
+                colorbar=dict(
+                    title="Avg min",
+                    tickcolor="black",
+                    tickfont=dict(color="black"),
+                    titlefont=dict(color="black"),
+                ),
                 text=dur_text,
                 texttemplate="%{text}",
+                textfont=dict(color="black"),
                 hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Avg min: %{z:.1f}<extra></extra>",
                 xgap=1,
                 ygap=1,
@@ -440,7 +464,13 @@ with t1:
             margin=dict(l=10, r=10, t=10, b=10),
             height=420,
             xaxis_title="Hour (0–23)",
+            template="plotly_white",
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            font=dict(color="black"),
         )
+        fig_dur.update_xaxes(showgrid=True, gridcolor="lightgray", zeroline=False, linecolor="black")
+        fig_dur.update_yaxes(showgrid=True, gridcolor="lightgray", zeroline=False, linecolor="black")
 
         # Render both heatmaps
         st.plotly_chart(fig_count, use_container_width=True, config={"displaylogo": False})
