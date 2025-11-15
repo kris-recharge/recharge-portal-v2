@@ -289,8 +289,9 @@ def heatmap_count(heat, title):
         hoverongaps=False,
         xgap=1,
         ygap=1,
-        text=text,
-        texttemplate="%{text}",
+        customdata=text,   # labels travel in customdata to avoid Plotly text bug on some envs
+        text=None,
+        texttemplate="%{customdata}",
         textfont={"color": "black", "size": 12},
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Starts: %{z:.0f}<extra></extra>",
     ))
@@ -348,8 +349,9 @@ def heatmap_duration(heat, title):
         hoverongaps=False,
         xgap=1,
         ygap=1,
-        text=text,
-        texttemplate="%{text}",
+        customdata=text,   # labels via customdata for stability across Plotly versions
+        text=None,
+        texttemplate="%{customdata}",
         textfont={"color": "black", "size": 12},
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Avg min: %{z:.1f}<extra></extra>",
     ))
