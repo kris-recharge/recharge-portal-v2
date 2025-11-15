@@ -194,6 +194,13 @@ def session_detail_figure(mv, sid, tx):
     )
     return fig
 
+def _ensure_ak_local(series):
+    """Ensure a datetime series is tz-aware and converted to Alaska time."""
+    s = pd.to_datetime(series, errors="coerce")
+    if getattr(s.dt, "tz", None) is None:
+        s = s.dt.tz_localize("UTC")
+    return s.dt.tz_convert(AK_TZ)
+
 def heatmap_count(heat, title):
     """Session start counts per day/hour with white→blue cells, black borders and labels."""
     if heat is None or heat.empty:
@@ -201,7 +208,7 @@ def heatmap_count(heat, title):
 
     h = heat.copy()
     # Normalize time → AK local then derive day/hour bins
-    h["start_local"] = h["start_ts"].dt.tz_convert(AK_TZ)
+    h["start_local"] = _ensure_ak_local(h["start_ts"])
     h["dow"] = h["start_local"].dt.dayofweek
     h["hour"] = h["start_local"].dt.hour
 
@@ -215,7 +222,7 @@ def heatmap_count(heat, title):
 
     # Ensure numeric array (avoid object dtype rendering issues). Also cap zmax
     z = mat.to_numpy(dtype=float)
-    # Guard against the all‑zero window (plotly auto with zmax=0 -> weird/blank).  
+    # Guard against the all‑zero window (plotly auto with zmax=0 -> weird/blank).
     zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
 
     # Explicit white→blue ramp so zero really looks white on dark background
@@ -230,7 +237,7 @@ def heatmap_count(heat, title):
         zmax=zmax,
         colorbar=dict(title="Starts"),
         hoverongaps=False,
-        # Black borders via gaps (background shows through in Streamlit dark theme)
+        # Borders via gaps (dark themes will show dark grid; light themes will show light grid)
         xgap=1,
         ygap=1,
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Starts: %{z:.0f}<extra></extra>",
@@ -270,7 +277,7 @@ def heatmap_duration(heat, title):
         return go.Figure()
 
     h = heat.copy()
-    h["start_local"] = h["start_ts"].dt.tz_convert(AK_TZ)
+    h["start_local"] = _ensure_ak_local(h["start_ts"])
     h["dow"] = h["start_local"].dt.dayofweek
     h["hour"] = h["start_local"].dt.hour
 
