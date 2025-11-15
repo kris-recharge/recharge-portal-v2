@@ -324,22 +324,42 @@ with t1:
     try:
         s2 = sess.copy()
 
-        # Robust de-duplication: prefer transaction_id; fallback to (_start, station_id)
-        # Build a UTC start datetime if not already present
-        if "_start" in s2.columns:
-            starts_utc = pd.to_datetime(s2["_start"], errors="coerce", utc=True)
-        else:
-            starts_utc = pd.to_datetime(s2.get("Start Date/Time"), errors="coerce", utc=True)
-
-        # Drop rows with invalid starts
-        s2 = s2.loc[starts_utc.notna()].copy()
-        starts_utc = starts_utc.loc[starts_utc.notna()]
-
-        # Alaska-local for bucketing
+        # --- Robust AK‑local start extraction ---
+        # Prefer UTC _start if present; otherwise use AKDT_dt, or fall back to Start Date/Time.
         AK = "America/Anchorage"
-        starts_ak = starts_utc.dt.tz_convert(AK)
+        starts_ak = None
+        try:
+            if "_start" in s2.columns:
+                # _start expected as UTC-like timestamp/ISO
+                su = pd.to_datetime(s2["_start"], errors="coerce", utc=True)
+                starts_ak = su.dt.tz_convert(AK)
+            elif "AKDT_dt" in s2.columns:
+                su = pd.to_datetime(s2["AKDT_dt"], errors="coerce")
+                # Localize if naive; convert if tz-aware
+                if getattr(su.dt, "tz", None) is None:
+                    starts_ak = su.dt.tz_localize(AK)
+                else:
+                    starts_ak = su.dt.tz_convert(AK)
+            else:
+                # Fallback: Start Date/Time could be naive AK local or tz-aware
+                sd = pd.to_datetime(s2.get("Start Date/Time"), errors="coerce")
+                if getattr(sd.dt, "tz", None) is None:
+                    starts_ak = sd.dt.tz_localize(AK)
+                else:
+                    starts_ak = sd.dt.tz_convert(AK)
+        except Exception:
+            # Last resort: parse Start Date/Time as UTC then convert
+            sd = pd.to_datetime(s2.get("Start Date/Time"), errors="coerce", utc=True)
+            try:
+                starts_ak = sd.dt.tz_convert(AK)
+            except Exception:
+                starts_ak = sd
 
-        # Attach working columns for bucketing
+        # Drop rows with invalid starts and attach working columns
+        valid = starts_ak.notna()
+        s2 = s2.loc[valid].copy()
+        starts_ak = starts_ak.loc[valid]
+
         s2["_start_ak"] = starts_ak
         s2["_dow"] = s2["_start_ak"].dt.dayofweek  # Mon=0..Sun=6
         s2["_hour"] = s2["_start_ak"].dt.hour
@@ -743,7 +763,26 @@ with t4:
         bio = BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as xw:
             if not sess_last.empty:
-                sess_last.to_excel(xw, sheet_name="Sessions", index=False)
+                sx = sess_last.copy()
+
+                # Normalize connector column for export — keep only a single "Connector id"
+                # Accept several possible source column spellings and drop the rest.
+                rename_map = {}
+                if "connector_id" in sx.columns and "Connector id" not in sx.columns:
+                    rename_map["connector_id"] = "Connector id"
+                if "Connector Id" in sx.columns:
+                    rename_map["Connector Id"] = "Connector id"
+                if rename_map:
+                    sx = sx.rename(columns=rename_map)
+                # If we only have "Connector #", promote it to "Connector id"
+                if "Connector id" not in sx.columns and "Connector #" in sx.columns:
+                    sx["Connector id"] = sx["Connector #"]
+
+                # Drop any legacy connector columns so only "Connector id" remains
+                drop_candidates = ["Connector #", "Connect #", "connector_id", "Connector Id"]
+                sx = sx.drop(columns=[c for c in drop_candidates if c in sx.columns], errors="ignore")
+
+                sx.to_excel(xw, sheet_name="Sessions", index=False)
             if not mv_last.empty:
                 mvx = mv_last.copy()
                 # Excel can't handle tz-aware datetimes. Provide AKDT/UTC strings and drop the tz-aware column.
