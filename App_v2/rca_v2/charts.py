@@ -144,11 +144,138 @@ def heatmap_duration(sessions_df: pd.DataFrame, title: str = "Average Session Du
     return _heatmap_from_grid(grid, title, _blank_or_float1)
 
 
-def session_detail_figure(df: Optional[pd.DataFrame], title: str = "Session details") -> go.Figure:
+def session_detail_figure(*args, title: str = "Charge Session Details", **kwargs) -> go.Figure:
     """
-    Minimal placeholder so callers can safely import it.
-    Extend later with real traces from your session telemetry frame.
+    Compatibility wrapper for session details plotting.
+
+    Supported call patterns:
+      1) session_detail_figure(df)
+      2) session_detail_figure(mv, selected_sid, selected_tx)
+      3) session_detail_figure(mv=..., station_id=..., transaction_id=...)
+
+    The dataframe rows used for plotting should include some combination of:
+      - timestamp column: one of ["timestamp", "ts", "time", "_time", "start_ts", "Start (UTC)"]
+      - power column: "power_w"
+      - energy column: "energy_wh"
+
+    The chart shows Power (kW) on the primary Y axis and Energy (kWh) on a secondary Y axis
+    when available. If energy_wh is not present, a trapezoidal integral of power is used
+    to approximate cumulative energy.
     """
+    # ---- Parse inputs to obtain a dataframe of the selected session ----
+    df: Optional[pd.DataFrame] = None
+
+    if len(args) == 1 and isinstance(args[0], pd.DataFrame):
+        # New style: just pass the filtered session frame
+        df = args[0]
+    elif len(args) >= 3 and isinstance(args[0], pd.DataFrame):
+        # Legacy style: (mv, selected_sid, selected_tx)
+        mv = args[0]
+        selected_sid = args[1]
+        selected_tx = args[2]
+        try:
+            df = mv[(mv["station_id"] == selected_sid) & (mv["transaction_id"] == selected_tx)].copy()
+        except Exception:
+            df = pd.DataFrame()
+    else:
+        # kwargs style
+        if "df" in kwargs and isinstance(kwargs["df"], pd.DataFrame):
+            df = kwargs["df"]
+        elif {"mv", "station_id", "transaction_id"} <= set(kwargs):
+            mv = kwargs.get("mv")
+            selected_sid = kwargs.get("station_id")
+            selected_tx = kwargs.get("transaction_id")
+            try:
+                df = mv[(mv["station_id"] == selected_sid) & (mv["transaction_id"] == selected_tx)].copy()
+            except Exception:
+                df = pd.DataFrame()
+
     fig = go.Figure()
-    fig.update_layout(title=title, xaxis_title="Time", yaxis_title="Value")
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time (AK)",
+        yaxis_title="kW / kWh",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=40, r=40, t=50, b=40),
+    )
+
+    if df is None or df.empty:
+        return fig
+
+    # ---- Detect timestamp column and convert to Alaska time for display ----
+    tcol = next((c for c in ["timestamp", "ts", "time", "_time", "start_ts", "Start (UTC)"] if c in df.columns), None)
+    if tcol is None:
+        return fig
+
+    t = pd.to_datetime(df[tcol], errors="coerce", utc=True)
+    try:
+        t_ak = t.dt.tz_convert("America/Anchorage")
+    except Exception:
+        t_ak = t
+
+    # ---- Add traces if available ----
+    added = 0
+
+    if "power_w" in df.columns:
+        try:
+            fig.add_trace(
+                go.Scatter(
+                    x=t_ak,
+                    y=pd.to_numeric(df["power_w"], errors="coerce") / 1000.0,
+                    mode="lines",
+                    name="Power (kW)",
+                )
+            )
+            added += 1
+        except Exception:
+            pass
+
+    if "energy_wh" in df.columns:
+        try:
+            fig.add_trace(
+                go.Scatter(
+                    x=t_ak,
+                    y=pd.to_numeric(df["energy_wh"], errors="coerce") / 1000.0,
+                    mode="lines",
+                    name="Energy (kWh)",
+                    yaxis="y2",
+                )
+            )
+            added += 1
+        except Exception:
+            pass
+    elif "power_w" in df.columns:
+        # Approximate cumulative energy from power if energy_wh isn't available
+        try:
+            s = df[[tcol, "power_w"]].copy()
+            s[tcol] = pd.to_datetime(s[tcol], errors="coerce", utc=True)
+            s = s.sort_values(tcol)
+            ts = s[tcol].astype("int64") // 10**9  # seconds
+            p_kw = pd.to_numeric(s["power_w"], errors="coerce").fillna(0).to_numpy() / 1000.0
+            if len(p_kw) > 1:
+                dt_h = np.diff(ts) / 3600.0
+                # cumulative trapezoid using left rectangle (simple and stable)
+                e_kwh = np.concatenate([[0.0], np.cumsum(p_kw[:-1] * dt_h)])
+                fig.add_trace(
+                    go.Scatter(
+                        x=pd.to_datetime(s[tcol], utc=True).tz_convert("America/Anchorage"),
+                        y=e_kwh,
+                        mode="lines",
+                        name="Energy (kWh)",
+                        yaxis="y2",
+                    )
+                )
+                added += 1
+        except Exception:
+            pass
+
+    # ---- Axes config ----
+    if added >= 2:
+        fig.update_layout(
+            yaxis=dict(title="Power (kW)"),
+            yaxis2=dict(title="Energy (kWh)", overlaying="y", side="right", showgrid=False),
+        )
+    else:
+        fig.update_layout(yaxis=dict(title="Value"))
+
     return fig
