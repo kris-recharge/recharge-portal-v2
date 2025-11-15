@@ -266,6 +266,48 @@ with t1:
         mv = _load_per_evse(load_meter_values, stations, start_utc, end_utc)
         auth = _load_per_evse(load_authorize, stations, start_utc, end_utc)
     sess, heat = build_sessions(mv, auth)
+    # --- Heat/starts frame hygiene to support charts helpers ---
+    if isinstance(heat, pd.DataFrame):
+        heat = heat.copy()
+        # Normalize transaction_id to string for any merges we may do
+        if "transaction_id" in heat.columns:
+            heat["transaction_id"] = heat["transaction_id"].astype(str)
+
+        # Ensure duration exists (pull from session summary if missing)
+        if (
+            "Duration (min)" not in heat.columns
+            and isinstance(sess, pd.DataFrame)
+            and ("transaction_id" in heat.columns)
+            and ("transaction_id" in sess.columns)
+            and ("Duration (min)" in sess.columns)
+        ):
+            sess_tx = pd.DataFrame({
+                "transaction_id": sess["transaction_id"].astype(str),
+                "Duration (min)": pd.to_numeric(sess["Duration (min)"], errors="coerce"),
+            })
+            heat = heat.merge(sess_tx, on="transaction_id", how="left")
+
+        # Ensure there is an AK‑local start timestamp usable for day/hour bucketing
+        if ("_start_ak" not in heat.columns) and ("start_ak" not in heat.columns) and ("Start (AK)" not in heat.columns):
+            if (
+                isinstance(sess, pd.DataFrame)
+                and ("transaction_id" in sess.columns)
+                and ("Start Date/Time" in sess.columns)
+            ):
+                # Build a tx -> AK‑local start mapping from the sessions table
+                _s = pd.to_datetime(sess["Start Date/Time"], errors="coerce")
+                try:
+                    _s = _s.dt.tz_localize("America/Anchorage")
+                except Exception:
+                    try:
+                        _s = _s.dt.tz_convert("America/Anchorage")
+                    except Exception:
+                        pass
+                tx_map = pd.DataFrame({
+                    "transaction_id": sess["transaction_id"].astype(str),
+                    "_start_ak": _s,
+                })
+                heat = heat.merge(tx_map, on="transaction_id", how="left")
     # Defensive: re-apply EVSE filter at the session level (guards against loader quirks)
     if (not st.session_state.get("_admin_all")) and (not st.session_state.get("__v2_all_evse", False)) and isinstance(stations, (list, tuple, set)) and len(stations) > 0 and "station_id" in sess.columns:
         _wanted = {str(s) for s in stations}
@@ -319,274 +361,72 @@ with t1:
     else:
         st.info("Select a session above to view details.")
 
-    # Heatmaps — stacked full width (to match v1 layout)
-    # Rebuild heatmaps from sessions to ensure AK-local bucketing and robust de-duplication.
-    try:
-        s2 = sess.copy()
+    # Debug helper: quick count grid to verify (Sun..Sat x 0..23)
+    def _count_grid_debug(df: pd.DataFrame) -> pd.DataFrame:
+        base = pd.DataFrame(0, index=range(7), columns=range(24))
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return base
+        d = df.copy()
+        ts = None
+        for c in ["_start_ak", "start_ak", "Start (AK)", "_start"]:
+            if c in d.columns:
+                ts = pd.to_datetime(d[c], errors="coerce")
+                break
+        if ts is None:
+            return base
+        dow = ((ts.dt.dayofweek + 1) % 7)
+        hour = ts.dt.hour
+        g = pd.DataFrame({"_dow": dow, "_hour": hour}).dropna().groupby(["_dow", "_hour"]).size().reset_index(name="n")
+        if not g.empty:
+            p = g.pivot(index="_dow", columns="_hour", values="n").fillna(0).astype(int)
+            base.loc[p.index, p.columns] = p.values
+        return base
 
-        # --- Build AK‑local, hour‑floored start times (robust across sources) ---
-        AK = "America/Anchorage"
-        starts_ak = None
-        if "_start" in s2.columns:
-            # Preferred: UTC ISO from build_sessions
-            su = pd.to_datetime(s2["_start"], errors="coerce", utc=True)
-            starts_ak = su.dt.tz_convert(AK).dt.floor("H")
-        elif "AKDT_dt" in s2.columns:
-            su = pd.to_datetime(s2["AKDT_dt"], errors="coerce")
-            # Localize if naive; convert if tz‑aware
-            if getattr(su.dt, "tz", None) is None:
-                starts_ak = su.dt.tz_localize(AK).dt.floor("H")
-            else:
-                starts_ak = su.dt.tz_convert(AK).dt.floor("H")
-        else:
-            sd = pd.to_datetime(s2.get("Start Date/Time"), errors="coerce")
-            if getattr(sd.dt, "tz", None) is None:
-                starts_ak = sd.dt.tz_localize(AK).dt.floor("H")
-            else:
-                starts_ak = sd.dt.tz_convert(AK).dt.floor("H")
-
-        # Keep only rows with a valid start time
-        valid = starts_ak.notna()
-        s2 = s2.loc[valid].copy()
-        starts_ak = starts_ak.loc[valid]
-
-        # Working columns for grouping
-        s2["_start_ak"] = starts_ak
-        s2["_dow"] = s2["_start_ak"].dt.dayofweek  # Mon=0 .. Sun=6
-        s2["_hour"] = s2["_start_ak"].dt.hour
-
-        # ---------- Count heatmap: session starts by day/hour ----------
-        # Stronger de‑duplication: count one row per unique (tx, station, connector)
-        dedupe_keys = []
-        if "transaction_id" in s2.columns:
-            dedupe_keys.append("transaction_id")
-        if "station_id" in s2.columns:
-            dedupe_keys.append("station_id")
-        if "connector_id" in s2.columns:
-            dedupe_keys.append("connector_id")
-        if dedupe_keys:
-            s2 = (
-                s2.sort_values("_start_ak")
-                  .drop_duplicates(subset=dedupe_keys, keep="first")
-            )
-
-        # Integer day-of-week / hour for grouping
-        d_int = pd.to_numeric(s2["_dow"], errors="coerce").astype("Int64")
-        h_int = pd.to_numeric(s2["_hour"], errors="coerce").astype("Int64")
-        gh = pd.DataFrame({"dow": d_int, "hour": h_int}).dropna().astype({"dow": int, "hour": int})
-
-        # Use groupby().size() to count starts (more predictable than pivot_table on some engines)
-        counts = (
-            gh.groupby(["dow", "hour"], observed=False)
-              .size()
-              .unstack(fill_value=0)
-        )
-
-        # Stable grid Sun..Sat and hours 0..23
-        sun_first = [6, 0, 1, 2, 3, 4, 5]
-        counts = (
-            counts.reindex(index=sun_first, fill_value=0)
-                  .reindex(columns=range(24), fill_value=0)
-        )
-        counts.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-
-        # Optional on‑screen debugging of the count grid
-        with st.expander("Heatmap debug (session starts)", expanded=False):
-            # High‑level row counts through the pipeline
-            try:
-                n_input = len(sess) if isinstance(sess, pd.DataFrame) else None
-            except Exception:
-                n_input = None
-            try:
-                n_valid = int(valid.sum())
-            except Exception:
-                n_valid = None
-            try:
-                n_after_dedupe = len(s2)
-            except Exception:
-                n_after_dedupe = None
-
-            st.write({
-                "rows_in_sessions_table": n_input,
-                "rows_with_valid_start": n_valid,
-                "rows_after_dedupe": n_after_dedupe,
-                "dedupe_keys": dedupe_keys or [],
+    with st.expander("Heatmap debug (session starts)", expanded=False):
+        try:
+            st.json({
+                "rows_in_sessions_table": int(sess.shape[0]) if isinstance(sess, pd.DataFrame) else 0,
+                "rows_in_heat_frame": int(heat.shape[0]) if isinstance(heat, pd.DataFrame) else 0,
+                "dedupe_keys": ["transaction_id", "station_id", "connector_id"],
             })
 
-            # Show top (day,hour) combos from raw starts prior to pivot
-            try:
-                vc = (
-                    gh.value_counts()
-                      .rename("n")
-                      .reset_index()
-                      .sort_values("n", ascending=False)
-                )
-                st.caption("Top (day,hour) occurrences from raw starts")
-                st.dataframe(vc.head(25), use_container_width=True)
-            except Exception as _:
-                pass
+            # Top (day,hour) occurrences from raw starts
+            ts = None
+            for c in ["_start_ak", "start_ak", "Start (AK)", "_start"]:
+                if c in heat.columns:
+                    ts = pd.to_datetime(heat[c], errors="coerce")
+                    break
+            if ts is not None:
+                tmp = pd.DataFrame({"dow": ((ts.dt.dayofweek + 1) % 7), "hour": ts.dt.hour})
+                tops = tmp.value_counts().reset_index(name="n").sort_values("n", ascending=False).head(10)
+                st.dataframe(tops, hide_index=True, **_df_stretch_kwargs())
 
-            # Materialize the count grid as a dataframe for inspection and totals
-            st.caption(f"Count grid (Sun..Sat x 0..23) — total starts = {int(np.nansum(counts.values))}")
-            counts_df = pd.DataFrame(
-                counts.to_numpy(dtype=int),
-                index=counts.index,
-                columns=counts.columns,
-            )
-            st.dataframe(counts_df, use_container_width=True)
+            # Count grid snapshot (Sun..Sat x 0..23)
+            cg = _count_grid_debug(heat)
+            st.write("Count grid (Sun..Sat × 0..23) — total starts =", int(cg.values.sum()))
+            st.dataframe(cg, height=260, **_df_stretch_kwargs())
 
-            # Provide a tidy CSV to download for offline analysis
-            try:
-                tidy = (
-                    counts.stack()
-                          .rename("starts")
-                          .reset_index(names=["Day", "Hour"])
-                )
-                csv_buf = BytesIO()
-                tidy.to_csv(csv_buf, index=False)
-                st.download_button(
-                    "⬇ Download count-grid CSV (debug)",
-                    data=csv_buf.getvalue(),
-                    file_name="heatmap_counts_debug.csv",
-                    mime="text/csv",
-                    help="Tidy table of session-start counts by Day/Hour."
-                )
-            except Exception:
-                pass
+            # Sample of the rows feeding the chart
+            sample_cols = [c for c in ["station_id", "connector_id", "transaction_id", "_start_ak", "_dow", "_hour"] if c in heat.columns]
+            if not sample_cols:
+                sample_cols = list(heat.columns)[:6]
+            st.dataframe(heat[sample_cols].head(50), hide_index=True, **_df_stretch_kwargs())
+        except Exception as _e:
+            st.caption(f"debug error: {_e}")
 
-            # Show a small sample of the deduplicated inputs that fed the grid
-            try:
-                cols = [c for c in ["station_id","connector_id","transaction_id","_start_ak","_dow","_hour"] if c in s2.columns]
-                if cols:
-                    st.caption("Sample of deduplicated start rows (first 50)")
-                    st.dataframe(s2[cols].head(50), use_container_width=True)
-            except Exception:
-                pass
-
-            # Optional: render legacy heatmap version for side‑by‑side comparison
-            try:
-                if st.checkbox("Show legacy heatmap (comparison)", value=False):
-                    st.plotly_chart(
-                        heatmap_count(heat, "LEGACY: Session Start Density (by Day & Hour)"),
-                        use_container_width=True,
-                        config={"displaylogo": False},
-                    )
-            except Exception:
-                pass
-
-        # Convert to dense numeric arrays and compute a robust zmax.
-        # IMPORTANT: We purposely do NOT overlay per-cell text labels here to avoid the
-        # "constant 16" artifact observed on Render. This matches the earlier working
-        # build where the gradient was correct but cells had no numbers.
-        z_counts = counts.to_numpy(dtype=float)
-        # Force no on-cell text for the count heatmap (prevents the stray "16" labels on Render)
-        empty_text = np.empty_like(z_counts, dtype=object)
-        empty_text[:] = ""
-        if np.isfinite(z_counts).any():
-            zmax_count = max(5.0, float(np.nanpercentile(z_counts, 98)))
-        else:
-            zmax_count = 5.0
-
-        fig_count = go.Figure(
-            data=go.Heatmap(
-                z=z_counts,
-                x=[f"{h:02d}" for h in counts.columns],
-                y=list(counts.index),
-                colorscale="Blues",
-                zmin=0,
-                zmax=zmax_count,
-                text=empty_text,
-                texttemplate="%{text}",
-                colorbar=dict(
-                    title="Starts",
-                    tickcolor="black",
-                    tickfont=dict(color="black"),
-                    titlefont=dict(color="black"),
-                ),
-                hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Starts: %{z:.0f}<extra></extra>",
-                xgap=1,
-                ygap=1,
-            )
-        )
-        fig_count.update_layout(
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=420,
-            xaxis_title="Hour (0–23)",
-            template="plotly_white",
-            paper_bgcolor="white",
-            plot_bgcolor="white",
-            font=dict(color="black"),
-        )
-        fig_count.update_xaxes(showgrid=True, gridcolor="lightgray", zeroline=False, linecolor="black")
-        fig_count.update_yaxes(showgrid=True, gridcolor="lightgray", zeroline=False, linecolor="black")
-
-        # ---------- Duration heatmap: average minutes by day/hour ----------
-        dur = pd.to_numeric(s2.get("Duration (min)"), errors="coerce")
-        s2["_dur"] = dur
-
-        dur_pivot = (
-            s2.groupby(["_dow", "_hour"])["_dur"]
-              .mean()
-              .unstack()
-        )
-        dur_pivot = dur_pivot.reindex(index=sun_first, fill_value=np.nan).reindex(columns=range(24), fill_value=np.nan)
-        dur_pivot.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-
-        # Round for on‑cell annotation
-        _vals = dur_pivot.values.astype(float)
-        # Hide NaNs and zeros in cell labels
-        dur_text = np.where(np.isnan(_vals) | (_vals <= 0), "", np.round(_vals, 1))
-
-        fig_dur = go.Figure(
-            data=go.Heatmap(
-                z=dur_pivot.values,
-                x=[f"{h:02d}" for h in dur_pivot.columns],
-                y=list(dur_pivot.index),
-                colorscale="Blues",
-                zmin=0,
-                colorbar=dict(
-                    title="Avg min",
-                    tickcolor="black",
-                    tickfont=dict(color="black"),
-                    titlefont=dict(color="black"),
-                ),
-                text=dur_text,
-                texttemplate="%{text}",
-                textfont=dict(color="black"),
-                hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Avg min: %{z:.1f}<extra></extra>",
-                xgap=1,
-                ygap=1,
-            )
-        )
-        fig_dur.update_layout(
-            margin=dict(l=10, r=10, t=10, b=10),
-            height=420,
-            xaxis_title="Hour (0–23)",
-            template="plotly_white",
-            paper_bgcolor="white",
-            plot_bgcolor="white",
-            font=dict(color="black"),
-        )
-        fig_dur.update_xaxes(showgrid=True, gridcolor="lightgray", zeroline=False, linecolor="black")
-        fig_dur.update_yaxes(showgrid=True, gridcolor="lightgray", zeroline=False, linecolor="black")
-
-        # Render both heatmaps
-        st.plotly_chart(fig_count, use_container_width=True, config={"displaylogo": False})
-        st.plotly_chart(fig_dur, use_container_width=True, config={"displaylogo": False})
-
-    except Exception:
-        # Fallback to previous implementation if anything goes sideways
-        st.plotly_chart(
-            heatmap_count(heat, "Session Start Density (by Day & Hour)"),
-            use_container_width=True,
-            config={"displaylogo": False},
-        )
-        st.plotly_chart(
-            heatmap_duration(heat, "Average Session Duration (min)"),
-            use_container_width=True,
-            config={"displaylogo": False},
-        )
-
+    # Heatmaps — centralized chart helpers (stable/legacy behavior)
+    # Revert to the working implementations in rca_v2.charts to avoid the
+    # "constant 16" label artifact and any cell misalignment in duration map.
+    st.plotly_chart(
+        heatmap_count(heat),
+        use_container_width=True,
+        config={"displaylogo": False},
+    )
+    st.plotly_chart(
+        heatmap_duration(heat),
+        use_container_width=True,
+        config={"displaylogo": False},
+    )
     # Cache latest results for the Data Export tab
     st.session_state["__v2_last_sessions"] = sess.copy()
     st.session_state["__v2_last_meter"] = mv.copy()
