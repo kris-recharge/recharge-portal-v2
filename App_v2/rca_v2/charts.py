@@ -50,15 +50,18 @@ def _heatmap_from_grid(
     Build a Plotly heatmap from a (7 x 24) DataFrame whose index is 0..6 (Sun..Sat)
     and columns are 0..23 (hours).
     """
-    # Ensure exact shape/order for robustness
+    # Coerce to fixed shape and numeric array for Plotly
     grid = (
         grid.reindex(index=range(7), fill_value=0)
         .reindex(columns=range(24), fill_value=0)
         .copy()
     )
 
-    z = grid.values
-    text = grid.applymap(value_to_text).values
+    # IMPORTANT: ensure z is a purely numeric ndarray so Plotly doesn't
+    # try to infer or broadcast labels. Text is a same-shape string array.
+    z = grid.to_numpy(dtype=float, copy=True)
+    text = grid.applymap(value_to_text).to_numpy()
+
     y_labels = [DAY_LABELS[i] for i in grid.index]
     x_labels = list(grid.columns)
 
@@ -72,7 +75,7 @@ def _heatmap_from_grid(
             zmax=zmax,
             text=text,
             texttemplate="%{text}",
-            hovertemplate="Day: %{y}<br>Hour: %{x}<br>Value: %{z}<extra></extra>",
+            hovertemplate="Day: %{y}<br>Hour: %{x}<br>Value: %{z:.0f}<extra></extra>",
             colorbar=dict(title=None),
         )
     )
@@ -97,13 +100,22 @@ def heatmap_count(starts_df: pd.DataFrame, title: str = "Session Start Density (
         return _heatmap_from_grid(empty, title, _blank_or_int)
 
     ts_ak = _to_ak(starts_df["start_ts"])
-    df = pd.DataFrame(
-        {
-            "dow": (ts_ak.dt.dayofweek + 1) % 7,  # Sun=0 .. Sat=6
-            "hour": ts_ak.dt.hour,
-        }
+    base = pd.DataFrame({
+        "dow": (ts_ak.dt.dayofweek + 1) % 7,  # Sun=0..Sat=6
+        "hour": ts_ak.dt.hour,
+    }).dropna()
+
+    if base.empty:
+        empty = pd.DataFrame(0, index=range(7), columns=range(24))
+        return _heatmap_from_grid(empty, title, _blank_or_int)
+
+    grid = (
+        base.groupby(["dow", "hour"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(index=range(7), columns=range(24), fill_value=0)
     )
-    grid = df.groupby(["dow", "hour"]).size().unstack(fill_value=0)
+
     return _heatmap_from_grid(grid, title, _blank_or_int)
 
 
@@ -141,6 +153,7 @@ def heatmap_duration(sessions_df: pd.DataFrame, title: str = "Average Session Du
     df = df[df["dur"] > 0]
 
     grid = df.groupby(["dow", "hour"])["dur"].mean().unstack()
+    grid = grid.reindex(index=range(7), columns=range(24), fill_value=np.nan)
     return _heatmap_from_grid(grid, title, _blank_or_float1)
 
 
@@ -194,7 +207,7 @@ def session_detail_figure(*args, title: str = "Charge Session Details", **kwargs
     fig.update_layout(
         title=title,
         xaxis_title="Time (AK)",
-        yaxis_title="kW / kWh",
+        yaxis_title="kW / A / V / %",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=40, r=40, t=50, b=40),
     )
@@ -216,58 +229,89 @@ def session_detail_figure(*args, title: str = "Charge Session Details", **kwargs
     # ---- Add traces if available ----
     added = 0
 
+    # Power (kW)
     if "power_w" in df.columns:
-        try:
-            fig.add_trace(
-                go.Scatter(
-                    x=t_ak,
-                    y=pd.to_numeric(df["power_w"], errors="coerce") / 1000.0,
-                    mode="lines",
-                    name="Power (kW)",
-                )
-            )
-            added += 1
-        except Exception:
-            pass
+        y_kw = pd.to_numeric(df["power_w"], errors="coerce") / 1000.0
+        fig.add_trace(
+            go.Scatter(x=t_ak, y=y_kw, mode="lines", name="Power (kW)")
+        )
+        added += 1
 
+    # Energy (kWh) or approximate from power
     if "energy_wh" in df.columns:
-        try:
+        y_kwh = pd.to_numeric(df["energy_wh"], errors="coerce") / 1000.0
+        fig.add_trace(
+            go.Scatter(x=t_ak, y=y_kwh, mode="lines", name="Energy (kWh)", yaxis="y2")
+        )
+        added += 1
+    elif "power_w" in df.columns:
+        # Approximate cumulative energy from power
+        s = df[[tcol, "power_w"]].copy()
+        s[tcol] = pd.to_datetime(s[tcol], errors="coerce", utc=True)
+        s = s.sort_values(tcol)
+        ts = (s[tcol].astype("int64") // 10**9).to_numpy()
+        p_kw = pd.to_numeric(s["power_w"], errors="coerce").fillna(0).to_numpy() / 1000.0
+        if len(p_kw) > 1:
+            dt_h = np.diff(ts) / 3600.0
+            e_kwh = np.concatenate([[0.0], np.cumsum(p_kw[:-1] * dt_h)])
             fig.add_trace(
                 go.Scatter(
-                    x=t_ak,
-                    y=pd.to_numeric(df["energy_wh"], errors="coerce") / 1000.0,
+                    x=pd.to_datetime(s[tcol], utc=True).tz_convert("America/Anchorage"),
+                    y=e_kwh,
                     mode="lines",
                     name="Energy (kWh)",
                     yaxis="y2",
                 )
             )
             added += 1
-        except Exception:
-            pass
-    elif "power_w" in df.columns:
-        # Approximate cumulative energy from power if energy_wh isn't available
-        try:
-            s = df[[tcol, "power_w"]].copy()
-            s[tcol] = pd.to_datetime(s[tcol], errors="coerce", utc=True)
-            s = s.sort_values(tcol)
-            ts = s[tcol].astype("int64") // 10**9  # seconds
-            p_kw = pd.to_numeric(s["power_w"], errors="coerce").fillna(0).to_numpy() / 1000.0
-            if len(p_kw) > 1:
-                dt_h = np.diff(ts) / 3600.0
-                # cumulative trapezoid using left rectangle (simple and stable)
-                e_kwh = np.concatenate([[0.0], np.cumsum(p_kw[:-1] * dt_h)])
-                fig.add_trace(
-                    go.Scatter(
-                        x=pd.to_datetime(s[tcol], utc=True).tz_convert("America/Anchorage"),
-                        y=e_kwh,
-                        mode="lines",
-                        name="Energy (kWh)",
-                        yaxis="y2",
-                    )
-                )
-                added += 1
-        except Exception:
-            pass
+
+    # Current (A)
+    for col in ["amperage_import", "current_a"]:
+        if col in df.columns:
+            y_a = pd.to_numeric(df[col], errors="coerce")
+            fig.add_trace(
+                go.Scatter(x=t_ak, y=y_a, mode="lines", name="Amps (A)")
+            )
+            added += 1
+            break
+
+    # Offered current (A)
+    for col in ["amperage_offered", "offered_current_a"]:
+        if col in df.columns:
+            y_oa = pd.to_numeric(df[col], errors="coerce")
+            fig.add_trace(
+                go.Scatter(x=t_ak, y=y_oa, mode="lines", name="Offered A")
+            )
+            added += 1
+            break
+
+    # Voltage (V) — charger DC bus
+    for col in ["voltage_v", "dc_voltage_v"]:
+        if col in df.columns:
+            y_v = pd.to_numeric(df[col], errors="coerce")
+            fig.add_trace(
+                go.Scatter(x=t_ak, y=y_v, mode="lines", name="Voltage (V)")
+            )
+            added += 1
+            break
+
+    # HV Battery Voltage (V) if available
+    if "hbv_v" in df.columns:
+        y_hbv = pd.to_numeric(df["hbv_v"], errors="coerce")
+        fig.add_trace(
+            go.Scatter(x=t_ak, y=y_hbv, mode="lines", name="HBV (V)")
+        )
+        added += 1
+
+    # State of Charge (%) if available
+    for col in ["soc", "SoC", "SoC (%)"]:
+        if col in df.columns:
+            y_soc = pd.to_numeric(df[col], errors="coerce")
+            fig.add_trace(
+                go.Scatter(x=t_ak, y=y_soc, mode="lines", name="SoC (%)")
+            )
+            added += 1
+            break
 
     # ---- Axes config ----
     if added >= 2:
