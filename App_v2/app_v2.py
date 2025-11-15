@@ -369,15 +369,16 @@ with t1:
                 s2 = s2.sort_values("_start_ak").drop_duplicates(subset=dedupe_keys, keep="first")
 
         # ---------- Count heatmap: session starts by day/hour ----------
-        counts = (
-            s2.groupby(["_dow", "_hour"])
-              .size()
-              .unstack(fill_value=0)
-        )
+        # Use crosstab to build a stable (dow x hour) grid and avoid any edge-cases with groupby/unstack.
+        counts = pd.crosstab(s2["_dow"], s2["_hour"]).astype(int)
 
         # Stable grid Sun..Sat and hours 0..23
         sun_first = [6, 0, 1, 2, 3, 4, 5]
-        counts = counts.reindex(index=sun_first, fill_value=0).reindex(columns=range(24), fill_value=0)
+        counts = (
+            counts
+            .reindex(index=sun_first, fill_value=0)
+            .reindex(columns=range(24), fill_value=0)
+        )
         counts.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
         # Build text labels that hide zeros (match local style)
@@ -385,8 +386,12 @@ with t1:
         count_text = np.where(count_vals > 0, counts.values.astype(int).astype(str), "")
 
         # Upper bound for color scale (avoid a flat palette when all zeros)
-        zmax_count = int(np.nanmax(counts.values)) if counts.size else 0
-        zmax_count = max(zmax_count, 1)
+        zmax_count = 1
+        if counts.size:
+            try:
+                zmax_count = int(max(1, float(np.nanmax(counts.values))))
+            except Exception:
+                zmax_count = 1
 
         fig_count = go.Figure(
             data=go.Heatmap(
