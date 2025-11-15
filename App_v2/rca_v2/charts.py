@@ -245,7 +245,10 @@ def session_detail_figure(mv, sid, tx):
     return fig
 
 def heatmap_count(heat, title):
-    """Session start counts per day/hour with white→blue cells, black borders and labels."""
+    """Session start counts per day/hour with white→blue cells, black borders and labels.
+    Uses Plotly texttemplate instead of an overlay text trace for consistent rendering
+    across Plotly versions (esp. on Render).
+    """
     if heat is None or heat.empty:
         return go.Figure()
 
@@ -260,7 +263,7 @@ def heatmap_count(heat, title):
     h["_dow"] = s_local.dt.dayofweek    # Mon=0 .. Sun=6
     h["_hour"] = s_local.dt.hour
 
-    # 7×24 matrix (Sun..Sat x 0..23), fill missing with 0 so we always render a full grid
+    # 7×24 matrix (Sun..Sat x 0..23)
     mat = (
         h.groupby(["_dow", "_hour"]).size().unstack(fill_value=0)
          .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0)
@@ -268,15 +271,15 @@ def heatmap_count(heat, title):
     )
     mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-    # Ensure numeric array and stable color range
+    # Heatmap values and labels
     z = mat.to_numpy(dtype=float)
+    text = [[(str(int(v)) if np.isfinite(v) and v > 0 else "") for v in row] for row in z]
     zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
 
-    # Explicit white→blue ramp (good contrast on dark Streamlit theme)
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
     fig = go.Figure(go.Heatmap(
-        z=z.tolist(),
+        z=z,
         x=list(mat.columns),
         y=list(mat.index),
         colorscale=blues,
@@ -284,28 +287,12 @@ def heatmap_count(heat, title):
         zmax=zmax,
         colorbar=dict(title="Starts"),
         hoverongaps=False,
-        # Black "borders" using gaps (background shows through)
         xgap=1,
         ygap=1,
+        text=text,
+        texttemplate="%{text}",
+        textfont={"color": "black", "size": 12},
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Starts: %{z:.0f}<extra></extra>",
-    ))
-
-    # Overlay numeric labels via a text trace so Plotly versions render consistently
-    xs, ys, labels = [], [], []
-    cols = list(mat.columns)
-    rows = list(mat.index)
-    for yi, row in enumerate(rows):
-        for xi, col in enumerate(cols):
-            val = z[yi, xi]
-            if np.isfinite(val) and val != 0:
-                xs.append(col)
-                ys.append(row)
-                labels.append(f"{int(round(val))}")
-    fig.add_trace(go.Scatter(
-        x=xs, y=ys, mode="text", text=labels,
-        textposition="middle center",
-        textfont=dict(color="black", size=12),
-        hoverinfo="skip", showlegend=False
     ))
 
     fig.update_layout(
@@ -319,13 +306,14 @@ def heatmap_count(heat, title):
     return fig
 
 def heatmap_duration(heat, title):
-    """Average session duration (minutes) per day/hour with white→blue cells, black borders and labels."""
+    """Average session duration (minutes) per day/hour with white→blue cells, borders and labels.
+    Uses Plotly texttemplate instead of an overlay text trace for consistent rendering.
+    """
     if heat is None or heat.empty:
         return go.Figure()
 
     h = heat.copy()
 
-    # Time bins
     s_local = _start_local_series(h)
     if s_local.empty or s_local.isna().all():
         return go.Figure()
@@ -333,7 +321,7 @@ def heatmap_duration(heat, title):
     h["_dow"] = s_local.dt.dayofweek
     h["_hour"] = s_local.dt.hour
 
-    # Duration series (minutes), tolerant to column name differences
+    # Duration series (minutes)
     h["_dur"] = _duration_minutes_series(h)
 
     mat = (
@@ -344,11 +332,13 @@ def heatmap_duration(heat, title):
     mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
     z = mat.to_numpy(dtype=float)
+    text = [[(f"{v:.1f}" if np.isfinite(v) and v > 0 else "") for v in row] for row in z]
     zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
+
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
     fig = go.Figure(go.Heatmap(
-        z=z.tolist(),
+        z=z,
         x=list(mat.columns),
         y=list(mat.index),
         colorscale=blues,
@@ -358,25 +348,10 @@ def heatmap_duration(heat, title):
         hoverongaps=False,
         xgap=1,
         ygap=1,
+        text=text,
+        texttemplate="%{text}",
+        textfont={"color": "black", "size": 12},
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Avg min: %{z:.1f}<extra></extra>",
-    ))
-
-    # Overlay numeric labels with one decimal
-    xs, ys, labels = [], [], []
-    cols = list(mat.columns)
-    rows = list(mat.index)
-    for yi, row in enumerate(rows):
-        for xi, col in enumerate(cols):
-            val = z[yi, xi]
-            if np.isfinite(val) and val != 0:
-                xs.append(col)
-                ys.append(row)
-                labels.append(f"{val:.1f}")
-    fig.add_trace(go.Scatter(
-        x=xs, y=ys, mode="text", text=labels,
-        textposition="middle center",
-        textfont=dict(color="black", size=12),
-        hoverinfo="skip", showlegend=False
     ))
 
     fig.update_layout(
