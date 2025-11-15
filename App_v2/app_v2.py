@@ -369,8 +369,8 @@ with t1:
                 s2 = s2.sort_values("_start_ak").drop_duplicates(subset=dedupe_keys, keep="first")
 
         # ---------- Count heatmap: session starts by day/hour ----------
-        # Use explicit groupby(size) instead of crosstab to avoid dtype/engine quirks seen on Render.
-        # Ensure day-of-week and hour are clean integers first.
+        # Build a clean (dow, hour) grid using a pivot so values are true counts.
+        # Using pivot_table here avoids occasional engine quirks seen with size().unstack().
         _d = pd.to_numeric(s2["_dow"], errors="coerce").astype("Int64")
         _h = pd.to_numeric(s2["_hour"], errors="coerce").astype("Int64")
         tmp = (
@@ -379,10 +379,13 @@ with t1:
             .astype({"dow": int, "hour": int})
         )
 
-        counts = (
-            tmp.groupby(["dow", "hour"])
-               .size()
-               .unstack(fill_value=0)
+        counts = pd.pivot_table(
+            tmp.assign(v=1),
+            index="dow",
+            columns="hour",
+            values="v",
+            aggfunc="sum",
+            fill_value=0,
         )
 
         # Stable grid Sun..Sat and hours 0..23
@@ -394,16 +397,18 @@ with t1:
         )
         counts.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-        # Build text labels that hide zeros (match local style)
-        count_vals = counts.values.astype(float)
-        count_text = np.where(count_vals > 0, counts.values.astype(int).astype(str), "")
+        # Convert to concrete 2‑D numpy arrays (no dtype=object) so Plotly doesn't broadcast
+        z_counts = counts.to_numpy(dtype=float)
+        # Hide zeros in the text overlay, print integers for >0
+        text_counts = counts.to_numpy(dtype=int)
+        text_counts = np.where(z_counts > 0, text_counts.astype(str), "")
 
         # Upper bound for color scale (avoid a flat palette when all zeros)
-        zmax_count = int(max(1, int(np.nanmax(counts.values)))) if counts.size else 1
+        zmax_count = int(max(1, int(np.nanmax(z_counts)))) if z_counts.size else 1
 
         fig_count = go.Figure(
             data=go.Heatmap(
-                z=counts.values,
+                z=z_counts,
                 x=[f"{h:02d}" for h in counts.columns],
                 y=list(counts.index),
                 colorscale="Blues",
@@ -415,7 +420,7 @@ with t1:
                     tickfont=dict(color="black"),
                     titlefont=dict(color="black"),
                 ),
-                text=count_text,
+                text=text_counts,
                 texttemplate="%{text}",
                 textfont=dict(color="black"),
                 hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Starts: %{z:.0f}<extra></extra>",
