@@ -324,84 +324,89 @@ with t1:
     try:
         s2 = sess.copy()
 
-        # --- Robust AK‑local start extraction ---
-        # Prefer UTC _start if present; otherwise use AKDT_dt, or fall back to Start Date/Time.
+        # --- Build AK‑local, hour‑floored start times (robust across sources) ---
         AK = "America/Anchorage"
         starts_ak = None
-        try:
-            if "_start" in s2.columns:
-                # _start expected as UTC-like timestamp/ISO
-                su = pd.to_datetime(s2["_start"], errors="coerce", utc=True)
-                starts_ak = su.dt.tz_convert(AK)
-            elif "AKDT_dt" in s2.columns:
-                su = pd.to_datetime(s2["AKDT_dt"], errors="coerce")
-                # Localize if naive; convert if tz-aware
-                if getattr(su.dt, "tz", None) is None:
-                    starts_ak = su.dt.tz_localize(AK)
-                else:
-                    starts_ak = su.dt.tz_convert(AK)
+        if "_start" in s2.columns:
+            # Preferred: UTC ISO from build_sessions
+            su = pd.to_datetime(s2["_start"], errors="coerce", utc=True)
+            starts_ak = su.dt.tz_convert(AK).dt.floor("H")
+        elif "AKDT_dt" in s2.columns:
+            su = pd.to_datetime(s2["AKDT_dt"], errors="coerce")
+            # Localize if naive; convert if tz‑aware
+            if getattr(su.dt, "tz", None) is None:
+                starts_ak = su.dt.tz_localize(AK).dt.floor("H")
             else:
-                # Fallback: Start Date/Time could be naive AK local or tz-aware
-                sd = pd.to_datetime(s2.get("Start Date/Time"), errors="coerce")
-                if getattr(sd.dt, "tz", None) is None:
-                    starts_ak = sd.dt.tz_localize(AK)
-                else:
-                    starts_ak = sd.dt.tz_convert(AK)
-        except Exception:
-            # Last resort: parse Start Date/Time as UTC then convert
-            sd = pd.to_datetime(s2.get("Start Date/Time"), errors="coerce", utc=True)
-            try:
-                starts_ak = sd.dt.tz_convert(AK)
-            except Exception:
-                starts_ak = sd
+                starts_ak = su.dt.tz_convert(AK).dt.floor("H")
+        else:
+            sd = pd.to_datetime(s2.get("Start Date/Time"), errors="coerce")
+            if getattr(sd.dt, "tz", None) is None:
+                starts_ak = sd.dt.tz_localize(AK).dt.floor("H")
+            else:
+                starts_ak = sd.dt.tz_convert(AK).dt.floor("H")
 
-        # Drop rows with invalid starts and attach working columns
+        # Keep only rows with a valid start time
         valid = starts_ak.notna()
         s2 = s2.loc[valid].copy()
         starts_ak = starts_ak.loc[valid]
 
+        # Working columns for grouping
         s2["_start_ak"] = starts_ak
-        s2["_dow"] = s2["_start_ak"].dt.dayofweek  # Mon=0..Sun=6
+        s2["_dow"] = s2["_start_ak"].dt.dayofweek  # Mon=0 .. Sun=6
         s2["_hour"] = s2["_start_ak"].dt.hour
 
-        # De-dupe keys
-        dedupe_keys = []
+        # --- De‑duplication: one row per session ---
+        # Prefer transaction_id; otherwise fall back to (station_id, _start_ak) or (EVSE, _start_ak).
         if "transaction_id" in s2.columns:
-            dedupe_keys = ["transaction_id"]
+            s2 = s2.sort_values("_start_ak").drop_duplicates(subset=["transaction_id"], keep="first")
         else:
-            # Fallback if tx id is unavailable
+            dedupe_keys = []
             if "station_id" in s2.columns:
-                dedupe_keys = ["_start_ak", "station_id"]
+                dedupe_keys = ["station_id", "_start_ak"]
             elif "EVSE" in s2.columns:
-                dedupe_keys = ["_start_ak", "EVSE"]
+                dedupe_keys = ["EVSE", "_start_ak"]
+            if dedupe_keys:
+                s2 = s2.sort_values("_start_ak").drop_duplicates(subset=dedupe_keys, keep="first")
 
-        if dedupe_keys:
-            s2 = s2.sort_values(by="_start_ak").drop_duplicates(subset=dedupe_keys, keep="first")
-
-        # ---- Count heatmap (starts per day/hour) ----
+        # ---------- Count heatmap: session starts by day/hour ----------
         counts = (
             s2.groupby(["_dow", "_hour"])
               .size()
               .unstack(fill_value=0)
         )
 
-        # Reindex to Sun..Sat and hours 0..23 for a stable grid
+        # Stable grid Sun..Sat and hours 0..23
         sun_first = [6, 0, 1, 2, 3, 4, 5]
         counts = counts.reindex(index=sun_first, fill_value=0).reindex(columns=range(24), fill_value=0)
         counts.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+        # Upper bound for color scale (avoid a flat palette when all zeros)
+        zmax_count = int(np.nanmax(counts.values)) if counts.size else 0
+        zmax_count = max(zmax_count, 1)
 
         fig_count = go.Figure(
             data=go.Heatmap(
                 z=counts.values,
                 x=[f"{h:02d}" for h in counts.columns],
                 y=list(counts.index),
+                colorscale="Blues",
+                zmin=0,
+                zmax=zmax_count,
                 colorbar=dict(title="Starts"),
-                hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Starts: %{z}<extra></extra>",
+                text=counts.values,
+                texttemplate="%{text:.0f}",
+                hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Starts: %{z:.0f}<extra></extra>",
+                xgap=1,
+                ygap=1,
             )
         )
-        fig_count.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=420)
+        fig_count.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=420,
+            xaxis_title="Hour (0–23)",
+        )
 
-        # ---- Duration heatmap (avg minutes per day/hour) ----
+        # ---------- Duration heatmap: average minutes by day/hour ----------
         dur = pd.to_numeric(s2.get("Duration (min)"), errors="coerce")
         s2["_dur"] = dur
 
@@ -413,17 +418,29 @@ with t1:
         dur_pivot = dur_pivot.reindex(index=sun_first, fill_value=np.nan).reindex(columns=range(24), fill_value=np.nan)
         dur_pivot.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
+        # Round for on‑cell annotation
+        dur_text = np.where(np.isnan(dur_pivot.values), "", np.round(dur_pivot.values, 1))
+
         fig_dur = go.Figure(
             data=go.Heatmap(
                 z=dur_pivot.values,
                 x=[f"{h:02d}" for h in dur_pivot.columns],
                 y=list(dur_pivot.index),
+                colorscale="Blues",
+                zmin=0,
                 colorbar=dict(title="Avg min"),
+                text=dur_text,
+                texttemplate="%{text}",
                 hovertemplate="Day: %{y}<br>Hour: %{x}:00<br>Avg min: %{z:.1f}<extra></extra>",
-                zmin=0
+                xgap=1,
+                ygap=1,
             )
         )
-        fig_dur.update_layout(margin=dict(l=10, r=10, t=10, b=10), height=420)
+        fig_dur.update_layout(
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=420,
+            xaxis_title="Hour (0–23)",
+        )
 
         # Render both heatmaps
         st.plotly_chart(fig_count, use_container_width=True, config={"displaylogo": False})
