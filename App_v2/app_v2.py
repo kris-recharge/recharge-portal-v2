@@ -355,56 +355,49 @@ with t1:
         s2["_dow"] = s2["_start_ak"].dt.dayofweek  # Mon=0 .. Sun=6
         s2["_hour"] = s2["_start_ak"].dt.hour
 
-        # --- De‑duplication: one row per session ---
-        # Prefer transaction_id; otherwise fall back to (station_id, _start_ak) or (EVSE, _start_ak).
-        if "transaction_id" in s2.columns:
-            s2 = s2.sort_values("_start_ak").drop_duplicates(subset=["transaction_id"], keep="first")
-        else:
-            dedupe_keys = []
-            if "station_id" in s2.columns:
-                dedupe_keys = ["station_id", "_start_ak"]
-            elif "EVSE" in s2.columns:
-                dedupe_keys = ["EVSE", "_start_ak"]
-            if dedupe_keys:
-                s2 = s2.sort_values("_start_ak").drop_duplicates(subset=dedupe_keys, keep="first")
-
         # ---------- Count heatmap: session starts by day/hour ----------
-        # Build a clean (dow, hour) grid using a pivot so values are true counts.
-        # Using pivot_table here avoids occasional engine quirks seen with size().unstack().
-        _d = pd.to_numeric(s2["_dow"], errors="coerce").astype("Int64")
-        _h = pd.to_numeric(s2["_hour"], errors="coerce").astype("Int64")
-        tmp = (
-            pd.DataFrame({"dow": _d, "hour": _h})
-            .dropna()
-            .astype({"dow": int, "hour": int})
-        )
+        # Stronger de‑duplication: count one row per unique (tx, station, connector)
+        dedupe_keys = []
+        if "transaction_id" in s2.columns:
+            dedupe_keys.append("transaction_id")
+        if "station_id" in s2.columns:
+            dedupe_keys.append("station_id")
+        if "connector_id" in s2.columns:
+            dedupe_keys.append("connector_id")
+        if dedupe_keys:
+            s2 = (
+                s2.sort_values("_start_ak")
+                  .drop_duplicates(subset=dedupe_keys, keep="first")
+            )
 
-        counts = pd.pivot_table(
-            tmp.assign(v=1),
-            index="dow",
-            columns="hour",
-            values="v",
-            aggfunc="sum",
-            fill_value=0,
+        # Integer day-of-week / hour for grouping
+        d_int = pd.to_numeric(s2["_dow"], errors="coerce").astype("Int64")
+        h_int = pd.to_numeric(s2["_hour"], errors="coerce").astype("Int64")
+        gh = pd.DataFrame({"dow": d_int, "hour": h_int}).dropna().astype({"dow": int, "hour": int})
+
+        # Use groupby().size() to count starts (more predictable than pivot_table on some engines)
+        counts = (
+            gh.groupby(["dow", "hour"], observed=False)
+              .size()
+              .unstack(fill_value=0)
         )
 
         # Stable grid Sun..Sat and hours 0..23
         sun_first = [6, 0, 1, 2, 3, 4, 5]
         counts = (
-            counts
-            .reindex(index=sun_first, fill_value=0)
-            .reindex(columns=range(24), fill_value=0)
+            counts.reindex(index=sun_first, fill_value=0)
+                  .reindex(columns=range(24), fill_value=0)
         )
         counts.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-        # Convert to concrete 2‑D numpy arrays (no dtype=object) so Plotly doesn't broadcast
-        z_counts = counts.to_numpy(dtype=float)
-        # Hide zeros in the text overlay, print integers for >0
-        text_counts = counts.to_numpy(dtype=int)
-        text_counts = np.where(z_counts > 0, text_counts.astype(str), "")
+        # Optional on‑screen debugging of the count grid
+        with st.expander("Heatmap debug (session starts)", expanded=False):
+            st.write("Sum of counts:", int(np.nansum(counts.values)))
+            st.dataframe(counts.astype(int), use_container_width=True)
 
-        # Upper bound for color scale (avoid a flat palette when all zeros)
-        zmax_count = int(max(1, int(np.nanmax(z_counts)))) if z_counts.size else 1
+        # Convert to dense numeric arrays for Plotly
+        z_counts = counts.to_numpy(dtype=float)
+        text_counts = np.where(z_counts > 0, counts.to_numpy(dtype=int).astype(str), "")
 
         fig_count = go.Figure(
             data=go.Heatmap(
