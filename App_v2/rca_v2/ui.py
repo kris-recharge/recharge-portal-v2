@@ -129,15 +129,18 @@ def _find_logo_path() -> Optional[str]:
 
 # Helper: future‑proof sizing for data_editor across Streamlit versions
 def _editor_stretch_kwargs():
-    """Return kwargs for st.data_editor that stretch to container on new Streamlit,
-    and fall back to use_container_width=True on older versions."""
+    """Return kwargs for st.data_editor that stretch to the container by using
+    use_container_width when available. This avoids passing unsupported values
+    (e.g., width='stretch') that can crash older/newer Streamlit builds.
+    """
     try:
         sig = inspect.signature(st.data_editor)
-        if "width" in sig.parameters:
-            return {"width": "stretch"}
+        if "use_container_width" in sig.parameters:
+            return {"use_container_width": True}
     except Exception:
         pass
-    return {"use_container_width": True}
+    # Fallback for very old versions that may not expose use_container_width
+    return {}
 
 def render_sidebar():
     # Logo
