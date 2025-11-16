@@ -7,6 +7,102 @@ from .config import AK_TZ, UTC
 from .constants import EVSE_DISPLAY, display_name, get_all_station_ids
 import inspect
 
+# --- Auth helpers (logout + current user display) ---
+
+# Where to send users after logging out. Can be overridden by env var.
+LOGIN_URL = os.environ.get(
+    "PORTAL_LOGIN_URL",
+    "https://recharge-portal-v2.onrender.com/login",
+)
+
+def _current_user_email() -> Optional[str]:
+    """
+    Best-effort extraction of the signed-in user's email from session_state.
+    Supports several common keys used across our auth experiments.
+    """
+    ss = st.session_state
+    # Direct email keys we have used
+    for k in ("user_email", "auth_email"):
+        if isinstance(ss.get(k), str) and "@" in ss[k]:
+            return ss[k]
+
+    # Supabase-style user dicts
+    for k in ("user", "auth_user", "supabase_user", "profile"):
+        obj = ss.get(k)
+        try:
+            if isinstance(obj, dict) and "email" in obj and obj["email"]:
+                return str(obj["email"])
+            # Sometimes nested under obj.get("user", {}).get("email")
+            if hasattr(obj, "get"):
+                inner = obj.get("user")
+                if isinstance(inner, dict) and inner.get("email"):
+                    return str(inner["email"])
+        except Exception:
+            pass
+
+    # Session object (e.g., sb_session / supabase_session) may carry user.email
+    for k in ("sb_session", "supabase_session", "gotrue_session"):
+        sess = ss.get(k)
+        try:
+            user = getattr(sess, "user", None) or (sess.get("user") if hasattr(sess, "get") else None)
+            email = getattr(user, "email", None) or (user.get("email") if hasattr(user, "get") else None)
+            if email:
+                return str(email)
+        except Exception:
+            pass
+
+    return None
+
+
+def _logout_and_redirect(login_url: str = LOGIN_URL) -> None:
+    """
+    Attempt to sign out from Supabase (if present), clear cached data,
+    remove any auth/session tokens from session_state, and hard-redirect
+    the browser to the login page.
+    """
+    # 1) Try Supabase sign-out if a client is available
+    sb = st.session_state.get("supabase")
+    if sb is not None:
+        try:
+            # pysupabase client
+            if hasattr(sb, "auth") and hasattr(sb.auth, "sign_out"):
+                sb.auth.sign_out()
+        except Exception:
+            pass
+
+    # 2) Purge common token/session keys we may have set
+    for k in [
+        "access_token", "refresh_token", "jwt", "token",
+        "sb_session", "supabase_session", "gotrue_session",
+        "user", "auth_user", "supabase_user", "profile",
+        "user_email", "auth_email", "rca_token",
+    ]:
+        if k in st.session_state:
+            del st.session_state[k]
+
+    # 3) Clear caches to avoid showing stale data after logout
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+    # 4) Redirect the browser to the login page and stop execution
+    st.write(
+        f"""<script>
+                try {{
+                    window.location.replace("{login_url}");
+                }} catch (e) {{
+                    window.location.href = "{login_url}";
+                }}
+            </script>""",
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
 def _round_up_to_hour(dt: datetime) -> datetime:
     base = dt.replace(minute=0, second=0, microsecond=0)
     if dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
@@ -50,6 +146,16 @@ def render_sidebar():
         st.image(logo_path, use_container_width=True)
     else:
         st.markdown("### ReCharge Alaska")
+
+    # --- Signed-in user + Sign out button ---
+    email = _current_user_email()
+    if email:
+        st.caption(f"Signed in as {email}")
+    else:
+        st.caption("Signed in")
+
+    if st.button("Sign out", key="v2_sign_out"):
+        _logout_and_redirect(LOGIN_URL)
 
     # ---------- EVSE Filter (friendly names only) ----------
     st.markdown("#### EVSE Filter")
