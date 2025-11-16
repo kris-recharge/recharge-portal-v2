@@ -584,25 +584,6 @@ with t1:
         st.info("Select a session above to view details.")
 
     # Debug helper: quick count grid to verify (Sun..Sat x 0..23)
-    def _count_grid_debug(df: pd.DataFrame) -> pd.DataFrame:
-        base = pd.DataFrame(0, index=range(7), columns=range(24))
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return base
-        d = df.copy()
-        ts = None
-        for c in ["_start_ak", "start_ak", "Start (AK)", "_start"]:
-            if c in d.columns:
-                ts = pd.to_datetime(d[c], errors="coerce")
-                break
-        if ts is None:
-            return base
-        dow = ((ts.dt.dayofweek + 1) % 7)
-        hour = ts.dt.hour
-        g = pd.DataFrame({"_dow": dow, "_hour": hour}).dropna().groupby(["_dow", "_hour"]).size().reset_index(name="n")
-        if not g.empty:
-            p = g.pivot(index="_dow", columns="_hour", values="n").fillna(0).astype(int)
-            base.loc[p.index, p.columns] = p.values
-        return base
 
     def _duration_grid_from_heat(df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -633,6 +614,9 @@ with t1:
         base.loc[pv.index, pv.columns] = pv.values
         return base
 
+    # Build heat grids once (shared by Debug + Charts) so both use exactly the same logic
+    _count_grid, _dur_grid = _build_heat_grids(sess, heat)
+
     with st.expander("Heatmap debug (session starts)", expanded=False):
         try:
             st.json({
@@ -652,9 +636,9 @@ with t1:
                 tops = tmp.value_counts().reset_index(name="n").sort_values("n", ascending=False).head(10)
                 st.dataframe(tops, hide_index=True, **_df_stretch_kwargs())
 
-            # Count grid snapshot (Sun..Sat x 0..23)
-            cg = _count_grid_debug(heat)
-            st.write("Count grid (Sun..Sat × 0..23) — total starts =", int(cg.values.sum()))
+            # Count grid snapshot (Sun..Sat × 0..23) — use the same computation as the charts
+            cg = _count_grid
+            st.write("Count grid (Sun..Sat × 0..23) — total starts =", int(np.nansum(cg.values)))
             st.dataframe(cg, height=260, **_df_stretch_kwargs())
 
             # Sample of the rows feeding the chart
@@ -665,8 +649,7 @@ with t1:
         except Exception as _e:
             st.caption(f"debug error: {_e}")
 
-    # Heatmaps — build 7×24 grids and render locally (robust & version-independent)
-    _count_grid, _dur_grid = _build_heat_grids(sess, heat)
+    # Heatmaps — grids already computed above; render locally (robust & version‑independent)
 
     st.plotly_chart(
         _fig_heatmap_count(_count_grid, "Session Start Density (by Day & Hour)"),
