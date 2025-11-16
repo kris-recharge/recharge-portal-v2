@@ -211,7 +211,7 @@ def session_detail_figure(mv, sid, tx):
                 name=name,
                 mode="lines",
                 yaxis=axis,
-                hovertemplate=hover_fmt + "<br>%{x|%b %-d, %H:%M:%S}<extra></extra>",
+                hovertemplate=hover_fmt + "<extra></extra>",
             )
         )
 
@@ -225,8 +225,9 @@ def session_detail_figure(mv, sid, tx):
     fig.update_layout(
         margin=dict(l=10, r=200, t=30, b=10),
         hovermode="x unified",
+        hoverlabel=dict(namelength=-1),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis=dict(title="Time (AK)"),
+        xaxis=dict(title="Time (AK)", hoverformat="%b %d, %H:%M:%S"),
         # y (left): Power
         yaxis=dict(title="Power (kW)", autorange=True, fixedrange=False),
         # y2..y5 (right): Amps, SoC, Energy, HVB
@@ -271,6 +272,7 @@ def session_detail_figure(mv, sid, tx):
             title_standoff=6,
         ),
     )
+    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", spikedash="dot")
     return fig
 
 def heatmap_count(heat, title):
