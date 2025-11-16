@@ -131,12 +131,17 @@ def _build_heat_grids(sess: pd.DataFrame, heat: pd.DataFrame):
 
     # Prefer starts from `heat`; fall back to Sessions
     ts = _ak_ts_from(heat, ("_start_ak", "start_ak", "Start (AK)", "_start", "timestamp"))
-    dur = pd.to_numeric(heat.get("Duration (min)"), errors="coerce") if isinstance(heat, pd.DataFrame) else None
+    # Duration column as a Series (aligned later); if missing or malformed, keep as None
+    if isinstance(heat, pd.DataFrame) and "Duration (min)" in heat.columns:
+        dur_raw = heat["Duration (min)"]
+    else:
+        dur_raw = None
 
     if ts is None:
         ts = _ak_ts_from(sess, ("Start Date/Time",))
-        if dur is None and isinstance(sess, pd.DataFrame):
-            dur = pd.to_numeric(sess.get("Duration (min)"), errors="coerce")
+        if dur_raw is None and isinstance(sess, pd.DataFrame):
+            if "Duration (min)" in sess.columns:
+                dur_raw = sess["Duration (min)"]
 
     if ts is None:
         return base_count, base_dur
@@ -151,14 +156,28 @@ def _build_heat_grids(sess: pd.DataFrame, heat: pd.DataFrame):
         base_count.loc[pv.index, pv.columns] = pv.values
 
     # Durations (average)
-    if dur is not None:
-        gd = pd.concat([df, dur.rename("dur")], axis=1).dropna(subset=["_dow", "_hour", "dur"])
+    try:
+        if isinstance(dur_raw, pd.Series):
+            dur_series = pd.to_numeric(dur_raw, errors="coerce")
+        else:
+            # Could be a scalar or None; create a NaN series aligned to df length
+            dur_series = pd.Series(np.nan, index=df.index)
+
+        # Ensure the duration series aligns to df for safe concat
+        if len(dur_series) != len(df):
+            dur_series = dur_series.reindex(range(len(df)))
+        dur_series.index = df.index
+
+        gd = pd.concat([df, dur_series.rename("dur")], axis=1).dropna(subset=["_dow", "_hour", "dur"])
         if not gd.empty:
             pv = (
                 gd.groupby(["_dow", "_hour"])["dur"].mean().reset_index()
                   .pivot(index="_dow", columns="_hour", values="dur")
             )
             base_dur.loc[pv.index, pv.columns] = pv.values
+    except Exception:
+        # Leave base_dur as-is on any unexpected type mismatch
+        pass
 
     return base_count, base_dur
 
