@@ -46,25 +46,39 @@ def _client_redirect(url: str) -> None:
 
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
 
-# Early logout hook (works even if auth/UI hasn't rendered yet)
+# Early logout / query-param sanitation (runs before auth/UI)
 try:
     _qp = st.experimental_get_query_params()
 except Exception:
     _qp = {}
-if (_qp.get("logout") == ["1"]) or st.session_state.pop("__logout_now", False):
-    # Clear common auth/session keys
-    for _k in [
-        "sb", "token", "access_token", "supabase_user", "user_email",
-        "_allowed_evse", "_admin_all", "__v2_all_evse",
-        "__v2_last_sessions", "__v2_last_meter",
-    ]:
-        st.session_state.pop(_k, None)
-    # Clear query string and send to central login
+
+_has_logout = _qp.get("logout") == ["1"]
+_sb_vals = _qp.get("sb") or []
+_sb_token = _sb_vals[0] if _sb_vals else ""
+
+# Case: we arrived with BOTH ?logout=1 AND a fresh sb token (e.g., an auth redirect
+# that preserved old params). Drop the stale logout flag so we don't bounce back out.
+if _has_logout and _sb_token:
     try:
-        st.experimental_set_query_params()  # wipe params (incl. sb)
+        st.experimental_set_query_params(sb=_sb_token)
     except Exception:
         pass
-    _client_redirect(LOGOUT_URL)
+else:
+    # True logout: either explicit ?logout=1 or our local flag from the sidebar button
+    if _has_logout or st.session_state.pop("__logout_now", False):
+        # Clear common auth/session keys
+        for _k in [
+            "sb", "token", "access_token", "supabase_user", "user_email",
+            "_allowed_evse", "_admin_all", "__v2_all_evse",
+            "__v2_last_sessions", "__v2_last_meter",
+        ]:
+            st.session_state.pop(_k, None)
+        # Clear query string and send to central login
+        try:
+            st.experimental_set_query_params()  # wipe params (incl. sb/logout)
+        except Exception:
+            pass
+        _client_redirect(LOGOUT_URL)
 
 # Gate the web build behind a simple login (disabled for local runs)
 if APP_MODE != "local":
