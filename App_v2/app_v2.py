@@ -43,53 +43,41 @@ def _client_redirect(url: str) -> None:
     )
     st.stop()
 
+# --- Helper: clear session and logout with hard redirect ---
+def perform_logout() -> None:
+    """Clear app/session state and hard-redirect to the central login page.
+
+    This avoids manipulating st.query_params (which can vary by Streamlit version)
+    and prevents redirect loops by stopping execution immediately after emitting
+    the client-side redirect script.
+    """
+    # Clear common auth/session keys
+    for _k in [
+        "sb", "token", "access_token", "supabase_user", "user_email",
+        "_allowed_evse", "_admin_all", "__v2_all_evse",
+        "__v2_last_sessions", "__v2_last_meter",
+    ]:
+        st.session_state.pop(_k, None)
+
+    # Client-side cleanup + redirect
+    st.markdown(
+        f"""
+        <script>
+            try {{
+                localStorage.clear();
+                sessionStorage.clear();
+                document.cookie = "sb=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+                document.cookie = "access_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
+            }} catch (e) {{}}
+            window.location.href = "{LOGOUT_URL}";
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.stop()
+
 
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
-
-# Early logout / query-param sanitation (runs before auth/UI)
-# Use modern st.query_params (dict-like) instead of deprecated experimental_* APIs.
-try:
-    qp_dict = dict(st.query_params)
-except Exception:
-    qp_dict = {}
-
-def _qp_get(name, default=""):
-    """Return a single string value from st.query_params (handles list-or-str)."""
-    if name not in qp_dict:
-        return default
-    v = qp_dict[name]
-    if isinstance(v, list):
-        return v[0] if v else default
-    return v
-
-_has_logout = _qp_get("logout") == "1"
-_sb_token = _qp_get("sb", "")
-
-# If we arrive with BOTH ?logout=1 AND a fresh sb token (e.g., an auth redirect
-# that preserved old params), drop the stale logout flag so we don't bounce again.
-if _has_logout and _sb_token:
-    try:
-        if "logout" in st.query_params:
-            del st.query_params["logout"]
-    except Exception:
-        pass
-else:
-    # True logout: explicit ?logout=1 OR a local flag set by the sidebar button.
-    if _has_logout or st.session_state.pop("__logout_now", False):
-        # Clear common auth/session keys.
-        for _k in [
-            "sb", "token", "access_token", "supabase_user", "user_email",
-            "_allowed_evse", "_admin_all", "__v2_all_evse",
-            "__v2_last_sessions", "__v2_last_meter",
-        ]:
-            st.session_state.pop(_k, None)
-        # Clear URL params and send to central login.
-        try:
-            # Remove all query params including any lingering sb=...
-            st.query_params.clear()
-        except Exception:
-            pass
-        _client_redirect(LOGOUT_URL)
 
 # Gate the web build behind a simple login (disabled for local runs)
 if APP_MODE != "local":
@@ -126,17 +114,7 @@ with st.sidebar:
     )
     st.caption(f"Signed in as **{_email}**" if _email else "Signed in")
     if st.button("Sign out", key="__btn_logout", use_container_width=True):
-        # Flag logout; the early hook above will clear state and hard-redirect.
-        st.session_state["__logout_now"] = True
-        try:
-            # Set a simple marker and strip any auth-bearing params from the URL
-            st.query_params["logout"] = "1"
-            for _key in ("sb", "access_token", "token"):
-                if _key in st.query_params:
-                    del st.query_params[_key]
-        except Exception:
-            pass
-        st.rerun()
+        perform_logout()
     st.divider()
     stations, start_utc, end_utc = render_sidebar()
 
