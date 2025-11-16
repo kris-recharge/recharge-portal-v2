@@ -106,16 +106,6 @@ def _df_stretch_kwargs():
     return {"use_container_width": True}
 
 with st.sidebar:
-    # --- Account / Sign-out ---
-    _email = (
-        st.session_state.get("user_email")
-        or (st.session_state.get("supabase_user") or {}).get("email")
-        or ""
-    )
-    st.caption(f"Signed in as **{_email}**" if _email else "Signed in")
-    if st.button("Sign out", key="__btn_logout", use_container_width=True):
-        perform_logout()
-    st.divider()
     stations, start_utc, end_utc = render_sidebar()
 
     # Optional diagnostics to verify DB connectivity & table counts on Render
@@ -532,12 +522,12 @@ with t1:
     _dur_grid = _duration_grid_from_heat(heat)
 
     st.plotly_chart(
-        heatmap_count(_count_grid),
+        heatmap_count(_count_grid, "Session Start Density (by Day & Hour)"),
         use_container_width=True,
         config={"displaylogo": False},
     )
     st.plotly_chart(
-        heatmap_duration(_dur_grid),
+        heatmap_duration(_dur_grid, "Average Session Duration (min)"),
         use_container_width=True,
         config={"displaylogo": False},
     )
