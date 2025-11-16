@@ -106,7 +106,18 @@ def _df_stretch_kwargs():
     return {"use_container_width": True}
 
 with st.sidebar:
-    stations, start_utc, end_utc = render_sidebar()
+    # Suppress duplicate "Sign out" button from render_sidebar by temporarily
+    # overriding st.button during the render call.
+    _orig_button = st.button
+    def _no_signout_button(label, *args, **kwargs):
+        if str(label).strip().lower() in {"sign out", "logout", "signout"}:
+            return False
+        return _orig_button(label, *args, **kwargs)
+    st.button = _no_signout_button
+    try:
+        stations, start_utc, end_utc = render_sidebar()
+    finally:
+        st.button = _orig_button
 
     # Optional diagnostics to verify DB connectivity & table counts on Render
     if APP_MODE == "local":
@@ -522,6 +533,62 @@ with t1:
     # "constant 16" label artifact and any cell misalignment in duration map.
     _count_grid = _count_grid_debug(heat)
     _dur_grid = _duration_grid_from_heat(heat)
+
+    # Fallback: if the heat-derived grids are empty (all zeros), rebuild
+    # count/duration grids directly from the Sessions table.
+    if (
+        isinstance(_count_grid, pd.DataFrame)
+        and int(np.nan_to_num(_count_grid.values).sum()) == 0
+        and isinstance(sess, pd.DataFrame)
+        and not sess.empty
+    ):
+        def _count_grid_from_sessions(df: pd.DataFrame) -> pd.DataFrame:
+            base = pd.DataFrame(0, index=range(7), columns=range(24))
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return base
+            ts = pd.to_datetime(df.get("Start Date/Time"), errors="coerce", utc=True)
+            try:
+                ts = ts.dt.tz_convert("America/Anchorage")
+            except Exception:
+                pass
+            g = pd.DataFrame({
+                "_dow": ((ts.dt.dayofweek + 1) % 7),
+                "_hour": ts.dt.hour,
+            }).dropna()
+            if g.empty:
+                return base
+            p = g.value_counts().reset_index(name="n").pivot(index="_dow", columns="_hour", values="n").fillna(0).astype(int)
+            base.loc[p.index, p.columns] = p.values
+            return base
+
+        def _dur_grid_from_sessions(df: pd.DataFrame) -> pd.DataFrame:
+            base = pd.DataFrame(np.nan, index=range(7), columns=range(24))
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return base
+            ts = pd.to_datetime(df.get("Start Date/Time"), errors="coerce", utc=True)
+            try:
+                ts = ts.dt.tz_convert("America/Anchorage")
+            except Exception:
+                pass
+            dur = pd.to_numeric(df.get("Duration (min)"), errors="coerce")
+            g = pd.DataFrame({
+                "_dow": ((ts.dt.dayofweek + 1) % 7),
+                "_hour": ts.dt.hour,
+                "dur": dur,
+            }).dropna()
+            if g.empty:
+                return base
+            pv = (
+                g.groupby(["_dow", "_hour"])["dur"]
+                 .mean()
+                 .reset_index()
+                 .pivot(index="_dow", columns="_hour", values="dur")
+            )
+            base.loc[pv.index, pv.columns] = pv.values
+            return base
+
+        _count_grid = _count_grid_from_sessions(sess)
+        _dur_grid   = _dur_grid_from_sessions(sess)
 
     st.plotly_chart(
         heatmap_count(_count_grid, "Session Start Density (by Day & Hour)"),
