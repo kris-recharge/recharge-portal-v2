@@ -8,11 +8,16 @@ from .constants import EVSE_DISPLAY, display_name, get_all_station_ids
 import inspect
 
 # --- Auth helpers (logout + current user display) ---
-
-# Where to send users after logging out. Can be overridden by env var.
+# Base app URL (absolute). You can override in Render env vars.
+PORTAL_BASE_URL = os.environ.get(
+    "PORTAL_BASE_URL",
+    "https://recharge-portal-v2.onrender.com",
+)
+# After logout, show the same app in a "login view" using a query param.
+# You can still override fully with PORTAL_LOGIN_URL if you host a separate page.
 LOGIN_URL = os.environ.get(
     "PORTAL_LOGIN_URL",
-    "https://recharge-portal-v2.onrender.com/login",
+    f"{PORTAL_BASE_URL}/?view=login",
 )
 
 def _current_user_email() -> Optional[str]:
@@ -90,11 +95,31 @@ def _logout_and_redirect(login_url: str = LOGIN_URL) -> None:
     except Exception:
         pass
 
+    # 3b) Clear any query params on the server side (Streamlit API differences)
+    try:
+        # Newer Streamlit
+        st.query_params.clear()  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            # Older Streamlit
+            st.experimental_set_query_params()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     # 4) Redirect the browser to the login page and stop execution
     st.write(
         f"""<script>
                 try {{
-                    window.location.replace("{login_url}");
+                    // Ensure we do not preserve any current query string (?sb=...).
+                    const target = new URL("{login_url}");
+                    const base = target.origin + target.pathname;   // absolute without query/hash
+                    const finalUrl = base + (target.search || "");
+                    // Drop the current query from the address bar first.
+                    const here = new URL(window.location.href);
+                    const hereBase = here.origin + here.pathname;
+                    window.history.replaceState({{}}, document.title, hereBase);
+                    // Hard redirect to the login view.
+                    window.location.replace(finalUrl);
                 }} catch (e) {{
                     window.location.href = "{login_url}";
                 }}
