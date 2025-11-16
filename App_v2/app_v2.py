@@ -47,35 +47,46 @@ def _client_redirect(url: str) -> None:
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
 
 # Early logout / query-param sanitation (runs before auth/UI)
+# Use modern st.query_params (dict-like) instead of deprecated experimental_* APIs.
 try:
-    _qp = st.experimental_get_query_params()
+    qp_dict = dict(st.query_params)
 except Exception:
-    _qp = {}
+    qp_dict = {}
 
-_has_logout = _qp.get("logout") == ["1"]
-_sb_vals = _qp.get("sb") or []
-_sb_token = _sb_vals[0] if _sb_vals else ""
+def _qp_get(name, default=""):
+    """Return a single string value from st.query_params (handles list-or-str)."""
+    if name not in qp_dict:
+        return default
+    v = qp_dict[name]
+    if isinstance(v, list):
+        return v[0] if v else default
+    return v
 
-# Case: we arrived with BOTH ?logout=1 AND a fresh sb token (e.g., an auth redirect
-# that preserved old params). Drop the stale logout flag so we don't bounce back out.
+_has_logout = _qp_get("logout") == "1"
+_sb_token = _qp_get("sb", "")
+
+# If we arrive with BOTH ?logout=1 AND a fresh sb token (e.g., an auth redirect
+# that preserved old params), drop the stale logout flag so we don't bounce again.
 if _has_logout and _sb_token:
     try:
-        st.experimental_set_query_params(sb=_sb_token)
+        if "logout" in st.query_params:
+            del st.query_params["logout"]
     except Exception:
         pass
 else:
-    # True logout: either explicit ?logout=1 or our local flag from the sidebar button
+    # True logout: explicit ?logout=1 OR a local flag set by the sidebar button.
     if _has_logout or st.session_state.pop("__logout_now", False):
-        # Clear common auth/session keys
+        # Clear common auth/session keys.
         for _k in [
             "sb", "token", "access_token", "supabase_user", "user_email",
             "_allowed_evse", "_admin_all", "__v2_all_evse",
             "__v2_last_sessions", "__v2_last_meter",
         ]:
             st.session_state.pop(_k, None)
-        # Clear query string and send to central login
+        # Clear URL params and send to central login.
         try:
-            st.experimental_set_query_params()  # wipe params (incl. sb/logout)
+            # Remove all query params including any lingering sb=...
+            st.query_params.clear()
         except Exception:
             pass
         _client_redirect(LOGOUT_URL)
@@ -115,14 +126,17 @@ with st.sidebar:
     )
     st.caption(f"Signed in as **{_email}**" if _email else "Signed in")
     if st.button("Sign out", key="__btn_logout", use_container_width=True):
-        # On click, flag logout and rerun; the early hook will redirect.
+        # Flag logout; the early hook above will clear state and hard-redirect.
         st.session_state["__logout_now"] = True
-        # Also drop URL auth tokens (sb=) from the address bar
         try:
-            st.experimental_set_query_params(logout="1")
+            # Set a simple marker and strip any auth-bearing params from the URL
+            st.query_params["logout"] = "1"
+            for _key in ("sb", "access_token", "token"):
+                if _key in st.query_params:
+                    del st.query_params[_key]
         except Exception:
             pass
-        st.experimental_rerun()
+        st.rerun()
     st.divider()
     stations, start_utc, end_utc = render_sidebar()
 
