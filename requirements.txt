@@ -1,10 +1,26 @@
-streamlit>=1.39
-pandas>=2.2
-numpy>=1.26
-plotly>=5.20
-openpyxl>=3.1
-SQLAlchemy>=2.0
-psycopg2-binary>=2.9
-python-dotenv>=1.0
-tzdata>=2024.1
-requests
+# Core app framework
+streamlit==1.39.0
+
+# Data handling
+pandas==2.2.2
+numpy==1.26.4
+
+# Visualization
+plotly==5.24.0
+
+# Database (Postgres / Render)
+psycopg[binary]==3.2.1
+
+# HTTP / APIs (LynkWell, Supabase REST, etc.)
+requests==2.32.3
+
+# Date & time helpers
+python-dateutil==2.9.0.post0
+pytz==2024.1
+
+# Excel export
+openpyxl==3.1.5
+xlsxwriter==3.2.0
+
+# Optional: Supabase Python client (if you decide to use it in admintab.py)
+supabase-py==2.4.0

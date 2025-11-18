@@ -1,10 +1,7 @@
 import numpy as np
 import pandas as pd
 from .config import AK_TZ
-from .constants import get_evse_display, CONNECTOR_TYPE
-
-# Friendly EVSE display names (ARG - Left, etc.)
-EVSE_DISPLAY = get_evse_display()
+from .constants import EVSE_LOCATION, CONNECTOR_TYPE
 
 # Helper: format datetime in Alaska time zone safely
 def _fmt_ak(dt, fmt="%Y-%m-%d %H:%M"):
@@ -86,7 +83,7 @@ def build_sessions(df, auth):
         row = {
             "Start Date/Time": _fmt_ak(ts_start),
             "End Date/Time":   _fmt_ak(ts_end),
-            "EVSE": EVSE_DISPLAY.get(sid, "") or str(sid),
+            "EVSE": EVSE_LOCATION.get(sid, ""),
             "Connector #": conn_int,
             "Connector Type": CONNECTOR_TYPE.get((sid, conn_int), ""),
             "Max Power (kW)": round(max_kw, 2) if pd.notna(max_kw) else None,

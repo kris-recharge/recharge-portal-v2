@@ -1,92 +1,13 @@
 import plotly.graph_objects as go
 import numpy as np
 import pandas as pd
-import os
-
 from .config import AK_TZ
-
-# --- Helpers for heatmaps: tolerant timestamp/duration discovery ---
-def _to_ak(series, ak_hint: bool = False) -> pd.Series:
-    """
-    Convert any datetime-like series to Alaska tz.
-    - If tz-aware, convert to AK_TZ.
-    - If tz-naive: treat *_ak as already in AK; otherwise assume UTC then convert.
-    """
-    s = pd.to_datetime(series, errors="coerce", utc=False)
-    if pd.api.types.is_datetime64tz_dtype(s):
-        return s.dt.tz_convert(AK_TZ)
-    try:
-        if ak_hint:
-            return s.dt.tz_localize(AK_TZ)
-        else:
-            return s.dt.tz_localize("UTC").dt.tz_convert(AK_TZ)
-    except Exception:
-        # Last-resort: parse as UTC then convert
-        return pd.to_datetime(series, errors="coerce", utc=True).dt.tz_convert(AK_TZ)
-
-def _start_local_series(df: pd.DataFrame) -> pd.Series:
-    """
-    Return a single Alaska-local timestamp series from any of the known columns.
-    Prefers *_ak columns, then UTC-like ones.
-    """
-    candidates = [
-        ("_start_ak", True),
-        ("start_ak", True),
-        ("start_local", True),
-        ("start_ts", False),
-        ("timestamp", False),
-        ("_start", False),
-        ("start", False),
-    ]
-    for name, ak_hint in candidates:
-        if name in df.columns:
-            return _to_ak(df[name], ak_hint)
-    # No viable column
-    return pd.Series(dtype="datetime64[ns]")
-
-def _duration_minutes_series(df: pd.DataFrame) -> pd.Series:
-    """
-    Return a duration (minutes) series from any known name; coerces to numeric.
-    Missing -> empty float series.
-    """
-    for name in ["dur_min", "Duration (min)", "duration_min", "duration_minutes", "duration", "dur"]:
-        if name in df.columns:
-            return pd.to_numeric(df[name], errors="coerce")
-    return pd.Series(index=df.index, dtype=float)
-
 
 def _first_col(df, names):
     for n in names:
         if n in df.columns:
             return n
     return None
-
-def _maybe_subtract_constant_offset(z: np.ndarray) -> np.ndarray:
-    """
-    Some Plotly builds on Render exhibit a +16 offset in Heatmap z-values when
-    text overlays are used. If non-zero cells cluster around ~16–18, treat it as
-    the artifact and subtract 16. Clamp negative results to 0.
-
-    Set env `RCA_FORCE_HEATMAP_OFFSET=1` to force subtraction (for diagnostics).
-    """
-    z_fixed = z.copy()
-    nz = z_fixed[z_fixed > 0]
-
-    # Optional hard override via environment (useful for quick verification)
-    if os.environ.get("RCA_FORCE_HEATMAP_OFFSET") == "1":
-        z_fixed = z_fixed - 16
-    else:
-        if nz.size > 0:
-            q25, q50, q75 = np.percentile(nz, [25, 50, 75])
-            # Heuristic: your expected counts per hour are small (often 0–5).
-            # If the distribution’s core lies near 16–18 across the board,
-            # it's almost certainly the offset artifact.
-            if 12 <= q25 <= 22 and 12 <= q50 <= 22 and 12 <= q75 <= 22:
-                z_fixed = z_fixed - 16
-
-    # Clamp to keep valid non-negative counts
-    z_fixed[z_fixed < 0] = 0
-    return z_fixed
 
 def session_detail_figure(mv, sid, tx):
     """
@@ -201,6 +122,11 @@ def session_detail_figure(mv, sid, tx):
         return fig
 
     def add_line(col, name, axis="y", hover_fmt="%{y}"):
+        """
+        Helper to add a line with a clean hover:
+        - We rely on layout(hovermode="x unified") to show the timestamp once
+        - Each trace hover only shows the value + units (no repeated time)
+        """
         series = s[col].dropna()
         if series.empty:
             return
@@ -225,9 +151,8 @@ def session_detail_figure(mv, sid, tx):
     fig.update_layout(
         margin=dict(l=10, r=200, t=30, b=10),
         hovermode="x unified",
-        hoverlabel=dict(namelength=-1),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis=dict(title="Time (AK)", hoverformat="%b %d, %H:%M:%S"),
+        xaxis=dict(title="Time (AK)"),
         # y (left): Power
         yaxis=dict(title="Power (kW)", autorange=True, fixedrange=False),
         # y2..y5 (right): Amps, SoC, Energy, HVB
@@ -272,48 +197,37 @@ def session_detail_figure(mv, sid, tx):
             title_standoff=6,
         ),
     )
-    fig.update_xaxes(showspikes=True, spikemode="across", spikesnap="cursor", spikedash="dot")
     return fig
 
 def heatmap_count(heat, title):
-    """Session start counts per day/hour with white→blue cells, black borders and labels.
-    Uses Plotly texttemplate instead of an overlay text trace for consistent rendering
-    across Plotly versions (esp. on Render).
-    """
+    """Session start counts per day/hour with white→blue cells, black borders and labels."""
     if heat is None or heat.empty:
         return go.Figure()
 
     h = heat.copy()
+    # Normalize time → AK local then derive day/hour bins
+    h["start_local"] = h["start_ts"].dt.tz_convert(AK_TZ)
+    h["dow"] = h["start_local"].dt.dayofweek
+    h["hour"] = h["start_local"].dt.hour
 
-    # Normalize time → Alaska local robustly (accepts *_ak, UTC, or naive)
-    s_local = _start_local_series(h)
-    if s_local.empty or s_local.isna().all():
-        return go.Figure()
-
-    h["_start_local"] = s_local
-    h["_dow"] = s_local.dt.dayofweek    # Mon=0 .. Sun=6
-    h["_hour"] = s_local.dt.hour
-
-    # 7×24 matrix (Sun..Sat x 0..23)
+    # 7×24 matrix, fill missing with 0 so we always render a full grid
     mat = (
-        h.groupby(["_dow", "_hour"]).size().unstack(fill_value=0)
-         .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0)
-         .reindex(columns=range(24), fill_value=0)
+        h.groupby(["dow", "hour"]).size().unstack(fill_value=0)
+        .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0)
+        .reindex(columns=range(24), fill_value=0)
     )
     mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-    # Heatmap values and labels (auto-fix possible +16 Render artifact)
-    z_raw = mat.to_numpy(dtype=float)
-    z = _maybe_subtract_constant_offset(z_raw)
+    # Ensure numeric array (avoid object dtype rendering issues). Also cap zmax
+    z = mat.to_numpy(dtype=float)
+    # Guard against the all‑zero window (plotly auto with zmax=0 -> weird/blank).  
+    zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
 
-    text = [[(str(int(v)) if np.isfinite(v) and v > 0 else "") for v in row] for row in z]
-    zmax = float(np.nanpercentile(z[z > 0], 95)) if np.nanmax(z) > 0 else 1.0
-
+    # Explicit white→blue ramp so zero really looks white on dark background
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
-    # Draw heatmap first (no text template), then overlay a text-only scatter
-    heat_trace = go.Heatmap(
-        z=z,
+    heatmap = go.Heatmap(
+        z=z.tolist(),
         x=list(mat.columns),
         y=list(mat.index),
         colorscale=blues,
@@ -321,81 +235,66 @@ def heatmap_count(heat, title):
         zmax=zmax,
         colorbar=dict(title="Starts"),
         hoverongaps=False,
+        # Black borders via gaps (background shows through in Streamlit dark theme)
         xgap=1,
         ygap=1,
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Starts: %{z:.0f}<extra></extra>",
-        showscale=True,
-    )
-    fig = go.Figure(data=[heat_trace])
-
-    # Build flattened text overlay (only for positive cells)
-    xs, ys, txts = [], [], []
-    for yi, ylab in enumerate(mat.index):
-        for xi, xlab in enumerate(mat.columns):
-            v = z[yi][xi]
-            if np.isfinite(v) and v > 0:
-                xs.append(xlab)
-                ys.append(ylab)
-                txts.append(str(int(v)))
-
-    fig.add_trace(
-        go.Scatter(
-            x=xs,
-            y=ys,
-            text=txts,
-            mode="text",
-            textposition="middle center",
-            textfont={"color": "black", "size": 12},
-            hoverinfo="skip",
-            showlegend=False,
-        )
     )
 
+    fig = go.Figure(data=heatmap)
     fig.update_layout(
         margin=dict(l=10, r=10, t=30, b=10),
         title=title,
         xaxis=dict(title="Hour (0-23)", type="category"),
-        yaxis=dict(title="Day", type="category"),
+        yaxis=dict(title="Day", type="category", autorange="reversed"),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
+    # Overlay numeric labels so they render across Plotly versions
+    xs, ys, labels = [], [], []
+    cols = list(mat.columns)
+    rows = list(mat.index)
+    for yi, row in enumerate(rows):
+        for xi, col in enumerate(cols):
+            val = z[yi, xi]
+            if np.isfinite(val) and val != 0:
+                xs.append(col)
+                ys.append(row)
+                labels.append(f"{int(round(val))}")
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="text", text=labels,
+        textposition="middle center",
+        textfont=dict(color="black", size=12),
+        hoverinfo="skip", showlegend=False
+    ))
     return fig
 
 def heatmap_duration(heat, title):
-    """Average session duration (minutes) per day/hour with white→blue cells, borders and labels.
-    Uses Plotly texttemplate instead of an overlay text trace for consistent rendering.
-    """
+    """Average session duration (minutes) per day/hour with white→blue cells, black borders and labels."""
     if heat is None or heat.empty:
         return go.Figure()
 
     h = heat.copy()
-
-    s_local = _start_local_series(h)
-    if s_local.empty or s_local.isna().all():
-        return go.Figure()
-    h["_start_local"] = s_local
-    h["_dow"] = s_local.dt.dayofweek
-    h["_hour"] = s_local.dt.hour
-
-    # Duration series (minutes)
-    h["_dur"] = _duration_minutes_series(h)
+    h["start_local"] = h["start_ts"].dt.tz_convert(AK_TZ)
+    h["dow"] = h["start_local"].dt.dayofweek
+    h["hour"] = h["start_local"].dt.hour
 
     mat = (
-        h.groupby(["_dow", "_hour"])["_dur"].mean().unstack(fill_value=0.0)
+        h.groupby(["dow", "hour"])  # mean minutes per bin
+         ["dur_min"].mean().unstack(fill_value=0.0)
          .reindex(index=[6, 0, 1, 2, 3, 4, 5], fill_value=0.0)
          .reindex(columns=range(24), fill_value=0.0)
     )
     mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
     z = mat.to_numpy(dtype=float)
-    text = [[(f"{v:.1f}" if np.isfinite(v) and v > 0 else "") for v in row] for row in z]
+    # Robust color range (avoid all‑black/blank when values are tiny or all zeros)
     zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
 
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
 
-    # Draw heatmap without texttemplate; overlay text with scatter for reliability on all Plotly builds
-    heat_trace = go.Heatmap(
-        z=z,
+    heatmap = go.Heatmap(
+        z=z.tolist(),
         x=list(mat.columns),
         y=list(mat.index),
         colorscale=blues,
@@ -406,39 +305,32 @@ def heatmap_duration(heat, title):
         xgap=1,
         ygap=1,
         hovertemplate="Day: %{y}<br>Hour: %{x}<br>Avg min: %{z:.1f}<extra></extra>",
-        showscale=True,
-    )
-    fig = go.Figure(data=[heat_trace])
-
-    # Text overlay (only for positive cells)
-    xs, ys, txts = [], [], []
-    for yi, ylab in enumerate(mat.index):
-        for xi, xlab in enumerate(mat.columns):
-            v = z[yi][xi]
-            if np.isfinite(v) and v > 0:
-                xs.append(xlab)
-                ys.append(ylab)
-                txts.append(f"{v:.1f}")
-
-    fig.add_trace(
-        go.Scatter(
-            x=xs,
-            y=ys,
-            text=txts,
-            mode="text",
-            textposition="middle center",
-            textfont={"color": "black", "size": 12},
-            hoverinfo="skip",
-            showlegend=False,
-        )
     )
 
+    fig = go.Figure(data=heatmap)
     fig.update_layout(
         margin=dict(l=10, r=10, t=30, b=10),
         title=title,
         xaxis=dict(title="Hour (0-23)", type="category"),
-        yaxis=dict(title="Day", type="category"),
+        yaxis=dict(title="Day", type="category", autorange="reversed"),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
     )
+    # Overlay numeric labels (one decimal) for reliability across Plotly versions
+    xs, ys, labels = [], [], []
+    cols = list(mat.columns)
+    rows = list(mat.index)
+    for yi, row in enumerate(rows):
+        for xi, col in enumerate(cols):
+            val = z[yi, xi]
+            if np.isfinite(val) and val != 0:
+                xs.append(col)
+                ys.append(row)
+                labels.append(f"{val:.1f}")
+    fig.add_trace(go.Scatter(
+        x=xs, y=ys, mode="text", text=labels,
+        textposition="middle center",
+        textfont=dict(color="black", size=12),
+        hoverinfo="skip", showlegend=False
+    ))
     return fig

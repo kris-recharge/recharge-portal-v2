@@ -1,35 +1,19 @@
-from .config import DB_BACKEND, SQLITE_PATH, RENDER_DB_URL, PGSSLMODE
+from .config import DB_BACKEND, SQLITE_PATH, RENDER_DB_URL
 import pandas as pd
 
 def get_conn():
     if DB_BACKEND == "postgres":
         from sqlalchemy import create_engine
         url = RENDER_DB_URL
-        if not url:
-            raise RuntimeError("RENDER_DB_URL is not set; cannot connect to Postgres.")
-        # Ensure sslmode is present (Render typically requires it)
-        sslmode = PGSSLMODE or "require"
-        if "sslmode=" not in url:
-            url += ("&" if "?" in url else "?") + f"sslmode={sslmode}"
-        engine = create_engine(url, pool_pre_ping=True)
-        return engine.connect()
+        if url and "sslmode" not in url:
+            url += ("&" if "?" in url else "?") + "sslmode=require"
+        return create_engine(url).connect()
     else:
-        import sqlite3, os
-        # Ensure directory exists for local DB file
-        directory = os.path.dirname(SQLITE_PATH)
-        if directory and not os.path.exists(directory):
-            os.makedirs(directory, exist_ok=True)
+        import sqlite3
         conn = sqlite3.connect(SQLITE_PATH)
         conn.row_factory = sqlite3.Row
         return conn
 
-def param_placeholder(n: int = 1) -> str:
-    """
-    Return a DB-appropriate placeholder token.
-    - For a single value: '?' (SQLite) or '%s' (Postgres)
-    - For N values (IN clause): '?, ?, ?' or '%s, %s, %s'
-    """
-    token = "%s" if DB_BACKEND == "postgres" else "?"
-    if n <= 1:
-        return token
-    return ",".join([token] * n)
+def param_placeholder(n: int) -> str:
+    # For SQLite we use "?", for Postgres via SQLAlchemy we can still pass "?" safely with pandas
+    return ",".join(["?"] * n)

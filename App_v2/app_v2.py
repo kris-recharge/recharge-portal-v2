@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
-import inspect
-import plotly.graph_objects as go
 
 from rca_v2.config import APP_MODE
 from rca_v2.ui import render_sidebar, sessions_table_single_select
@@ -16,415 +14,128 @@ from rca_v2.loaders import (
 from rca_v2.sessions import build_sessions
 from rca_v2.charts import session_detail_figure, heatmap_count, heatmap_duration
 from rca_v2.constants import get_evse_display
-from rca_v2.db import get_conn
-from rca_v2.auth import require_auth
 
 from rca_v2.admintab import render_admin_tab
 
-# --- Sign‑out/redirect helpers ---
-LOGOUT_URL = "https://recharge-portal.onrender.com/login"
-
-def _client_redirect(url: str) -> None:
-    """Hard redirect the browser to a different origin."""
-    st.markdown(
-        f"""
-        <script>
-            try {{
-                // Best-effort: clear typical auth artifacts
-                localStorage.clear();
-                sessionStorage.clear();
-                document.cookie = "sb=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-                document.cookie = "access_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-            }} catch (e) {{}}
-            window.location.replace("{url}");
-        </script>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.stop()
-
-# --- Helper: clear session and logout with hard redirect ---
-def perform_logout() -> None:
-    """Clear app/session state and hard-redirect to the central login page.
-
-    This avoids manipulating st.query_params (which can vary by Streamlit version)
-    and prevents redirect loops by stopping execution immediately after emitting
-    the client-side redirect script.
-    """
-    # Clear common auth/session keys
-    for _k in [
-        "sb", "token", "access_token", "supabase_user", "user_email",
-        "_allowed_evse", "_admin_all", "__v2_all_evse",
-        "__v2_last_sessions", "__v2_last_meter",
-    ]:
-        st.session_state.pop(_k, None)
-
-    # Client-side cleanup + redirect
-    st.markdown(
-        f"""
-        <script>
-            try {{
-                localStorage.clear();
-                sessionStorage.clear();
-                document.cookie = "sb=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-                document.cookie = "access_token=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;";
-            }} catch (e) {{}}
-            window.location.href = "{LOGOUT_URL}";
-        </script>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.stop()
-
-
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
 
-# Gate the web build behind a simple login (disabled for local runs)
-if APP_MODE != "local":
-    require_auth()
-
-# Admin wildcard propagated by auth.require_auth: {"*"} means unrestricted
-_admin_all = False
-try:
-    _allowed = st.session_state.get("_allowed_evse")
-    if isinstance(_allowed, set) and ("*" in _allowed):
-        _admin_all = True
-except Exception:
-    _admin_all = False
-st.session_state["_admin_all"] = _admin_all
-
-# Helper: future‑proof sizing for st.dataframe across Streamlit versions
-# Uses width="stretch" on newer Streamlit; falls back to use_container_width=True on older.
-
-def _df_stretch_kwargs():
-    try:
-        sig = inspect.signature(st.dataframe)
-        if "width" in sig.parameters:
-            return {"width": "stretch"}
-    except Exception:
-        pass
-    return {"use_container_width": True}
-
-# --- Local heatmap helpers (independent of charts.py) ---
-
-def _ak_ts_from(df: pd.DataFrame, candidates=("_start_ak", "start_ak", "Start (AK)", "_start", "start", "timestamp", "Start Date/Time")):
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return None
-    for c in candidates:
-        if c in df.columns:
-            s = pd.to_datetime(df[c], errors="coerce", utc=(c in {"timestamp", "Start Date/Time"}))
-            try:
-                s = s.dt.tz_convert("America/Anchorage")
-            except Exception:
-                try:
-                    s = s.dt.tz_localize("America/Anchorage")
-                except Exception:
-                    pass
-            return s
-    return None
-
-
-def _build_heat_grids(sess: pd.DataFrame, heat: pd.DataFrame):
-    """Return (count_grid, duration_grid) as 7x24 DataFrames (Sun..Sat x 0..23)."""
-    base_count = pd.DataFrame(0, index=range(7), columns=range(24))
-    base_dur   = pd.DataFrame(np.nan, index=range(7), columns=range(24))
-
-    # Prefer starts from `heat`; fall back to Sessions
-    ts = _ak_ts_from(heat, ("_start_ak", "start_ak", "Start (AK)", "_start", "timestamp"))
-    # Duration column as a Series (aligned later); if missing or malformed, keep as None
-    if isinstance(heat, pd.DataFrame) and "Duration (min)" in heat.columns:
-        dur_raw = heat["Duration (min)"]
-    else:
-        dur_raw = None
-
-    if ts is None:
-        ts = _ak_ts_from(sess, ("Start Date/Time",))
-        if dur_raw is None and isinstance(sess, pd.DataFrame):
-            if "Duration (min)" in sess.columns:
-                dur_raw = sess["Duration (min)"]
-
-    if ts is None:
-        return base_count, base_dur
-
-    # Day-of-week mapping: 0 = Sun .. 6 = Sat
-    df = pd.DataFrame({"_dow": ((ts.dt.dayofweek + 1) % 7), "_hour": ts.dt.hour})
-
-    # Counts
-    gc = df.dropna().value_counts().reset_index(name="n")
-    if not gc.empty:
-        pv = gc.pivot(index="_dow", columns="_hour", values="n").fillna(0).astype(int)
-        base_count.loc[pv.index, pv.columns] = pv.values
-
-    # Durations (average)
-    try:
-        if isinstance(dur_raw, pd.Series):
-            dur_series = pd.to_numeric(dur_raw, errors="coerce")
-        else:
-            # Could be a scalar or None; create a NaN series aligned to df length
-            dur_series = pd.Series(np.nan, index=df.index)
-
-        # Ensure the duration series aligns to df for safe concat
-        if len(dur_series) != len(df):
-            dur_series = dur_series.reindex(range(len(df)))
-        dur_series.index = df.index
-
-        gd = pd.concat([df, dur_series.rename("dur")], axis=1).dropna(subset=["_dow", "_hour", "dur"])
-        if not gd.empty:
-            pv = (
-                gd.groupby(["_dow", "_hour"])["dur"].mean().reset_index()
-                  .pivot(index="_dow", columns="_hour", values="dur")
-            )
-            base_dur.loc[pv.index, pv.columns] = pv.values
-    except Exception:
-        # Leave base_dur as-is on any unexpected type mismatch
-        pass
-
-    return base_count, base_dur
-
-
-def _fig_heatmap(zgrid: pd.DataFrame, title: str, as_int: bool):
-    vals = zgrid.values.astype(float)
-    # Use string annotations to sidestep any numeric-text quirks
-    if as_int:
-        text = np.where(np.isnan(vals), "", vals.round(0).astype(int).astype(str))
-    else:
-        text = np.where(np.isnan(vals), "", np.round(vals, 1).astype(str))
-    days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
-    fig = go.Figure(go.Heatmap(
-        z=vals,
-        x=list(range(24)),
-        y=list(range(7)),
-        text=text,
-        texttemplate="%{text}",
-        hovertemplate="Day=%{y}<br>Hour=%{x}<br>Value=%{z}<extra></extra>",
-        coloraxis="coloraxis"
-    ))
-    fig.update_layout(
-        title=title,
-        coloraxis=dict(colorscale="Blues"),
-        xaxis=dict(title="Hour (0-23)", tickmode="linear", dtick=1, range=[-0.5, 23.5]),
-        yaxis=dict(title="Day", tickmode="array", tickvals=list(range(7)), ticktext=days, range=[-0.5, 6.5]),
-        margin=dict(l=50, r=30, b=50, t=40),
-    )
-    return fig
-
-
-def _fig_heatmap_count(grid: pd.DataFrame, title: str):
-    return _fig_heatmap(grid, title, as_int=True)
-
-
-def _fig_heatmap_duration(grid: pd.DataFrame, title: str):
-    return _fig_heatmap(grid, title, as_int=False)
-
 with st.sidebar:
-    # Suppress duplicate Sign out from render_sidebar (buttons, link_buttons, form_submit_buttons)
-    _orig_button = st.button
-    _orig_link_button = getattr(st, "link_button", None)
-    _orig_form_button = getattr(st, "form_submit_button", None)
+    stations, start_utc, end_utc = render_sidebar()
 
-    def _label_is_logout(label: object) -> bool:
-        lab = str(label).strip().lower()
-        return lab in {"sign out", "logout", "signout", "log out"}
-
-    def _no_signout_button(label, *args, **kwargs):
-        if _label_is_logout(label):
-            return False
-        return _orig_button(label, *args, **kwargs)
-
-    st.button = _no_signout_button
-
-    if _orig_link_button:
-        def _no_signout_link_button(label, *args, **kwargs):
-            if _label_is_logout(label):
-                return False
-            return _orig_link_button(label, *args, **kwargs)
-        st.link_button = _no_signout_link_button
-
-    if _orig_form_button:
-        def _no_signout_form_button(label, *args, **kwargs):
-            if _label_is_logout(label):
-                return False
-            return _orig_form_button(label, *args, **kwargs)
-        st.form_submit_button = _no_signout_form_button
-
-    try:
-        stations, start_utc, end_utc = render_sidebar()
-    finally:
-        st.button = _orig_button
-        if _orig_link_button:
-            st.link_button = _orig_link_button
-        if _orig_form_button:
-            st.form_submit_button = _orig_form_button
-
-    # Optional diagnostics to verify DB connectivity & table counts on Render
-    if APP_MODE == "local":
-        with st.expander("Diagnostics", expanded=False):
-            try:
-                raw_conn = get_conn()
-
-                # Open an executable connection across both SQLAlchemy Engines and sqlite3 connections
-                exec_conn = raw_conn
-                if hasattr(raw_conn, "connect") and not hasattr(raw_conn, "cursor"):
-                    # SQLAlchemy Engine -> Connection
-                    exec_conn = raw_conn.connect()
-
-                def _run(sql: str, params=None):
-                    """Best-effort SQL runner that works for SQLAlchemy (exec_driver_sql/execute) and sqlite3."""
-                    params = params or {}
-                    # SQLAlchemy Connection (preferred)
-                    if hasattr(exec_conn, "exec_driver_sql"):
-                        res = exec_conn.exec_driver_sql(sql, params)
-                        try:
-                            return res.fetchall()
-                        except Exception:
-                            return []
-                    if hasattr(exec_conn, "execute"):
-                        res = exec_conn.execute(sql, params)
-                        try:
-                            return res.fetchall()
-                        except Exception:
-                            return []
-                    # Raw DB-API (e.g., sqlite3)
-                    cur = exec_conn.cursor()
-                    if isinstance(params, (list, tuple)):
-                        cur.execute(sql, params)
-                    elif isinstance(params, dict):
-                        # Fall back to tuple of dict values for sqlite3
-                        cur.execute(sql, tuple(params.values()))
-                    else:
-                        cur.execute(sql)
-                    rows = cur.fetchall()
-                    return rows
-
-                # Detect backend
-                backend = "unknown"
-                try:
-                    v = _run("select version()")
-                    if v and "PostgreSQL" in str(v[0][0]):
-                        backend = "postgres"
-                    elif v and "SQLite" in str(v[0][0]):
-                        backend = "sqlite"
-                except Exception:
-                    try:
-                        _ = _run("pragma user_version")
-                        backend = "sqlite"
-                    except Exception:
-                        pass
-
-                st.success(f"DB connected ({backend})")
-
-                expected_tables = [
-                    "sessions",
-                    "session_logs",
-                    "meter_values",
-                    "realtime_meter_values",
-                    "status_notifications",
-                    "realtime_status_notifications",
-                    "realtime_websocket",
-                    "connectivity_logs",
-                ]
-
-                # Enumerate tables present
-                if backend == "postgres":
-                    tbl_rows = _run("select table_name from information_schema.tables where table_schema='public'")
-                    present_tables = {r[0] for r in tbl_rows}
-                else:
-                    tbl_rows = _run("select name from sqlite_master where type='table'")
-                    present_tables = {r[0] for r in tbl_rows}
-
-                st.write("**Tables present**")
-                st.json(sorted(present_tables))
-
-                missing_tables = [t for t in expected_tables if t not in present_tables]
-                if missing_tables:
-                    st.warning(f"Missing tables: {', '.join(missing_tables)}")
-
-                # Helper to list columns for a table
-                def _list_columns(table_name: str):
-                    if backend == "postgres":
-                        rows = _run(
-                            "select column_name, data_type from information_schema.columns where table_schema='public' and table_name=%(t)s",
-                            {"t": table_name},
-                        )
-                        return [r[0] for r in rows]
-                    else:
-                        # sqlite PRAGMA table_info returns: cid, name, type, ...
-                        rows = _run(f"pragma table_info({table_name})")
-                        return [r[1] for r in rows]
-
-                # Column inventory for meter tables (check for 'hbv_v')
-                expected_meter_cols = [
-                    "station_id","connector_id","transaction_id","timestamp",
-                    "power_w","energy_wh","soc","amperage_offered","amperage_import",
-                    "power_offered_w","voltage_v","hbv_v"
-                ]
-                col_report = {}
-                for tbl in ["realtime_meter_values", "meter_values"]:
-                    if tbl in present_tables:
-                        cols = _list_columns(tbl)
-                        miss = [c for c in expected_meter_cols if c not in cols]
-                        col_report[tbl] = {"columns": cols, "missing_expected": miss}
-                if col_report:
-                    st.write("**Column inventory (meter tables)**")
-                    st.json(col_report)
-                    if any("hbv_v" in v.get("missing_expected", []) for v in col_report.values()):
-                        st.info(
-                            "Hint: your Postgres tables are missing 'hbv_v'. To match the local SQLite schema, run:\n"
-                            "```sql\n"
-                            "ALTER TABLE public.realtime_meter_values ADD COLUMN hbv_v double precision;\n"
-                            "ALTER TABLE public.meter_values ADD COLUMN hbv_v double precision;\n"
-                            "```"
-                        )
-
-                # Window sanity counts (uses current sidebar date range)
-                def _window_counts(table_name: str):
-                    if backend == "postgres":
-                        sql = f"""
-                        select
-                          min((regexp_replace("timestamp",'Z$','+00:00'))::timestamptz) as min_ts,
-                          max((regexp_replace("timestamp",'Z$','+00:00'))::timestamptz) as max_ts,
-                          count(*) as n
-                        from public.{table_name}
-                        where "timestamp" ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}T'
-                          and (regexp_replace("timestamp",'Z$','+00:00'))::timestamptz
-                              between %(s)s and %(e)s
-                        """
-                        rows = _run(sql, {"s": start_utc, "e": end_utc})
-                    else:
-                        sql = f"""
-                        select min(timestamp), max(timestamp), count(*)
-                        from {table_name}
-                        where timestamp between ? and ?
-                        """
-                        rows = _run(sql, [start_utc, end_utc])
-                    return rows[0] if rows else None
-
-                window_report = {}
-                for tname in ["realtime_meter_values","meter_values","sessions","status_notifications","realtime_websocket"]:
-                    if tname in present_tables:
-                        r = _window_counts(tname)
-                        if r:
-                            window_report[tname] = {"min": str(r[0]), "max": str(r[1]), "rows": int(r[2]) if r[2] is not None else None}
-                if window_report:
-                    st.write("**Rows in current window**")
-                    st.json(window_report)
-
-            except Exception as e:
-                st.error(f"DB error: {e}")
-            finally:
-                # Close connections if applicable
-                try:
-                    if 'exec_conn' in locals() and hasattr(exec_conn, "close"):
-                        exec_conn.close()
-                except Exception:
-                    pass
-                try:
-                    if 'raw_conn' in locals() and hasattr(raw_conn, "close"):
-                        raw_conn.close()
-                except Exception:
-                    pass
 
 EVSE_DISPLAY = get_evse_display()
+
+
+# Best-effort enrichment of status rows with Tritium error metadata.
+def _enrich_status_with_tritium(df: pd.DataFrame) -> pd.DataFrame:
+    """Best-effort enrichment of status rows with Tritium error metadata.
+
+    Joins the provided frame on vendor_error_code (digits only) to a
+    lookup table loaded via load_tritium_error_codes(). If the lookup
+    table is missing or has an unexpected shape, this function is a
+    no-op and simply returns the original frame.
+    """
+    try:
+        from rca_v2.loaders import load_tritium_error_codes
+
+        if "vendor_error_code" not in df.columns:
+            # Nothing to enrich
+            return df
+
+        codes = load_tritium_error_codes()
+        if not isinstance(codes, pd.DataFrame) or codes.empty:
+            return df
+
+        base = df.copy()
+        # Normalize the vendor_error_code column to a digits-only key
+        base["code_key"] = (
+            base["vendor_error_code"].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
+        )
+
+        # Normalize the codes table. Support either `code` or `code_key`.
+        if "code" in codes.columns:
+            codes2 = codes.rename(columns={"code": "code_key"}).copy()
+        elif "code_key" in codes.columns:
+            codes2 = codes.copy()
+        else:
+            return df
+
+        codes2["code_key"] = (
+            codes2["code_key"].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
+        )
+
+        # Ensure the impact/description columns exist on the lookup side
+        for col in ("impact", "description"):
+            if col not in codes2.columns:
+                codes2[col] = ""
+
+        # Join only on the digits-only error code; platform-specific
+        # differences can be handled later if needed.
+        merged = base.merge(
+            codes2[["code_key", "impact", "description"]],
+            on="code_key",
+            how="left",
+            suffixes=("", "_tr"),
+        )
+
+        # Ensure the output always has impact/description columns
+        if "impact" not in merged.columns:
+            merged["impact"] = ""
+        if "description" not in merged.columns:
+            merged["description"] = ""
+
+        return merged
+    except Exception:
+        # Keep the calling code resilient; if anything goes wrong,
+        # just return the original frame unchanged.
+        return df
+
+
+# Helper to load data per-EVSE and concatenate, to avoid SQLite IN () quirks.
+def _load_per_evse(loader_fn, ids, start_iso, end_iso):
+    """
+    Helper to load data per‑EVSE and concatenate, to avoid SQLite IN () quirks.
+    """
+    if not ids:
+        # No filter means all EVSEs; let the loader decide by passing None or []
+        try:
+            return loader_fn(None, start_iso, end_iso)
+        except TypeError:
+            return loader_fn([], start_iso, end_iso)
+    if isinstance(ids, (set, tuple)):
+        ids = list(ids)
+    frames = []
+    for sid in ids:
+        try:
+            df = loader_fn([sid], start_iso, end_iso)
+        except TypeError:
+            df = loader_fn(sid, start_iso, end_iso)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            frames.append(df)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def load_mv_auth_and_sessions(stations_key, start_iso, end_iso):
+    """
+    Cached loader for meter values, authorize records, and built sessions/heatmaps.
+
+    stations_key should be a hashable representation of the selected EVSEs
+    (e.g., a sorted tuple of station IDs). This keeps interactive clicks fast:
+    changing only the selected row will reuse cached data for the same filters.
+    """
+    # Normalize stations_key back to a simple list for the per‑EVSE loader
+    if isinstance(stations_key, (list, set, tuple)):
+        stations_list = list(stations_key)
+    elif stations_key:
+        stations_list = [stations_key]
+    else:
+        stations_list = []
+
+    mv = _load_per_evse(load_meter_values, stations_list, start_iso, end_iso)
+    auth = _load_per_evse(load_authorize, stations_list, start_iso, end_iso)
+    sess, heat = build_sessions(mv, auth)
+    return mv, auth, sess, heat
 
 # Treat "no selection" as ALL EVSEs (matches sidebar hint)
 if not stations:
@@ -445,92 +156,16 @@ else:
 with t1:
     st.subheader("Charging Sessions")
     with st.spinner("Loading data…"):
-        # Some SQLite builds mis-handle `IN (?)` when given multiple params, which can
-        # cause results to collapse to only the last EVSE (e.g., Autel Maxi).
-        # To be bulletproof on all environments, load per‑EVSE and concat.
-        def _load_per_evse(loader_fn, ids, start_iso, end_iso):
-            if not ids:
-                # No filter means all EVSEs; let the loader decide by passing None
-                try:
-                    return loader_fn(None, start_iso, end_iso)
-                except TypeError:
-                    return loader_fn([], start_iso, end_iso)
-            if isinstance(ids, (set, tuple)):
-                ids = list(ids)
-            frames = []
-            for sid in ids:
-                try:
-                    df = loader_fn([sid], start_iso, end_iso)
-                except TypeError:
-                    df = loader_fn(sid, start_iso, end_iso)
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    frames.append(df)
-            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-        mv = _load_per_evse(load_meter_values, stations, start_utc, end_utc)
-        auth = _load_per_evse(load_authorize, stations, start_utc, end_utc)
-    sess, heat = build_sessions(mv, auth)
-    # --- Heat/starts frame hygiene to support charts helpers ---
-    if isinstance(heat, pd.DataFrame):
-        heat = heat.copy()
-        # Normalize transaction_id to string for any merges we may do
-        if "transaction_id" in heat.columns:
-            heat["transaction_id"] = heat["transaction_id"].astype(str)
-
-        # Ensure duration exists (pull from session summary if missing)
-        if (
-            "Duration (min)" not in heat.columns
-            and isinstance(sess, pd.DataFrame)
-            and ("transaction_id" in heat.columns)
-            and ("transaction_id" in sess.columns)
-            and ("Duration (min)" in sess.columns)
-        ):
-            sess_tx = pd.DataFrame({
-                "transaction_id": sess["transaction_id"].astype(str),
-                "Duration (min)": pd.to_numeric(sess["Duration (min)"], errors="coerce"),
-            })
-            heat = heat.merge(sess_tx, on="transaction_id", how="left")
-
-        # Ensure there is an AK‑local start timestamp usable for day/hour bucketing
-        if ("_start_ak" not in heat.columns) and ("start_ak" not in heat.columns) and ("Start (AK)" not in heat.columns):
-            merged = False
-            if (
-                "transaction_id" in heat.columns
-                and isinstance(sess, pd.DataFrame)
-                and ("transaction_id" in sess.columns)
-                and ("Start Date/Time" in sess.columns)
-            ):
-                # Build a tx -> AK‑local start mapping from the sessions table
-                _s = pd.to_datetime(sess["Start Date/Time"], errors="coerce")
-                try:
-                    _s = _s.dt.tz_localize("America/Anchorage")
-                except Exception:
-                    try:
-                        _s = _s.dt.tz_convert("America/Anchorage")
-                    except Exception:
-                        pass
-                tx_map = pd.DataFrame({
-                    "transaction_id": sess["transaction_id"].astype(str),
-                    "_start_ak": _s,
-                })
-                try:
-                    heat = heat.merge(tx_map, on="transaction_id", how="left")
-                    merged = True
-                except Exception:
-                    merged = False
-            if not merged:
-                # Fallback: derive from any time-like column already present in `heat`
-                for c in ["start_ak", "Start (AK)", "_start", "start", "timestamp"]:
-                    if c in heat.columns:
-                        _s2 = pd.to_datetime(heat[c], errors="coerce", utc=True)
-                        try:
-                            _s2 = _s2.dt.tz_convert("America/Anchorage")
-                        except Exception:
-                            pass
-                        heat["_start_ak"] = _s2
-                        break
+        # Use a cached loader so that interactive clicks re-use data for the same filters.
+        if isinstance(stations, (list, set, tuple)):
+            stations_key = tuple(sorted(stations))
+        elif stations:
+            stations_key = (str(stations),)
+        else:
+            stations_key = tuple()
+        mv, auth, sess, heat = load_mv_auth_and_sessions(stations_key, start_utc, end_utc)
     # Defensive: re-apply EVSE filter at the session level (guards against loader quirks)
-    if (not st.session_state.get("_admin_all")) and (not st.session_state.get("__v2_all_evse", False)) and isinstance(stations, (list, tuple, set)) and len(stations) > 0 and "station_id" in sess.columns:
+    if isinstance(stations, (list, tuple, set)) and len(stations) > 0 and "station_id" in sess.columns:
         _wanted = {str(s) for s in stations}
         sess = sess[sess["station_id"].astype(str).isin(_wanted)]
     if sess.empty:
@@ -578,91 +213,22 @@ with t1:
             session_detail_figure(mv, selected_sid, selected_tx),
             use_container_width=True,
             config={"displaylogo": False},
-            key=f"chart-detail-{selected_sid}-{selected_tx}",
         )
     else:
         st.info("Select a session above to view details.")
 
-    # Debug helper: quick count grid to verify (Sun..Sat x 0..23)
-
-    def _duration_grid_from_heat(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Build a 7x24 grid (Sun..Sat x 0..23) of average Duration (min) values.
-        Uses the same timestamp detection as the count grid.
-        """
-        base = pd.DataFrame(np.nan, index=range(7), columns=range(24))
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return base
-
-        d = df.copy()
-        # find a usable timestamp column in AK local
-        ts = None
-        for c in ["_start_ak", "start_ak", "Start (AK)", "_start"]:
-            if c in d.columns:
-                ts = pd.to_datetime(d[c], errors="coerce")
-                break
-        if ts is None:
-            return base
-
-        dur = pd.to_numeric(d.get("Duration (min)"), errors="coerce")
-        g = pd.DataFrame({"_dow": ((ts.dt.dayofweek + 1) % 7), "_hour": ts.dt.hour, "dur": dur})
-        g = g.dropna(subset=["_dow", "_hour", "dur"])
-        if g.empty:
-            return base
-        p = g.groupby(["_dow", "_hour"])["dur"].mean().reset_index()
-        pv = p.pivot(index="_dow", columns="_hour", values="dur")
-        base.loc[pv.index, pv.columns] = pv.values
-        return base
-
-    # Build heat grids once (shared by Debug + Charts) so both use exactly the same logic
-    _count_grid, _dur_grid = _build_heat_grids(sess, heat)
-
-    with st.expander("Heatmap debug (session starts)", expanded=False):
-        try:
-            st.json({
-                "rows_in_sessions_table": int(sess.shape[0]) if isinstance(sess, pd.DataFrame) else 0,
-                "rows_in_heat_frame": int(heat.shape[0]) if isinstance(heat, pd.DataFrame) else 0,
-                "dedupe_keys": ["transaction_id", "station_id", "connector_id"],
-            })
-
-            # Top (day,hour) occurrences from raw starts
-            ts = None
-            for c in ["_start_ak", "start_ak", "Start (AK)", "_start"]:
-                if c in heat.columns:
-                    ts = pd.to_datetime(heat[c], errors="coerce")
-                    break
-            if ts is not None:
-                tmp = pd.DataFrame({"dow": ((ts.dt.dayofweek + 1) % 7), "hour": ts.dt.hour})
-                tops = tmp.value_counts().reset_index(name="n").sort_values("n", ascending=False).head(10)
-                st.dataframe(tops, hide_index=True, **_df_stretch_kwargs())
-
-            # Count grid snapshot (Sun..Sat × 0..23) — use the same computation as the charts
-            cg = _count_grid
-            st.write("Count grid (Sun..Sat × 0..23) — total starts =", int(np.nansum(cg.values)))
-            st.dataframe(cg, height=260, **_df_stretch_kwargs())
-
-            # Sample of the rows feeding the chart
-            sample_cols = [c for c in ["station_id", "connector_id", "transaction_id", "_start_ak", "_dow", "_hour"] if c in heat.columns]
-            if not sample_cols:
-                sample_cols = list(heat.columns)[:6]
-            st.dataframe(heat[sample_cols].head(50), hide_index=True, **_df_stretch_kwargs())
-        except Exception as _e:
-            st.caption(f"debug error: {_e}")
-
-    # Heatmaps — grids already computed above; render locally (robust & version‑independent)
-
+    # Heatmaps — stacked full width (to match v1 layout)
     st.plotly_chart(
-        _fig_heatmap_count(_count_grid, "Session Start Density (by Day & Hour)"),
+        heatmap_count(heat, "Session Start Density (by Day & Hour)"),
         use_container_width=True,
         config={"displaylogo": False},
-        key="hm-count",
     )
     st.plotly_chart(
-        _fig_heatmap_duration(_dur_grid, "Average Session Duration (min)"),
+        heatmap_duration(heat, "Average Session Duration (min)"),
         use_container_width=True,
         config={"displaylogo": False},
-        key="hm-duration",
     )
+
     # Cache latest results for the Data Export tab
     st.session_state["__v2_last_sessions"] = sess.copy()
     st.session_state["__v2_last_meter"] = mv.copy()
@@ -713,37 +279,8 @@ with t2:
             v = df["vendor_error_code"].astype(str).str.strip()
             df = df[(v != "") & (~v.str.lower().eq("none")) & (~v.eq("0"))]
 
-        # Tritium enrichment (best‑effort; no‑op if helper not present)
-        try:
-            from rca_v2.loaders import load_tritium_error_codes  # added in loaders.py
-            from rca_v2.constants import PLATFORM_MAP
-            codes = load_tritium_error_codes()
-            if isinstance(codes, pd.DataFrame) and not codes.empty and "vendor_error_code" in df.columns:
-                # normalize codes table: use same keys and strip to just digits
-                codes2 = codes.rename(columns={"platform": "Platform", "code": "code_key"}).copy()
-                codes2["code_key"] = (
-                    codes2["code_key"].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
-                )
-
-                base = df.copy()
-                # map platform by station_id (PLATFORM_MAP is keyed by station_id)
-                base["Platform"] = base.get("station_id", "").map(PLATFORM_MAP).fillna("")
-
-                # normalize vendor_error_code -> digits only
-                base["code_key"] = (
-                    base["vendor_error_code"].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
-                )
-
-                # join on (Platform, code_key)
-                base = base.merge(
-                    codes2[["Platform", "code_key", "impact", "description"]],
-                    on=["Platform", "code_key"],
-                    how="left",
-                )
-                df = base
-        except Exception:
-            # Keep table functional even if enrichment isn't wired yet
-            pass
+        # Tritium enrichment (best‑effort; no‑op if lookup isn’t wired yet)
+        df = _enrich_status_with_tritium(df)
 
         # Build display & sort newest-first
         display = df.copy()
@@ -761,7 +298,7 @@ with t2:
         ]
         final = [c for c in wanted if c in display.columns]
         display = display.sort_values("_ts", ascending=False, kind="mergesort")
-        st.dataframe(display[final], hide_index=True, **_df_stretch_kwargs())
+        st.dataframe(display[final], use_container_width=True, hide_index=True)
 
 with t3:
     st.subheader("Connectivity")
@@ -829,7 +366,7 @@ with t3:
         })
         display = display.assign(__ts=df["_ts"]).sort_values("__ts", ascending=False, kind="mergesort").drop(columns="__ts")
 
-        st.dataframe(display, hide_index=True, **_df_stretch_kwargs())
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
 with t4:
     st.subheader("Data Export")
@@ -867,44 +404,14 @@ with t4:
         s["_ts"] = ts
 
         # Tritium enrichment (adds impact/description when available)
-        # Always create the columns so they appear in the export, even if the lookup is unavailable.
+        s = _enrich_status_with_tritium(s)
+        # Always create the columns so they appear in the export, even if the lookup is unavailable
         if "vendor_error_code" not in s.columns:
             s["vendor_error_code"] = ""
         if "impact" not in s.columns:
             s["impact"] = ""
         if "description" not in s.columns:
             s["description"] = ""
-        try:
-            from rca_v2.loaders import load_tritium_error_codes
-            from rca_v2.constants import PLATFORM_MAP
-            codes = load_tritium_error_codes()
-            if isinstance(codes, pd.DataFrame) and not codes.empty and "vendor_error_code" in s.columns:
-                # normalize codes table: same join keys and digits-only code
-                codes2 = codes.rename(columns={"platform": "Platform", "code": "code_key"}).copy()
-                codes2["code_key"] = (
-                    codes2["code_key"].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
-                )
-
-                base = s.copy()
-                base["Platform"] = base.get("station_id", "").map(PLATFORM_MAP).fillna("")
-                base["code_key"] = (
-                    base["vendor_error_code"].astype(str).str.extract(r"(\d+)", expand=False).fillna("")
-                )
-
-                s = base.merge(
-                    codes2[["Platform", "code_key", "impact", "description"]],
-                    on=["Platform", "code_key"],
-                    how="left",
-                )
-
-                # Ensure the columns exist even if merge produced all-NaN
-                if "impact" not in s.columns:
-                    s["impact"] = ""
-                if "description" not in s.columns:
-                    s["description"] = ""
-        except Exception:
-            # best‑effort enrichment; continue silently if the lookup isn't available
-            pass
 
         status_export = s.copy()
         status_export["Date/Time (AK Local)"] = status_export["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -983,27 +490,33 @@ with t4:
     else:
         bio = BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as xw:
+            # Sessions sheet: convert SoC columns to percentage and apply Excel % formatting
             if not sess_last.empty:
-                sx = sess_last.copy()
+                sess_df = sess_last.copy()
+                # Convert SoC values from 0–100 to 0–1 so they are true percentages
+                for col in ("SoC Start", "SoC End"):
+                    if col in sess_df.columns:
+                        sess_df[col] = (
+                            pd.to_numeric(sess_df[col], errors="coerce") / 100.0
+                        )
+                sess_df.to_excel(xw, sheet_name="Sessions", index=False)
 
-                # Normalize connector column for export — keep only a single "Connector id"
-                # Accept several possible source column spellings and drop the rest.
-                rename_map = {}
-                if "connector_id" in sx.columns and "Connector id" not in sx.columns:
-                    rename_map["connector_id"] = "Connector id"
-                if "Connector Id" in sx.columns:
-                    rename_map["Connector Id"] = "Connector id"
-                if rename_map:
-                    sx = sx.rename(columns=rename_map)
-                # If we only have "Connector #", promote it to "Connector id"
-                if "Connector id" not in sx.columns and "Connector #" in sx.columns:
-                    sx["Connector id"] = sx["Connector #"]
+                # Best-effort: apply percentage number format to those columns
+                try:
+                    from openpyxl.utils import get_column_letter
 
-                # Drop any legacy connector columns so only "Connector id" remains
-                drop_candidates = ["Connector #", "Connect #", "connector_id", "Connector Id"]
-                sx = sx.drop(columns=[c for c in drop_candidates if c in sx.columns], errors="ignore")
-
-                sx.to_excel(xw, sheet_name="Sessions", index=False)
+                    sheet = xw.book["Sessions"]
+                    for col_name in ("SoC Start", "SoC End"):
+                        if col_name in sess_df.columns:
+                            col_idx = sess_df.columns.get_loc(col_name) + 1  # 1-based
+                            col_letter = get_column_letter(col_idx)
+                            for row_idx in range(2, len(sess_df) + 2):  # skip header
+                                cell = sheet[f"{col_letter}{row_idx}"]
+                                if cell.value is not None:
+                                    cell.number_format = "0%"
+                except Exception:
+                    # Keep export working even if formatting fails
+                    pass
             if not mv_last.empty:
                 mvx = mv_last.copy()
                 # Excel can't handle tz-aware datetimes. Provide AKDT/UTC strings and drop the tz-aware column.
@@ -1018,6 +531,25 @@ with t4:
                 se_cols = [c for c in _status_cols if c in status_export.columns]
                 status_export[se_cols].to_excel(xw, sheet_name="Status", index=False)
             if not conn_export.empty:
+                # Summary sheet: total DISCONNECT time per EVSE for this window
+                conn_summary = conn_export.copy()
+                if "Duration (min)" in conn_summary.columns:
+                    conn_summary["Duration (min)"] = pd.to_numeric(
+                        conn_summary["Duration (min)"], errors="coerce"
+                    )
+                    conn_summary = conn_summary[conn_summary["Duration (min)"] > 0]
+                    conn_summary = (
+                        conn_summary.groupby("EVSE", as_index=False)["Duration (min)"]
+                        .sum()
+                        .rename(columns={"Duration (min)": "Total Disconnect Time (min)"})
+                        .sort_values("Total Disconnect Time (min)", ascending=False)
+                    )
+                    if not conn_summary.empty:
+                        conn_summary.to_excel(
+                            xw,
+                            sheet_name="Connectivity Summary",
+                            index=False,
+                        )
                 conn_export.to_excel(xw, sheet_name="Connectivity", index=False)
         data = bio.getvalue()
         st.download_button(
@@ -1025,7 +557,7 @@ with t4:
             data=data,
             file_name="recharge_export.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Exports Sessions, MeterValues (window), plus Status and Connectivity tables for the current filters."
+            help="Exports Sessions, MeterValues (window), plus Status and Connectivity tables and a Connectivity Summary for the current filters."
         )
 
 if APP_MODE == "local" and t5 is not None:
