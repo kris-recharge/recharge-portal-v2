@@ -16,9 +16,11 @@ IS_POSTGRES = (
     or _DB_URL.startswith("postgresql://")
 )
 
+
 def _ts_col() -> str:
     """Return the proper timestamp column reference for the current backend."""
     return '"timestamp"' if IS_POSTGRES else "timestamp"
+
 
 def _make_placeholders(n: int) -> str:
     """Return the correct placeholder list for IN (...) given backend and count n."""
@@ -30,6 +32,7 @@ def _make_placeholders(n: int) -> str:
     # default: sqlite qmark style
     return ",".join(["?"] * n)
 
+
 def _between_placeholders() -> str:
     """Return the placeholder pair for `BETWEEN ... AND ...` based on backend."""
     if IS_POSTGRES:
@@ -37,6 +40,7 @@ def _between_placeholders() -> str:
         return "%s AND %s"
     # default: sqlite qmark style
     return "? AND ?"
+
 
 # -----------------------------
 # Meter values + Authorize data
@@ -109,7 +113,7 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         f = pd.read_sql(single_sql, conn, params=[sid, start_utc, end_utc])
                         if f is not None and not f.empty:
                             frames.append(f)
-                    except Exception as e:
+                    except Exception:
                         logger.exception(
                             "load_meter_values single-station query failed for %s (backend=%s)",
                             sid,
@@ -122,10 +126,19 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
 
     if not df.empty:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        for c in ["power_w","energy_wh","soc","amperage_offered","amperage_import","power_offered_w","voltage_v"]:
+        for c in [
+            "power_w",
+            "energy_wh",
+            "soc",
+            "amperage_offered",
+            "amperage_import",
+            "power_offered_w",
+            "voltage_v",
+        ]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
 
 def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
@@ -134,8 +147,12 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     if not stations:
         return pd.DataFrame()
 
-    start_pad = (pd.to_datetime(start_utc) - pd.Timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_pad   = (pd.to_datetime(end_utc)   + pd.Timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start_pad = (pd.to_datetime(start_utc) - pd.Timedelta(hours=2)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    end_pad = (pd.to_datetime(end_utc) + pd.Timedelta(hours=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
     placeholders = _make_placeholders(len(stations))
     between = _between_placeholders()
     sql = f"""
@@ -168,7 +185,7 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         frames.append(f)
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
-        except Exception as e:
+        except Exception:
             logger.exception(
                 "load_authorize primary query failed (backend=%s, stations=%s, window=%s→%s)",
                 "postgres" if IS_POSTGRES else "sqlite",
@@ -193,7 +210,7 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         f = pd.read_sql(single_sql, conn, params=[sid, start_pad, end_pad])
                         if f is not None and not f.empty:
                             frames.append(f)
-                    except Exception as e:
+                    except Exception:
                         logger.exception(
                             "load_authorize single-station query failed for %s (backend=%s)",
                             sid,
@@ -210,6 +227,7 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
         df = df[df["id_tag"].str.startswith("VID:", na=False)]
     return df
 
+
 # -----------------------------
 # Status + Connectivity loaders
 # -----------------------------
@@ -222,6 +240,7 @@ def _in_clause_and_params(stations, start_utc: str, end_utc: str):
     where_in = f"station_id IN ({placeholders}) AND " if stations else ""
     return where_in, list(stations) + [start_utc, end_utc]
 
+
 def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_status_notifications for the window; newest first; AKDT strings + friendly names.
@@ -231,8 +250,10 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     between = _between_placeholders()
 
     # Try selecting vendor_error_code if present; fallback to a reduced column set if not
-    base_cols = 'station_id, connector_id, {_ts} AS timestamp, status, error_code'.format(_ts=_ts_col())
-    try_cols = base_cols + ', vendor_error_code'
+    base_cols = "station_id, connector_id, {_ts} AS timestamp, status, error_code".format(
+        _ts=_ts_col()
+    )
+    try_cols = base_cols + ", vendor_error_code"
 
     sql_try = f"""
       SELECT {try_cols}
@@ -252,22 +273,38 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
         try:
             df = pd.read_sql(sql_try, conn, params=params)
         except Exception:
-            df = pd.read_sql(sql_fallback, conn, params=params)
+            # This can be e.g. missing vendor_error_code column or SQL error
+            logger.exception(
+                "load_status_history extended-column query failed; falling back (backend=%s, stations=%s)",
+                "postgres" if IS_POSTGRES else "sqlite",
+                stations,
+            )
+            try:
+                df = pd.read_sql(sql_fallback, conn, params=params)
+            except Exception:
+                logger.exception(
+                    "load_status_history fallback query failed completely (backend=%s, stations=%s)",
+                    "postgres" if IS_POSTGRES else "sqlite",
+                    stations,
+                )
+                df = pd.DataFrame()
     finally:
         conn.close()
 
     if df is None or df.empty:
-        return pd.DataFrame(columns=[
-            "AKDT",
-            "Location",
-            "station_id",
-            "connector_id",
-            "status",
-            "error_code",
-            "vendor_error_code",
-            "impact",
-            "description",
-        ])
+        return pd.DataFrame(
+            columns=[
+                "AKDT",
+                "Location",
+                "station_id",
+                "connector_id",
+                "status",
+                "error_code",
+                "vendor_error_code",
+                "impact",
+                "description",
+            ]
+        )
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df["AKDT"] = df["timestamp"].dt.tz_convert(AK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -281,7 +318,9 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                 tec = tec.copy()
                 # Ensure numeric compare where possible
                 tec["code"] = pd.to_numeric(tec["code"], errors="coerce")
-                df["vendor_error_code"] = pd.to_numeric(df["vendor_error_code"], errors="coerce")
+                df["vendor_error_code"] = pd.to_numeric(
+                    df["vendor_error_code"], errors="coerce"
+                )
 
                 df = df.merge(
                     tec[["code", "impact", "description"]],
@@ -294,7 +333,7 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                     df = df.drop(columns=["code"])
         except Exception:
             # Fail silently if lookup table is missing or malformed
-            pass
+            logger.exception("load_status_history: Tritium enrichment failed")
 
     cols = [
         "AKDT",
@@ -315,6 +354,7 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
         "AKDT", ascending=False, kind="mergesort"
     )
 
+
 def load_connectivity(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_websocket CONNECT/DISCONNECT events; newest first; AKDT strings + friendly names.
@@ -329,20 +369,37 @@ def load_connectivity(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     conn = get_conn()
     try:
-        df = pd.read_sql(sql, conn, params=params)
+        try:
+            df = pd.read_sql(sql, conn, params=params)
+        except Exception:
+            logger.exception(
+                "load_connectivity query failed (backend=%s, stations=%s, window=%s→%s)",
+                "postgres" if IS_POSTGRES else "sqlite",
+                stations,
+                start_utc,
+                end_utc,
+            )
+            df = pd.DataFrame()
     finally:
         conn.close()
 
     if df is None or df.empty:
-        return pd.DataFrame(columns=["AKDT","Location","station_id","connection_id","Connectivity"])
+        return pd.DataFrame(
+            columns=["AKDT", "Location", "station_id", "connection_id", "Connectivity"]
+        )
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
     df["AKDT"] = df["timestamp"].dt.tz_convert(AK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
     ev = df.get("event").astype(str).str.upper()
-    df["Connectivity"] = np.where(ev.str.contains("DISCONNECT"), "websocket DISCONNECT", "websocket CONNECT")
+    df["Connectivity"] = np.where(
+        ev.str.contains("DISCONNECT"), "websocket DISCONNECT", "websocket CONNECT"
+    )
     df["Location"] = df["station_id"].map(EVSE_DISPLAY).fillna(df["station_id"])
-    cols = ["AKDT","Location","station_id","connection_id","Connectivity"]
-    return df[[c for c in cols if c in df.columns]].sort_values("AKDT", ascending=False, kind="mergesort")
+    cols = ["AKDT", "Location", "station_id", "connection_id", "Connectivity"]
+    return df[[c for c in cols if c in df.columns]].sort_values(
+        "AKDT", ascending=False, kind="mergesort"
+    )
+
 
 def load_tritium_error_codes() -> pd.DataFrame:
     """
