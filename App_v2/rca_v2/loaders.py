@@ -1,25 +1,38 @@
+import os
+import logging
 import pandas as pd
 import numpy as np
 from .config import DB_BACKEND, AK_TZ
 from .db import get_conn
 from .constants import EVSE_DISPLAY
 
+logger = logging.getLogger(__name__)
+
+# Heuristic: treat as Postgres if either the config says so OR the DATABASE_URL is a Postgres URI.
+_DB_URL = os.getenv("DATABASE_URL", "")
+IS_POSTGRES = (
+    DB_BACKEND == "postgres"
+    or _DB_URL.startswith("postgres://")
+    or _DB_URL.startswith("postgresql://")
+)
+
 def _ts_col() -> str:
     """Return the proper timestamp column reference for the current backend."""
-    return '"timestamp"' if DB_BACKEND == "postgres" else "timestamp"
+    return '"timestamp"' if IS_POSTGRES else "timestamp"
 
 def _make_placeholders(n: int) -> str:
     """Return the correct placeholder list for IN (...) given backend and count n."""
     if n <= 0:
         return ""
-    if DB_BACKEND == "postgres":
+    if IS_POSTGRES:
+        # psycopg / Postgres uses %s style placeholders
         return ",".join(["%s"] * n)
-    # default: sqlite
+    # default: sqlite qmark style
     return ",".join(["?"] * n)
 
 def _between_placeholders() -> str:
     """Return the placeholder pair for `BETWEEN ... AND ...` based on backend."""
-    if DB_BACKEND == "postgres":
+    if IS_POSTGRES:
         # psycopg / Postgres uses %s style placeholders
         return "%s AND %s"
     # default: sqlite qmark style
@@ -70,7 +83,14 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         frames.append(f)
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
-        except Exception:
+        except Exception as e:
+            logger.exception(
+                "load_meter_values primary query failed (backend=%s, stations=%s, window=%s→%s)",
+                "postgres" if IS_POSTGRES else "sqlite",
+                stations,
+                start_utc,
+                end_utc,
+            )
             # As an additional hard fallback, also attempt per-station queries
             df = pd.DataFrame()
             if len(stations) >= 1:
@@ -89,8 +109,12 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         f = pd.read_sql(single_sql, conn, params=[sid, start_utc, end_utc])
                         if f is not None and not f.empty:
                             frames.append(f)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception(
+                            "load_meter_values single-station query failed for %s (backend=%s)",
+                            sid,
+                            "postgres" if IS_POSTGRES else "sqlite",
+                        )
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
     finally:
@@ -144,7 +168,14 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         frames.append(f)
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
-        except Exception:
+        except Exception as e:
+            logger.exception(
+                "load_authorize primary query failed (backend=%s, stations=%s, window=%s→%s)",
+                "postgres" if IS_POSTGRES else "sqlite",
+                stations,
+                start_pad,
+                end_pad,
+            )
             # As an additional hard fallback, also attempt per-station queries
             df = pd.DataFrame()
             if len(stations) >= 1:
@@ -162,8 +193,12 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                         f = pd.read_sql(single_sql, conn, params=[sid, start_pad, end_pad])
                         if f is not None and not f.empty:
                             frames.append(f)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.exception(
+                            "load_authorize single-station query failed for %s (backend=%s)",
+                            sid,
+                            "postgres" if IS_POSTGRES else "sqlite",
+                        )
                 if frames:
                     df = pd.concat(frames, ignore_index=True)
     finally:
