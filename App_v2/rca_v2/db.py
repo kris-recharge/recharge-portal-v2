@@ -12,7 +12,22 @@ BASE_DIR = Path(__file__).resolve().parent
 SQLITE_PATH = BASE_DIR.parent.parent / "database" / "lynkwell_data.db"
 
 # Render / cloud: use Postgres when DATABASE_URL is set
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+
+def param_placeholder() -> str:
+    """
+    Return the correct parameter placeholder token for the active backend.
+
+    - For Postgres/psycopg (when DATABASE_URL is set), use %s
+    - For local SQLite (no DATABASE_URL), use ?
+    """
+    if DATABASE_URL:
+        # psycopg uses the 'pyformat' style with %s placeholders
+        return "%s"
+    # sqlite3 uses the 'qmark' style with ? placeholders
+    return "?"
 
 
 def get_conn():
