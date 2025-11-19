@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from .config import DB_BACKEND, AK_TZ
-from .db import get_conn, param_placeholder
+from .db import get_conn
 from .constants import EVSE_DISPLAY
 
 def _ts_col() -> str:
@@ -17,6 +17,14 @@ def _make_placeholders(n: int) -> str:
     # default: sqlite
     return ",".join(["?"] * n)
 
+def _between_placeholders() -> str:
+    """Return the placeholder pair for `BETWEEN ... AND ...` based on backend."""
+    if DB_BACKEND == "postgres":
+        # psycopg / Postgres uses %s style placeholders
+        return "%s AND %s"
+    # default: sqlite qmark style
+    return "? AND ?"
+
 # -----------------------------
 # Meter values + Authorize data
 # -----------------------------
@@ -29,12 +37,13 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
         return pd.DataFrame()
 
     placeholders = _make_placeholders(len(stations))
+    between = _between_placeholders()
     sql = f"""
       SELECT station_id, connector_id, transaction_id, {_ts_col()} AS timestamp,
              power_w, energy_wh, soc, amperage_offered, amperage_import, power_offered_w, voltage_v
       FROM realtime_meter_values
       WHERE station_id IN ({placeholders})
-        AND {_ts_col()} BETWEEN ? AND ?
+        AND {_ts_col()} BETWEEN {between}
       ORDER BY station_id, connector_id, transaction_id, {_ts_col()}
     """
     params = list(stations) + [start_utc, end_utc]
@@ -46,12 +55,13 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             # run per-EVSE and concatenate (addresses IN-clause driver quirks).
             if (df is None or df.empty) and len(stations) > 1:
                 frames = []
+                single_between = _between_placeholders()
                 single_sql = f"""
                   SELECT station_id, connector_id, transaction_id, {_ts_col()} AS timestamp,
                          power_w, energy_wh, soc, amperage_offered, amperage_import, power_offered_w, voltage_v
                   FROM realtime_meter_values
                   WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN ? AND ?
+                    AND {_ts_col()} BETWEEN {single_between}
                   ORDER BY station_id, connector_id, transaction_id, {_ts_col()}
                 """
                 for sid in stations:
@@ -65,12 +75,13 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             df = pd.DataFrame()
             if len(stations) >= 1:
                 frames = []
+                single_between = _between_placeholders()
                 single_sql = f"""
                   SELECT station_id, connector_id, transaction_id, {_ts_col()} AS timestamp,
                          power_w, energy_wh, soc, amperage_offered, amperage_import, power_offered_w, voltage_v
                   FROM realtime_meter_values
                   WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN ? AND ?
+                    AND {_ts_col()} BETWEEN {single_between}
                   ORDER BY station_id, connector_id, transaction_id, {_ts_col()}
                 """
                 for sid in stations:
@@ -102,11 +113,12 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     start_pad = (pd.to_datetime(start_utc) - pd.Timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end_pad   = (pd.to_datetime(end_utc)   + pd.Timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
     placeholders = _make_placeholders(len(stations))
+    between = _between_placeholders()
     sql = f"""
       SELECT station_id, {_ts_col()} AS timestamp, id_tag
       FROM realtime_authorize
       WHERE station_id IN ({placeholders})
-        AND {_ts_col()} BETWEEN ? AND ?
+        AND {_ts_col()} BETWEEN {between}
       ORDER BY station_id, {_ts_col()}
     """
     params = list(stations) + [start_pad, end_pad]
@@ -118,11 +130,12 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             # run per-EVSE and concatenate (addresses IN-clause driver quirks).
             if (df is None or df.empty) and len(stations) > 1:
                 frames = []
+                single_between = _between_placeholders()
                 single_sql = f"""
                   SELECT station_id, {_ts_col()} AS timestamp, id_tag
                   FROM realtime_authorize
                   WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN ? AND ?
+                    AND {_ts_col()} BETWEEN {single_between}
                   ORDER BY station_id, {_ts_col()}
                 """
                 for sid in stations:
@@ -136,11 +149,12 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             df = pd.DataFrame()
             if len(stations) >= 1:
                 frames = []
+                single_between = _between_placeholders()
                 single_sql = f"""
                   SELECT station_id, {_ts_col()} AS timestamp, id_tag
                   FROM realtime_authorize
                   WHERE station_id IN ({_make_placeholders(1)})
-                    AND {_ts_col()} BETWEEN ? AND ?
+                    AND {_ts_col()} BETWEEN {single_between}
                   ORDER BY station_id, {_ts_col()}
                 """
                 for sid in stations:
@@ -165,9 +179,9 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
 # Status + Connectivity loaders
 # -----------------------------
 def _in_clause_and_params(stations, start_utc: str, end_utc: str):
-    """
-    Build an 'IN (...) AND timestamp BETWEEN ? AND ?' clause and params
-    for SQLite (uses '?' placeholders). For Postgres we'll adapt later.
+    """Build the `station_id IN (...) AND` piece and param list for the window.
+
+    The timestamp BETWEEN placeholders are handled separately per backend.
     """
     placeholders = _make_placeholders(len(stations)) if stations else ""
     where_in = f"station_id IN ({placeholders}) AND " if stations else ""
@@ -179,6 +193,7 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     Includes vendor_error_code if the column exists (falls back cleanly if not).
     """
     where_in, params = _in_clause_and_params(stations, start_utc, end_utc)
+    between = _between_placeholders()
 
     # Try selecting vendor_error_code if present; fallback to a reduced column set if not
     base_cols = 'station_id, connector_id, {_ts} AS timestamp, status, error_code'.format(_ts=_ts_col())
@@ -187,13 +202,13 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     sql_try = f"""
       SELECT {try_cols}
       FROM realtime_status_notifications
-      WHERE {where_in} {_ts_col()} BETWEEN ? AND ?
+      WHERE {where_in} {_ts_col()} BETWEEN {between}
       ORDER BY {_ts_col()} DESC
     """
     sql_fallback = f"""
       SELECT {base_cols}
       FROM realtime_status_notifications
-      WHERE {where_in} {_ts_col()} BETWEEN ? AND ?
+      WHERE {where_in} {_ts_col()} BETWEEN {between}
       ORDER BY {_ts_col()} DESC
     """
 
@@ -270,10 +285,11 @@ def load_connectivity(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     Load realtime_websocket CONNECT/DISCONNECT events; newest first; AKDT strings + friendly names.
     """
     where_in, params = _in_clause_and_params(stations, start_utc, end_utc)
+    between = _between_placeholders()
     sql = f"""
       SELECT station_id, connection_id, event, {_ts_col()} AS timestamp
       FROM realtime_websocket
-      WHERE {where_in} {_ts_col()} BETWEEN ? AND ?
+      WHERE {where_in} {_ts_col()} BETWEEN {between}
       ORDER BY {_ts_col()} DESC
     """
     conn = get_conn()
