@@ -34,7 +34,7 @@ def render_sidebar():
     # Logo
     logo_path = _find_logo_path()
     if logo_path:
-        st.image(logo_path, use_container_width=True)
+        st.image(logo_path, use_column_width=True)
     else:
         st.markdown("### ReCharge Alaska")
 
