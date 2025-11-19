@@ -2,14 +2,14 @@
 streamlit==1.39.0
 
 # Data handling
-pandas==2.2.2
+pandas==2.2.3
 numpy==1.26.4
 
 # Visualization
 plotly==5.24.0
 
 # Database (Postgres / Render)
-psycopg[binary]==3.2.1
+psycopg[binary]==3.2.12
 
 # HTTP / APIs (LynkWell, Supabase REST, etc.)
 requests==2.32.3
