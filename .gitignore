@@ -41,6 +41,8 @@ web/.turbo/
 web/.vercel/
 
 # Local env files (never commit secrets)
+.env.local
+.env.*.local
 web/.env.local
 web/.env.*.local
 
