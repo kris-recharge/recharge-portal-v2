@@ -38,6 +38,39 @@ def render_sidebar():
     else:
         st.markdown("### ReCharge Alaska")
 
+    # User info (optional, driven by query params passed from the portal)
+    try:
+        qp = st.query_params  # Streamlit >= 1.27
+    except Exception:
+        qp = st.experimental_get_query_params()
+
+    email = ""
+    logout_url = ""
+
+    if isinstance(qp, dict):
+        def _first(val):
+            if isinstance(val, list):
+                return val[0] if val else ""
+            return val or ""
+        email = _first(qp.get("email"))
+        logout_url = _first(qp.get("logout_url"))
+    else:
+        # st.query_params on newer Streamlit returns a Mapping[str, str]
+        email = qp.get("email", "")
+        logout_url = qp.get("logout_url", "")
+
+    if email:
+        st.caption(f"Signed in as **{email}**")
+    else:
+        st.caption("Signed in via ReCharge Portal")
+
+    if logout_url:
+        st.link_button("Log out", logout_url, use_container_width=True)
+    else:
+        st.caption("To sign out, use the controls in the portal header.")
+
+    st.divider()
+
     # ---------- EVSE Filter (friendly names only) ----------
     st.markdown("#### EVSE Filter")
     # Use union of all known station_ids so overrides / archived items still appear

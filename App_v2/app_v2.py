@@ -274,13 +274,29 @@ with t2:
             ts = pd.to_datetime(df.get("timestamp"), errors="coerce", utc=True).dt.tz_convert(AK)
         df["_ts"] = ts
 
-        # Optional: only rows that actually have a vendor_error_code
-        if show_only_vendor and "vendor_error_code" in df.columns:
-            v = df["vendor_error_code"].astype(str).str.strip()
-            df = df[(v != "") & (~v.str.lower().eq("none")) & (~v.eq("0"))]
-
         # Tritium enrichment (best‑effort; no‑op if lookup isn’t wired yet)
         df = _enrich_status_with_tritium(df)
+
+        # Optional: only rows that actually have a vendor_error_code
+        # Apply this after Tritium enrichment so we filter on the final column.
+        if show_only_vendor and "vendor_error_code" in df.columns:
+            v_raw = df["vendor_error_code"]
+            v = v_raw.astype(str).str.strip()
+
+            keep = (
+                ~v_raw.isna()
+                & (v != "")
+                & (~v.str.lower().isin(["none", "nan"]))
+                & (~v.isin(["0", "0000", "0.0"]))
+            )
+
+            df = df[keep]
+
+            if df.empty:
+                st.info(
+                    "No status rows with vendor_error_code in this window for the selected EVSE."
+                )
+                st.stop()
 
         # Build display & sort newest-first
         display = df.copy()
