@@ -1,7 +1,52 @@
+
+import os
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+
+# Optional soft gate: require a shared embed token when running behind a portal.
+REQUIRED_EMBED_ACCESS_TOKEN = os.getenv("EMBED_ACCESS_TOKEN")
+
+
+def check_embed_token() -> None:
+    """
+    Block direct access to the dashboard unless a valid embed token is present.
+
+    This is a soft gate intended to discourage direct hits to the Streamlit URL.
+    The primary authentication and authorization still live in the Next.js + Supabase portal.
+    """
+    # If no token is configured in the environment, do nothing (gate disabled).
+    if not REQUIRED_EMBED_ACCESS_TOKEN:
+        return
+
+    # Streamlit 1.27+ has st.query_params; older releases use experimental_get_query_params.
+    try:
+        qp = st.query_params  # type: ignore[attr-defined]
+    except Exception:
+        qp = st.experimental_get_query_params()
+
+    token = ""
+
+    if isinstance(qp, dict):
+        # qp may be Mapping[str, List[str]] or Mapping[str, str]
+        val = qp.get("token")
+        if isinstance(val, list):
+            token = val[0] if val else ""
+        else:
+            token = val or ""
+    else:
+        # Newer Mapping-like object
+        token = qp.get("token", "")
+
+    if token != REQUIRED_EMBED_ACCESS_TOKEN:
+        st.error("Access to this dashboard is restricted.")
+        st.markdown(
+            "Please sign in via the ReCharge Portal:\n\n"
+            "[Open ReCharge Portal](https://recharge-portal-next.onrender.com)"
+        )
+        st.stop()
 
 from rca_v2.config import APP_MODE
 from rca_v2.ui import render_sidebar, sessions_table_single_select
@@ -17,7 +62,11 @@ from rca_v2.constants import get_evse_display
 
 from rca_v2.admintab import render_admin_tab
 
+
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
+
+# Soft gate: require the correct embed token when configured.
+check_embed_token()
 
 with st.sidebar:
     stations, start_utc, end_utc = render_sidebar()
