@@ -85,7 +85,7 @@ export default function AppPage() {
     : `${DASHBOARD_BASE}?${params.toString()}`;
 
   return (
-    <main className="min-h-screen flex flex-col bg-slate-950 text-slate-100">
+    <main className="h-screen flex flex-col bg-slate-950 text-slate-100 overflow-hidden">
       <header className="w-full border-b border-slate-800 px-6 py-3 flex items-center justify-between bg-slate-900/80 backdrop-blur">
         <div className="flex items-center gap-3">
           <div className="h-8 w-8 rounded-full bg-emerald-500/20 flex items-center justify-center text-xs font-bold tracking-tight">
@@ -118,16 +118,9 @@ export default function AppPage() {
         </div>
       </header>
 
-      <section className="flex-1 flex flex-col">
-        {/* Optional message row */}
-        <div className="border-b border-slate-800 px-6 py-2 text-xs text-slate-400 bg-slate-900/60">
-          If the dashboard below does not load, verify that the Render app is
-          running at
-          <code className="ml-1 font-mono text-[0.7rem]"> {DASHBOARD_BASE}</code>.
-        </div>
+      <section className="flex-1 min-h-0 flex flex-col">
 
-        {/* Iframe container */}
-        <div className="flex-1 bg-black/80">
+        <div className="flex-1 min-h-0 bg-black/80">
           <iframe
             src={iframeSrc}
             title="ReCharge Alaska Dashboard"
