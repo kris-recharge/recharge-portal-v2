@@ -198,7 +198,14 @@ else:
     st.session_state["__portal_allowed_station_ids"] = None
 
 with st.sidebar:
-    stations, start_utc, end_utc = render_sidebar()
+    # Pass the filtered EVSE_DISPLAY into the sidebar renderer so that
+    # users only see EVSEs they are authorized for. Fall back gracefully
+    # if the function signature does not accept any arguments.
+    try:
+        stations, start_utc, end_utc = render_sidebar(EVSE_DISPLAY)
+    except TypeError:
+        # Older/local versions of render_sidebar() may not take parameters.
+        stations, start_utc, end_utc = render_sidebar()
 
 # Enforce EVSE authorization on the selected station list as a second line of defense.
 _allowed = st.session_state.get("__portal_allowed_station_ids")
