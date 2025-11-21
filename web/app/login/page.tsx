@@ -174,7 +174,7 @@ export default function LoginPage() {
               disabled={loading}
               className="w-full rounded-md bg-emerald-600 text-white py-2 text-sm font-medium hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed"
             >
-              {loading ? "Verifying…" : "Verify &amp; Sign in"}
+              {loading ? "Verifying…" : "Authenticate"}
             </button>
 
             <button
