@@ -1,10 +1,12 @@
 
 import os
+import json
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import requests
 
 # Optional soft gate: require a shared embed token when running behind a portal.
 REQUIRED_EMBED_ACCESS_TOKEN = os.getenv("EMBED_ACCESS_TOKEN")
@@ -48,6 +50,104 @@ def check_embed_token() -> None:
         )
         st.stop()
 
+
+# --- Begin: Portal user helpers (query param extraction, Supabase authorization) ---
+
+def _get_query_params():
+    """
+    Helper to safely access the current query parameters in Streamlit.
+    """
+    try:
+        return st.query_params  # type: ignore[attr-defined]
+    except Exception:
+        return st.experimental_get_query_params()
+
+
+def _extract_query_param(qp, key: str) -> str:
+    """
+    Normalize a single query-parameter value to a simple string.
+    """
+    try:
+        val = qp.get(key)
+    except Exception:
+        return ""
+    if isinstance(val, list):
+        return val[0] if val else ""
+    return val or ""
+
+
+def get_current_user_email() -> str | None:
+    """
+    Best-effort extraction of the portal user's email from the query string.
+
+    The Next.js shell passes ?email=... (or ?user_email=...) when embedding
+    the dashboard iframe.
+    """
+    qp = _get_query_params()
+    email = _extract_query_param(qp, "email")
+    if not email:
+        email = _extract_query_param(qp, "user_email")
+    email = (email or "").strip()
+    return email or None
+
+
+def fetch_allowed_evse_ids_for_email(email: str | None):
+    """
+    Look up the set of station_ids this email is allowed to see from Supabase.
+
+    Returns:
+        - set([...])  : authorization data found and parsed
+        - set()       : user is known but has no allowed EVSEs
+        - None        : Supabase not configured / unreachable (no restriction)
+    """
+    supabase_url = os.getenv("SUPABASE_URL")
+    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not email or not supabase_url or not service_key:
+        # Treat missing config as "no restriction" so the app still works locally.
+        return None
+
+    try:
+        resp = requests.get(
+            f"{supabase_url}/rest/v1/portal_user_allowed_evse",
+            params={
+                "email": f"eq.{email}",
+                "active": "eq.true",
+                "select": "allowed_evse_ids",
+            },
+            headers={
+                "apikey": service_key,
+                "Authorization": f"Bearer {service_key}",
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+    except Exception:
+        # Fail open: if Supabase is unavailable, don't break the dashboard.
+        return None
+
+    if not rows:
+        # User exists in auth but has no portal_user_allowed_evse row.
+        return set()
+
+    raw_ids = rows[0].get("allowed_evse_ids") or []
+
+    # Supabase normally returns a JSON array here; normalize defensively.
+    if isinstance(raw_ids, str):
+        try:
+            parsed = json.loads(raw_ids)
+            if isinstance(parsed, list):
+                raw_ids = parsed
+            else:
+                raw_ids = [parsed]
+        except Exception:
+            raw_ids = [raw_ids]
+
+    return {str(sid) for sid in raw_ids}
+
+# --- End: Portal user helpers ---
+
 from rca_v2.config import APP_MODE
 from rca_v2.ui import render_sidebar, sessions_table_single_select
 from rca_v2.loaders import (
@@ -63,16 +163,49 @@ from rca_v2.constants import get_evse_display
 from rca_v2.admintab import render_admin_tab
 
 
+EVSE_DISPLAY = get_evse_display()
+
+
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
 
 # Soft gate: require the correct embed token when configured.
 check_embed_token()
 
+# Identify current portal user (if any) from the query string.
+current_email = get_current_user_email()
+if current_email:
+    st.session_state["__portal_user_email"] = current_email
+
+# Look up allowed EVSEs for this user via Supabase (if configured).
+ALLOWED_STATIONS = fetch_allowed_evse_ids_for_email(current_email)
+if isinstance(ALLOWED_STATIONS, set):
+    if not ALLOWED_STATIONS:
+        st.error(
+            "Your account does not have access to any EVSEs. "
+            "Please contact ReCharge Alaska if you believe this is an error."
+        )
+        st.stop()
+
+    # Restrict the global EVSE display map to the allowed set only.
+    EVSE_DISPLAY = {
+        sid: name
+        for sid, name in EVSE_DISPLAY.items()
+        if sid in ALLOWED_STATIONS
+    }
+    st.session_state["__portal_allowed_station_ids"] = ALLOWED_STATIONS
+else:
+    # None = fail-open / local dev: no authorization filter applied.
+    st.session_state["__portal_allowed_station_ids"] = None
+
 with st.sidebar:
     stations, start_utc, end_utc = render_sidebar()
 
-
-EVSE_DISPLAY = get_evse_display()
+# Enforce EVSE authorization on the selected station list as a second line of defense.
+_allowed = st.session_state.get("__portal_allowed_station_ids")
+if isinstance(_allowed, (set, list, tuple)) and _allowed:
+    allowed_set = {str(s) for s in _allowed}
+    if stations:
+        stations = [s for s in stations if str(s) in allowed_set]
 
 
 # Best-effort enrichment of status rows with Tritium error metadata.

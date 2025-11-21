@@ -30,7 +30,7 @@ def _find_logo_path() -> Optional[str]:
             return p
     return None
 
-def render_sidebar():
+def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_override: Optional[str] = None, logout_url_override: Optional[str] = None):
     # Logo
     logo_path = _find_logo_path()
     if logo_path:
@@ -59,6 +59,12 @@ def render_sidebar():
         email = qp.get("email", "")
         logout_url = qp.get("logout_url", "")
 
+    # Allow app-level overrides (used when embedding behind the Next.js portal)
+    if user_email_override:
+        email = user_email_override
+    if logout_url_override:
+        logout_url = logout_url_override
+
     if email:
         st.caption(f"Signed in as **{email}**")
     else:
@@ -71,17 +77,37 @@ def render_sidebar():
 
     st.divider()
 
-    # ---------- EVSE Filter (friendly names only) ----------
+    # ---------- EVSE Filter (friendly names only, honor allowed_evse_ids if provided) ----------
     st.markdown("#### EVSE Filter")
-    # Use union of all known station_ids so overrides / archived items still appear
+
+    # All known EVSE station_ids from the DB
     all_keys = get_all_station_ids()
-    pairs = sorted([(display_name(k), k) for k in all_keys], key=lambda x: x[0])
+
+    # If the caller passed an allow-list, intersect with all_keys so users only
+    # see EVSEs they are allowed to access.
+    if allowed_evse_ids is not None:
+        allowed_set = set(allowed_evse_ids)
+        visible_keys = [k for k in all_keys if k in allowed_set]
+        # If nothing overlaps (e.g. new EVSE not yet in the DB snapshot),
+        # fall back to whatever was passed in.
+        if not visible_keys:
+            visible_keys = list(allowed_set)
+    else:
+        visible_keys = list(all_keys)
+
+    # Build label → station_id mapping from the visible keys
+    pairs = sorted([(display_name(k), k) for k in visible_keys], key=lambda x: x[0])
     labels = [p[0] for p in pairs]
     friendly_to_key = dict(pairs)
-    # Clean visual by default: no chips shown; empty selection means "all EVSEs"
+
+    # If user has no visible EVSEs, show a note but still render the controls
+    if not visible_keys:
+        st.caption("You don't currently have access to any EVSEs.")
+
+    # Clean visual by default: no chips shown; empty selection means \"all allowed EVSEs\"
     sel_labels = st.multiselect(" ", options=labels, default=[], label_visibility="collapsed")
-    stations = [friendly_to_key[x] for x in sel_labels] if sel_labels else all_keys
-    st.caption("No selection = all EVSEs")
+    stations = [friendly_to_key[x] for x in sel_labels] if sel_labels else visible_keys
+    st.caption("No selection = all allowed EVSEs")
 
     # ---------- Default rolling 7‑day window (AK local) ----------
     now_ak = datetime.now(AK_TZ)
