@@ -6,6 +6,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+from datetime import datetime
 import requests
 
 # Optional soft gate: require a shared embed token when running behind a portal.
@@ -304,7 +305,45 @@ def _load_per_evse(loader_fn, ids, start_iso, end_iso):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False)
+
+
+def _make_station_key(stations):
+    """Normalize a stations list/set into a hashable cache key.
+
+    We convert to a sorted tuple of stringified IDs so that different
+    list orderings produce the same cache key.
+    """
+    if isinstance(stations, (list, set, tuple)):
+        return tuple(sorted(str(s) for s in stations))
+    elif stations:
+        return (str(stations),)
+    else:
+        return tuple()
+
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=50)
+def cached_status_history(station_key, start_utc, end_utc):
+    """Cached wrapper around load_status_history.
+
+    station_key is the normalized, hashable representation of the
+    selected EVSEs (see _make_station_key).
+    """
+    stations = list(station_key)
+    return load_status_history(stations, start_utc, end_utc)
+
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=50)
+def cached_connectivity(station_key, start_utc, end_utc):
+    """Cached wrapper around load_connectivity.
+
+    station_key is the normalized, hashable representation of the
+    selected EVSEs (see _make_station_key).
+    """
+    stations = list(station_key)
+    return load_connectivity(stations, start_utc, end_utc)
+
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=20)
 def load_mv_auth_and_sessions(stations_key, start_iso, end_iso):
     """
     Cached loader for meter values, authorize records, and built sessions/heatmaps.
@@ -346,12 +385,7 @@ with t1:
     st.subheader("Charging Sessions")
     with st.spinner("Loading data…"):
         # Use a cached loader so that interactive clicks re-use data for the same filters.
-        if isinstance(stations, (list, set, tuple)):
-            stations_key = tuple(sorted(stations))
-        elif stations:
-            stations_key = (str(stations),)
-        else:
-            stations_key = tuple()
+        stations_key = _make_station_key(stations)
         mv, auth, sess, heat = load_mv_auth_and_sessions(stations_key, start_utc, end_utc)
     # Defensive: re-apply EVSE filter at the session level (guards against loader quirks)
     if isinstance(stations, (list, tuple, set)) and len(stations) > 0 and "station_id" in sess.columns:
@@ -433,7 +467,8 @@ with t2:
     with c2:
         show_only_vendor = st.checkbox("Show only vendor_error_code", value=False)
 
-    status_df = load_status_history(stations, start_utc, end_utc)
+    stations_key = _make_station_key(stations)
+    status_df = cached_status_history(stations_key, start_utc, end_utc)
     if status_df.empty:
         st.info("No status notifications in this window for the selected EVSE.")
     else:
@@ -507,7 +542,8 @@ with t2:
 
 with t3:
     st.subheader("Connectivity")
-    conn_df = load_connectivity(stations, start_utc, end_utc)
+    stations_key = _make_station_key(stations)
+    conn_df = cached_connectivity(stations_key, start_utc, end_utc)
     if conn_df.empty:
         st.info("No websocket CONNECT/DISCONNECT events in this window.")
     else:
@@ -575,11 +611,77 @@ with t3:
 
 with t4:
     st.subheader("Data Export")
+
+    # Export-specific date/time range controls (AK local), separate from the main sidebar.
+    AK = "America/Anchorage"
+    try:
+        start_local = pd.to_datetime(start_utc).tz_convert(AK)
+    except Exception:
+        start_local = pd.Timestamp.now(tz=AK) - pd.Timedelta(days=1)
+    try:
+        end_local = pd.to_datetime(end_utc).tz_convert(AK)
+    except Exception:
+        end_local = pd.Timestamp.now(tz=AK)
+
+    # Two rows of inputs: start/end date on top, start/end time below.
+    row1_col1, row1_spacer, row1_col2 = st.columns([1, 0.3, 1])
+    row2_col1, row2_spacer, row2_col2 = st.columns([1, 0.3, 1])
+
+    with row1_col1:
+        export_start_date = st.date_input(
+            "Start date (export)",
+            value=start_local.date(),
+            key="export_start_date",
+        )
+    with row1_col2:
+        export_end_date = st.date_input(
+            "End date (export)",
+            value=end_local.date(),
+            key="export_end_date",
+        )
+
+    with row2_col1:
+        export_start_time = st.time_input(
+            "Start time (export)",
+            value=start_local.time().replace(microsecond=0),
+            key="export_start_time",
+        )
+    with row2_col2:
+        export_end_time = st.time_input(
+            "End time (export)",
+            value=end_local.time().replace(microsecond=0),
+            key="export_end_time",
+        )
+
+    # Build export window in UTC based on the export-specific controls.
+    try:
+        start_dt_local = pd.Timestamp(
+            datetime.combine(export_start_date, export_start_time),
+            tz=AK,
+        )
+    except Exception:
+        start_dt_local = start_local
+    try:
+        end_dt_local = pd.Timestamp(
+            datetime.combine(export_end_date, export_end_time),
+            tz=AK,
+        )
+    except Exception:
+        end_dt_local = end_local
+
+    export_start_utc = start_dt_local.tz_convert("UTC")
+    export_end_utc = end_dt_local.tz_convert("UTC")
+
+    if export_end_utc <= export_start_utc:
+        st.warning("Export end time must be after start time.")
+        st.stop()
+
     sess_last = st.session_state.get("__v2_last_sessions", pd.DataFrame())
     mv_last = st.session_state.get("__v2_last_meter", pd.DataFrame())
 
-    # Build Status and Connectivity exports on-demand using the current filters
-    status_src = load_status_history(stations, start_utc, end_utc)
+    # Build Status and Connectivity exports on-demand using the export-specific filters
+    stations_key = _make_station_key(stations)
+    status_src = cached_status_history(stations_key, export_start_utc, export_end_utc)
     status_export = pd.DataFrame()
     if isinstance(status_src, pd.DataFrame) and not status_src.empty:
         s = status_src.copy()
@@ -632,7 +734,7 @@ with t4:
         ]
         status_export = status_export.sort_values("_ts", ascending=False, kind="mergesort")
 
-    conn_src = load_connectivity(stations, start_utc, end_utc)
+    conn_src = cached_connectivity(stations_key, export_start_utc, export_end_utc)
     conn_export = pd.DataFrame()
     if isinstance(conn_src, pd.DataFrame) and not conn_src.empty:
         c = conn_src.copy()
@@ -757,13 +859,16 @@ with t4:
                         )
                 conn_export.to_excel(xw, sheet_name="Connectivity", index=False)
         data = bio.getvalue()
-        st.download_button(
-            "⬇ Download Excel",
-            data=data,
-            file_name="recharge_export.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Exports Sessions, MeterValues (window), plus Status and Connectivity tables and a Connectivity Summary for the current filters."
-        )
+        # Center the download button beneath the export controls
+        spacer_left, center_col, spacer_right = st.columns([1, 1, 1])
+        with center_col:
+            st.download_button(
+                "⬇ Download Excel",
+                data=data,
+                file_name="recharge_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Exports Sessions, MeterValues (window), plus Status and Connectivity tables and a Connectivity Summary for the current filters.",
+            )
 
 if APP_MODE == "local" and t5 is not None:
     with t5:
