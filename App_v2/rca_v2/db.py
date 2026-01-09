@@ -4,44 +4,43 @@ from pathlib import Path
 
 import psycopg
 
-APP_MODE = os.getenv("APP_MODE", "local")
-
 # Base dir is App_v2/rca_v2
 BASE_DIR = Path(__file__).resolve().parent
 
-# Local fallback: your existing SQLite file for when you run on Wednesday
-# (adjust the relative path to match whatever you had before if needed)
+# Local fallback: your existing SQLite file for when you run locally
 SQLITE_PATH = BASE_DIR.parent.parent / "database" / "lynkwell_data.db"
 
-# Render / cloud: use Postgres when DATABASE_URL is set
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+def using_postgres() -> bool:
+    """Return True when we should use Postgres."""
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+    if db_url:
+        return True
+
+    # Back-compat: allow explicit APP_MODE=render/cloud
+    app_mode = (os.getenv("APP_MODE") or "local").strip().lower()
+    return app_mode in {"render", "cloud", "prod", "production"}
 
 
 def param_placeholder() -> str:
-    """
-    Return the correct parameter placeholder token for the active backend.
-
-    - For Postgres/psycopg (APP_MODE == 'render'), use %s
-    - For local SQLite (APP_MODE != 'render'), use ?
-    """
-    if APP_MODE == "render":
-        return "%s"
-    return "?"
+    """Return the correct parameter placeholder token for the active backend."""
+    return "%s" if using_postgres() else "?"
 
 
 def get_conn():
-    """
-    Return a database connection.
+    """Return a DB connection.
 
-    - On Render (APP_MODE == 'render'), use Postgres via psycopg with DATABASE_URL.
-    - Locally, fall back to the SQLite file so your existing workflow still works.
+    - If DATABASE_URL is set (or APP_MODE indicates cloud), use Postgres via psycopg.
+    - Otherwise, fall back to the local SQLite file.
     """
-    if APP_MODE == "render":
-        if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL is not set in the environment for Render/APP_MODE=render")
-        # Postgres connection for Render
-        return psycopg.connect(DATABASE_URL)
+    if using_postgres():
+        db_url = (os.getenv("DATABASE_URL") or "").strip()
+        if not db_url:
+            raise RuntimeError(
+                "DATABASE_URL is not set; cannot use Postgres. "
+                "Set DATABASE_URL or run with local SQLite."
+            )
+        return psycopg.connect(db_url)
 
     # Local dev: SQLite
     conn = sqlite3.connect(SQLITE_PATH)
