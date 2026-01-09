@@ -92,14 +92,10 @@ def get_conn():
                 "DATABASE_URL is not set; cannot use Postgres. "
                 "Set DATABASE_URL or run with local SQLite."
             )
-        # If DATABASE_URL is a postgres URL, convert to libpq conninfo and
-        # add hostaddr=<ipv4> when available to avoid IPv6 network issues.
-        try:
-            conninfo = _url_to_conninfo(db_url) if "://" in db_url else db_url
-            return psycopg.connect(conninfo)
-        except Exception:
-            # Fall back to raw URL/conninfo
-            return psycopg.connect(db_url)
+        # Convert URL -> libpq conninfo. If an IPv4 A record exists, we add
+        # hostaddr=<ipv4> to avoid IPv6-first connection attempts.
+        conninfo = _url_to_conninfo(db_url) if "://" in db_url else db_url
+        return psycopg.connect(conninfo)
 
     # Local dev: SQLite
     conn = sqlite3.connect(SQLITE_PATH)
