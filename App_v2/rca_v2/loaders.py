@@ -341,20 +341,21 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     if using_postgres():
         placeholders = _make_placeholders(len(stations))
         between = _between_placeholders()
+        station_expr = "COALESCE(asset_id, action_payload->'data'->'asset'->>'id')"
         sql = f"""
-          SELECT asset_id AS station_id,
+          SELECT {station_expr} AS station_id,
                  connector_id,
                  transaction_id,
                  {_ts_col()} AS timestamp,
                  action_payload
           FROM ocpp_events
-          WHERE asset_id IN ({placeholders})
+          WHERE {station_expr} IN ({placeholders})
             AND (
-                action = 'MeterValues'
-                OR (action IS NULL AND action_payload->'data'->'log'->>'action' = 'MeterValues')
+                  action = 'MeterValues'
+                  OR (action IS NULL AND action_payload->'data'->'log'->>'action' = 'MeterValues')
                 )
             AND {_ts_col()} BETWEEN {between}
-          ORDER BY asset_id, connector_id, transaction_id, {_ts_col()}
+          ORDER BY {station_expr}, connector_id, transaction_id, {_ts_col()}
         """
         params = list(stations) + [start_utc, end_utc]
         conn = get_conn()
