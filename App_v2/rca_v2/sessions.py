@@ -299,10 +299,29 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
 
     heat = pd.DataFrame({"start_ts": starts, "dur_min": durs}) if starts else pd.DataFrame(columns=["start_ts", "dur_min"])
 
-    # If we produced no sessions via transaction_id grouping (common on Supabase: no MeterValues
-    # and StartTransaction has no transaction_id), attempt Start/Stop pairing fallback.
-    if sess.empty:
+    # If we are operating on Supabase Start/StopTransaction fallback rows, the transaction_id
+    # grouping path can produce "stop-only" sessions (single row per tx) with 0 duration and 0 kWh.
+    # In that case (and also when sess is empty), prefer the Start/Stop pairing fallback.
+    has_start_stop = False
+    if "action" in df.columns:
+        actions = set(df["action"].dropna().unique().tolist())
+        has_start_stop = actions.issubset({"StartTransaction", "StopTransaction"}) and ("StartTransaction" in actions) and ("StopTransaction" in actions)
+
+    def _is_stop_only_sessions(s: pd.DataFrame) -> bool:
+        if s is None or s.empty:
+            return True
+        # Coerce numeric columns if present
+        dur = pd.to_numeric(s.get("Duration (min)", pd.Series(dtype=float)), errors="coerce")
+        kwh = pd.to_numeric(s.get("Energy Delivered (kWh)", pd.Series(dtype=float)), errors="coerce")
+        # If all durations are 0/NaN and all kWh are 0/NaN, these are not usable sessions
+        dur_ok = dur.fillna(0) > 0
+        kwh_ok = kwh.fillna(0) > 0
+        return not (dur_ok.any() or kwh_ok.any())
+
+    if sess.empty or (has_start_stop and _is_stop_only_sessions(sess)):
         sess2, heat2 = _build_sessions_from_start_stop(df, auth_df)
-        return sess2, heat2
+        # If fallback produced something, return it. Otherwise fall back to tx grouping output.
+        if sess2 is not None and not sess2.empty:
+            return sess2, heat2
 
     return sess, heat
