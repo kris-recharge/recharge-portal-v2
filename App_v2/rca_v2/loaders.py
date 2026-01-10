@@ -285,7 +285,7 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             sql2 = f"""
               SELECT asset_id AS station_id,
                      connector_id,
-                     COALESCE(transaction_id, action_payload->>'transactionId', action_payload->>'transaction_id') AS transaction_id,
+                     COALESCE(transaction_id::text, action_payload->>'transactionId', action_payload->>'transaction_id') AS transaction_id,
                      {_ts_col()} AS timestamp,
                      action,
                      action_payload
