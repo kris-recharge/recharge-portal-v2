@@ -168,6 +168,81 @@ def _parse_meter_values_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.concat(frames, ignore_index=True)
     return df
 
+
+# -----------------------------
+# Fallback: parse Start/StopTransaction rows for minimal meter values
+# -----------------------------
+def _parse_start_stop_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    """Create a minimal meter-values-like dataframe from Start/StopTransaction events.
+
+    This enables session building on Supabase when `MeterValues` is not available.
+    We emit two rows per transaction (start and stop) with energy_wh populated from
+    meterStart/meterStop when present.
+    """
+    out: List[Dict[str, Any]] = []
+
+    for r in rows or []:
+        station_id = r.get("station_id")
+        received_at = r.get("timestamp")
+        action = r.get("action")
+        payload = r.get("action_payload")
+
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = None
+
+        if not isinstance(payload, dict):
+            payload = {}
+
+        # Connector id can be in different places depending on platform
+        connector_id = (
+            payload.get("connectorId")
+            or _safe_get(payload, "connectorId")
+            or _safe_get(payload, "connector_id")
+        )
+
+        # Transaction id is often only in payload on Supabase
+        tx = (
+            r.get("transaction_id")
+            or payload.get("transactionId")
+            or payload.get("transaction_id")
+        )
+
+        # Meter start/stop (usually Wh)
+        meter_start = payload.get("meterStart")
+        meter_stop = payload.get("meterStop")
+
+        energy_wh = None
+        if action == "StartTransaction" and meter_start is not None:
+            energy_wh = _to_float(meter_start)
+        elif action == "StopTransaction" and meter_stop is not None:
+            energy_wh = _to_float(meter_stop)
+
+        out.append(
+            {
+                "station_id": station_id,
+                "connector_id": connector_id,
+                "transaction_id": str(tx) if tx is not None else None,
+                "timestamp": received_at,
+                "energy_wh": energy_wh,
+                # Other metrics are unknown in this fallback
+                "power_w": None,
+                "soc": None,
+                "voltage_v": None,
+                "amperage_import": None,
+                "amperage_offered": None,
+                "power_offered_w": None,
+            }
+        )
+
+    if not out:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(out)
+    return df
+
 # -----------------------------
 # Meter values + Authorize data
 # -----------------------------
@@ -203,7 +278,48 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             conn.close()
 
         if raw is None or raw.empty:
-            return pd.DataFrame()
+            # Fallback: some platforms do not emit MeterValues but do emit Start/StopTransaction.
+            # Build a minimal dataframe from those events so sessions can still be produced.
+            placeholders2 = _make_placeholders(len(stations))
+            between2 = _between_placeholders()
+            sql2 = f"""
+              SELECT asset_id AS station_id,
+                     connector_id,
+                     COALESCE(transaction_id, action_payload->>'transactionId', action_payload->>'transaction_id') AS transaction_id,
+                     {_ts_col()} AS timestamp,
+                     action,
+                     action_payload
+              FROM ocpp_events
+              WHERE asset_id IN ({placeholders2})
+                AND action IN ('StartTransaction','StopTransaction')
+                AND {_ts_col()} BETWEEN {between2}
+              ORDER BY asset_id, {_ts_col()}
+            """
+            params2 = list(stations) + [start_utc, end_utc]
+            conn2 = get_conn()
+            try:
+                raw2 = pd.read_sql(sql2, conn2, params=params2)
+            finally:
+                conn2.close()
+
+            if raw2 is None or raw2.empty:
+                return pd.DataFrame()
+
+            df2 = _parse_start_stop_rows(raw2.to_dict(orient='records'))
+            if not df2.empty:
+                df2["timestamp"] = pd.to_datetime(df2["timestamp"], utc=True, errors="coerce")
+                for c in [
+                    "power_w",
+                    "energy_wh",
+                    "soc",
+                    "amperage_offered",
+                    "amperage_import",
+                    "power_offered_w",
+                    "voltage_v",
+                ]:
+                    if c in df2.columns:
+                        df2[c] = pd.to_numeric(df2[c], errors="coerce")
+            return df2
 
         rows = raw.to_dict(orient="records")
         df = _parse_meter_values_rows(rows)
