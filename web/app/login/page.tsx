@@ -54,6 +54,12 @@ export default function LoginPage() {
     setError(null);
     setInfo(null);
 
+    if (!email) {
+      setError("Missing email address. Please start over.");
+      setStep("request");
+      return;
+    }
+    
     if (!code || code.length !== 6) {
       setError("Please enter the 6-digit code from your email.");
       return;
@@ -61,21 +67,29 @@ export default function LoginPage() {
 
     setLoading(true);
 
-    const { data, error } = await supabase.auth.verifyOtp({
-      email,
-      token: code,
-      type: "email",
-    });
-    setLoading(false);
+    try {
+      const resp = await fetch("/api/auth/verify-otp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, token: code }),
+      });
 
-    if (error) {
-      console.error("Supabase OTP verify error:", error);
-      setError(error.message || "Invalid code. Please try again.");
-      return;
+      const payload = await resp.json().catch(() => ({}));
+
+      if (!resp.ok) {
+        console.error("OTP verify-otp failed:", payload);
+        setError(payload?.error || "Invalid code. Please try again.");
+        setLoading(false);
+        return;
+      }
+
+      setLoading(false);
+      router.push("/app");
+    } catch (err) {
+      console.error("OTP verify-otp request error:", err);
+      setLoading(false);
+      setError("Network error verifying code. Please try again.");
     }
-
-    console.log("Supabase OTP login success:", data);
-    router.push("/app");
   };
 
   return (
@@ -194,4 +208,3 @@ export default function LoginPage() {
       </div>
     </main>
   );
-}
