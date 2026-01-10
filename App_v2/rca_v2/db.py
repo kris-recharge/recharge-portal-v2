@@ -95,7 +95,29 @@ def get_conn():
         # Convert URL -> libpq conninfo. If an IPv4 A record exists, we add
         # hostaddr=<ipv4> to avoid IPv6-first connection attempts.
         conninfo = _url_to_conninfo(db_url) if "://" in db_url else db_url
-        return psycopg.connect(conninfo)
+
+        # IMPORTANT: psycopg connections start a transaction implicitly.
+        # Our app is read-heavy; if any code path forgets to close a cursor/connection,
+        # Postgres can show "idle in transaction" and hold resources.
+        # Autocommit avoids that class of hangs for pure SELECT workloads.
+        conn = psycopg.connect(
+            conninfo,
+            connect_timeout=10,
+            application_name=os.getenv("APP_NAME", "app_v2"),
+        )
+        conn.autocommit = True
+
+        # Safety net: cap long-running statements (milliseconds).
+        # Can be overridden via env var if you intentionally run heavy queries.
+        try:
+            stmt_timeout_ms = int(os.getenv("PG_STATEMENT_TIMEOUT_MS", "15000"))
+            with conn.cursor() as cur:
+                cur.execute("SET statement_timeout = %s", (stmt_timeout_ms,))
+        except Exception:
+            # Don't block app startup if SET fails
+            pass
+
+        return conn
 
     # Local dev: SQLite
     conn = sqlite3.connect(SQLITE_PATH)
