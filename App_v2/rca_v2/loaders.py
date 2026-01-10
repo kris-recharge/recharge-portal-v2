@@ -365,6 +365,55 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             conn.close()
 
         if raw is None or raw.empty:
+            # Second attempt: MeterValues are often only present in the raw webhook table.
+            # The webhook wrapper looks like:
+            #   {"data":{"log":{"action":"MeterValues","payload":"{...OCPP...}"},"asset":{"id":"as_..."},"timestamp":"..."},"createdAt":"..."}
+            # We select the full wrapper JSON as action_payload so `_parse_meter_values_rows` can unwrap `data.log.payload`.
+            placeholders_mv = _make_placeholders(len(stations))
+            between_mv = _between_placeholders()
+            mv_station_expr = "(to_jsonb(t)->'data'->'asset'->>'id')"
+            mv_ts_expr = "COALESCE((to_jsonb(t)->>'createdAt')::timestamptz, (to_jsonb(t)->'data'->>'timestamp')::timestamptz)"
+
+            sql_mv = f"""
+              SELECT {mv_station_expr} AS station_id,
+                     NULL::int AS connector_id,
+                     NULL::text AS transaction_id,
+                     {mv_ts_expr} AS timestamp,
+                     to_jsonb(t) AS action_payload
+              FROM lynkwell_webhook_raw t
+              WHERE (to_jsonb(t)->'data'->'log'->>'action') = 'MeterValues'
+                AND {mv_station_expr} IN ({placeholders_mv})
+                AND {mv_ts_expr} BETWEEN {between_mv}
+              ORDER BY {mv_station_expr}, {mv_ts_expr}
+            """
+            params_mv = list(stations) + [start_utc, end_utc]
+            conn_mv = get_conn()
+            try:
+                raw_mv = pd.read_sql(sql_mv, conn_mv, params=params_mv)
+            finally:
+                conn_mv.close()
+
+            if raw_mv is not None and not raw_mv.empty:
+                rows_mv = raw_mv.to_dict(orient="records")
+                df_mv = _parse_meter_values_rows(rows_mv)
+                if not df_mv.empty and "action" not in df_mv.columns:
+                    df_mv["action"] = "MeterValues"
+                if not df_mv.empty:
+                    df_mv["timestamp"] = pd.to_datetime(df_mv["timestamp"], utc=True, errors="coerce")
+                    for c in [
+                        "power_w",
+                        "energy_wh",
+                        "soc",
+                        "amperage_offered",
+                        "amperage_import",
+                        "power_offered_w",
+                        "voltage_v",
+                    ]:
+                        if c in df_mv.columns:
+                            df_mv[c] = pd.to_numeric(df_mv[c], errors="coerce")
+                # Return MeterValues from webhook_raw; do NOT fall through to Start/Stop fallback.
+                return df_mv
+
             # Fallback: some platforms do not emit MeterValues but do emit Start/StopTransaction.
             # Build a minimal dataframe from those events so sessions can still be produced.
             placeholders2 = _make_placeholders(len(stations))
