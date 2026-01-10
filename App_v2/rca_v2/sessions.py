@@ -1,205 +1,132 @@
-import json
+import numpy as np
 import pandas as pd
-from typing import Any, Dict, List
+
 from .config import AK_TZ
 from .constants import EVSE_LOCATION, CONNECTOR_TYPE
 
-def _to_float(val):
+
+def _fmt_ak(dt, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Format a UTC timestamp into Alaska local time."""
+    ts = pd.to_datetime(dt, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return ""
     try:
-        return float(val)
+        return ts.tz_convert(AK_TZ).strftime(fmt)
     except Exception:
-        return None
-
-def _parse_meter_values_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    out = []
-    for r in rows:
-        station_id = r.get("station_id")
-        connector_id = r.get("connector_id")
-        transaction_id = r.get("transaction_id")
-        timestamp = r.get("timestamp")
-        action = r.get("action")
-        payload = r.get("action_payload")
-
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = None
-
-        energy_wh = None
-        power_w = None
-        soc = None
-        voltage_v = None
-        amperage_import = None
-        amperage_offered = None
-        power_offered_w = None
-
-        if isinstance(payload, dict):
-            # Parse nested meter values if present
-            meter_values = payload.get("meterValue") or payload.get("meterValues")
-            if meter_values and isinstance(meter_values, list):
-                # Take the last meter value reading in the list
-                last_mv = meter_values[-1]
-                if isinstance(last_mv, dict):
-                    energy_wh = _to_float(last_mv.get("energyActiveImportRegister"))
-                    power_w = _to_float(last_mv.get("powerActiveImport"))
-                    soc = _to_float(last_mv.get("stateOfCharge"))
-                    voltage_v = _to_float(last_mv.get("voltage"))
-                    amperage_import = _to_float(last_mv.get("currentImport"))
-                    amperage_offered = _to_float(last_mv.get("currentOffer"))
-                    power_offered_w = _to_float(last_mv.get("powerOffer"))
-
-        out.append(
-            {
-                "station_id": station_id,
-                "connector_id": connector_id,
-                "transaction_id": transaction_id,
-                "timestamp": timestamp,
-                "energy_wh": energy_wh,
-                "power_w": power_w,
-                "soc": soc,
-                "voltage_v": voltage_v,
-                "amperage_import": amperage_import,
-                "amperage_offered": amperage_offered,
-                "power_offered_w": power_offered_w,
-            }
-        )
-    df = pd.DataFrame(out)
-    return df
-
-
-def _parse_start_stop_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Build a minimal meter-values-like dataframe from StartTransaction/StopTransaction.
-
-    Enables session building even when MeterValues are not present.
-    Produces: station_id, connector_id, transaction_id, timestamp, energy_wh
-    and includes the other expected numeric columns as null.
-    """
-    out: List[Dict[str, Any]] = []
-
-    for r in rows:
-        station_id = r.get("station_id")
-        connector_id = r.get("connector_id")
-        transaction_id = r.get("transaction_id")
-        received_at = r.get("timestamp")
-        action = r.get("action")
-        payload = r.get("action_payload")
-
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = None
-
-        ts = received_at
-        if isinstance(payload, dict):
-            ts = payload.get("timestamp") or received_at
-
-        energy_wh = None
-        if isinstance(payload, dict):
-            if action == "StartTransaction":
-                energy_wh = _to_float(payload.get("meterStart"))
-            elif action == "StopTransaction":
-                energy_wh = _to_float(payload.get("meterStop"))
-
-        out.append(
-            {
-                "station_id": station_id,
-                "connector_id": connector_id,
-                "transaction_id": transaction_id,
-                "timestamp": ts,
-                "energy_wh": energy_wh,
-                "power_w": None,
-                "soc": None,
-                "voltage_v": None,
-                "amperage_import": None,
-                "amperage_offered": None,
-                "power_offered_w": None,
-            }
-        )
-
-    if not out:
-        return pd.DataFrame()
-
-    return pd.DataFrame(out)
-
-
-def load_meter_values(stations, start_utc, end_utc):
-    from .db import get_conn, using_postgres, _make_placeholders, _between_placeholders, _ts_col
-
-    # Supabase/Postgres: pull from ocpp_events. Prefer MeterValues; also pull
-    # Start/StopTransaction as a fallback so sessions can be built.
-    if using_postgres():
-        placeholders = _make_placeholders(len(stations))
-        between = _between_placeholders()
-        params = list(stations) + [start_utc, end_utc]
-
-        conn = get_conn()
+        # Fallback if ts lost tz info
         try:
-            df_parts: List[pd.DataFrame] = []
+            return ts.tz_localize("UTC").tz_convert(AK_TZ).strftime(fmt)
+        except Exception:
+            return ""
 
-            # 1) MeterValues (if present)
-            sql_mv = f"""
-              SELECT asset_id AS station_id,
-                     connector_id,
-                     transaction_id,
-                     {_ts_col()} AS timestamp,
-                     action,
-                     action_payload
-              FROM ocpp_events
-              WHERE asset_id IN ({placeholders})
-                AND action = 'MeterValues'
-                AND {_ts_col()} BETWEEN {between}
-              ORDER BY asset_id, connector_id, transaction_id, {_ts_col()}
-            """
-            raw_mv = pd.read_sql(sql_mv, conn, params=params)
-            if raw_mv is not None and not raw_mv.empty:
-                df_parts.append(_parse_meter_values_rows(raw_mv.to_dict(orient="records")))
 
-            # 2) Start/StopTransaction fallback (meterStart/meterStop)
-            sql_tx = f"""
-              SELECT asset_id AS station_id,
-                     connector_id,
-                     transaction_id,
-                     {_ts_col()} AS timestamp,
-                     action,
-                     action_payload
-              FROM ocpp_events
-              WHERE asset_id IN ({placeholders})
-                AND action IN ('StartTransaction','StopTransaction')
-                AND {_ts_col()} BETWEEN {between}
-              ORDER BY asset_id, connector_id, transaction_id, {_ts_col()}
-            """
-            raw_tx = pd.read_sql(sql_tx, conn, params=params)
-            if raw_tx is not None and not raw_tx.empty:
-                df_parts.append(_parse_start_stop_rows(raw_tx.to_dict(orient="records")))
+def _first_nonzero(series: pd.Series):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    nz = s[s > 0]
+    return (nz.iloc[0] if not nz.empty else (s.iloc[0] if not s.empty else None))
 
-        finally:
-            conn.close()
 
-        if not df_parts:
-            return pd.DataFrame()
+def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
+    """Build charging sessions and a simple heatmap frame.
 
-        df = pd.concat([d for d in df_parts if d is not None and not d.empty], ignore_index=True)
-        if df is None or df.empty:
-            return pd.DataFrame()
+    Expected df columns:
+      - station_id, connector_id, transaction_id, timestamp
+      - energy_wh (optional but enables kWh), power_w, soc, voltage_v, etc.
 
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    Expected auth columns:
+      - station_id, timestamp, id_tag
+    """
 
-        for c in [
-            "power_w",
-            "energy_wh",
-            "soc",
-            "amperage_offered",
-            "amperage_import",
-            "power_offered_w",
-            "voltage_v",
-        ]:
-            if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame(columns=["start_ts", "dur_min"])
 
-        df = df.sort_values(["station_id", "connector_id", "transaction_id", "timestamp"], kind="mergesort")
-        return df
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df = df.dropna(subset=["timestamp"])
 
-    # SQLite/legacy path below (not changed)
-    # ... (existing code not shown) ...
+    # Ensure IDs exist
+    for c in ["station_id", "connector_id", "transaction_id"]:
+        if c not in df.columns:
+            df[c] = None
+
+    df = df.sort_values(["station_id", "connector_id", "transaction_id", "timestamp"], kind="mergesort")
+
+    groups = df.groupby(["station_id", "connector_id", "transaction_id"], dropna=True, sort=False)
+
+    rows = []
+    starts = []
+    durs = []
+
+    auth_df = None
+    if auth is not None and not auth.empty:
+        auth_df = auth.copy()
+        auth_df["timestamp"] = pd.to_datetime(auth_df["timestamp"], utc=True, errors="coerce")
+        auth_df = auth_df.dropna(subset=["timestamp"]).sort_values(["station_id", "timestamp"], kind="mergesort")
+
+    for (sid, conn_id, tx), g in groups:
+        if tx is None or (not isinstance(tx, str) and pd.isna(tx)):
+            continue
+
+        ts_start = g["timestamp"].min()
+        ts_end = g["timestamp"].max()
+        if pd.isna(ts_start) or pd.isna(ts_end):
+            continue
+
+        dur_min = (ts_end - ts_start).total_seconds() / 60.0
+        starts.append(ts_start)
+        durs.append(dur_min)
+
+        # Power and energy
+        pmax = pd.to_numeric(g.get("power_w", pd.Series(dtype=float)), errors="coerce").max()
+        max_kw = (pmax / 1000.0) if pd.notna(pmax) else np.nan
+
+        e = pd.to_numeric(g.get("energy_wh", pd.Series(dtype=float)), errors="coerce")
+        e_min = e.min() if not e.empty else np.nan
+        e_max = e.max() if not e.empty else np.nan
+        e_kwh = (e_max - e_min) / 1000.0 if pd.notna(e_min) and pd.notna(e_max) and e_max >= e_min else np.nan
+
+        # SoC (optional)
+        soc_start = _first_nonzero(g.get("soc", pd.Series(dtype=float)))
+        soc_series = pd.to_numeric(g.get("soc", pd.Series(dtype=float)), errors="coerce").dropna()
+        soc_end = soc_series.iloc[-1] if not soc_series.empty else None
+
+        # Find an authorization close to start
+        id_tag = ""
+        if auth_df is not None:
+            a_sid = auth_df[auth_df["station_id"] == sid]
+            if not a_sid.empty:
+                mask = (a_sid["timestamp"] >= ts_start - pd.Timedelta(minutes=60)) & (a_sid["timestamp"] <= ts_start + pd.Timedelta(minutes=5))
+                cand = a_sid.loc[mask]
+                if not cand.empty:
+                    idx = (cand["timestamp"] - ts_start).abs().sort_values().index
+                    id_tag = str(cand.loc[idx[0], "id_tag"])
+
+        conn_num = pd.to_numeric(conn_id, errors="coerce")
+        conn_int = int(conn_num) if pd.notna(conn_num) else None
+
+        rows.append(
+            {
+                "Start Date/Time": _fmt_ak(ts_start),
+                "End Date/Time": _fmt_ak(ts_end),
+                "EVSE": EVSE_LOCATION.get(sid, ""),
+                "Connector #": conn_int,
+                "Connector Type": CONNECTOR_TYPE.get((sid, conn_int), ""),
+                "Max Power (kW)": round(max_kw, 2) if pd.notna(max_kw) else None,
+                "Energy Delivered (kWh)": round(e_kwh, 2) if pd.notna(e_kwh) else None,
+                "Duration (min)": round(dur_min, 2) if pd.notna(dur_min) else None,
+                "SoC Start": int(round(soc_start)) if pd.notna(soc_start) else None,
+                "SoC End": int(round(soc_end)) if soc_end is not None else None,
+                "ID Tag": id_tag,
+                "station_id": sid,
+                "transaction_id": tx,
+                "connector_id": conn_int,
+            }
+        )
+
+    sess = pd.DataFrame(rows)
+    if not sess.empty:
+        # Sort newest-first by end time string (already AK formatted). Keep stable tie-breakers.
+        sess = sess.sort_values(["End Date/Time", "station_id", "transaction_id"], ascending=[False, True, True], kind="mergesort")
+
+    heat = pd.DataFrame({"start_ts": starts, "dur_min": durs}) if starts else pd.DataFrame(columns=["start_ts", "dur_min"])
+    return sess, heat
