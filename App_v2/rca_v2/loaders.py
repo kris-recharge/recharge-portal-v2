@@ -105,7 +105,14 @@ def _extract_sampled_values(sampled: List[Dict[str, Any]]) -> Dict[str, Optional
 
 
 def _parse_meter_values_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Parse ocpp_events MeterValues rows into the schema expected by the app."""
+    """Parse ocpp_events MeterValues rows into the schema expected by the app.
+
+    Supports two formats:
+      1) Direct OCPP MeterValues payload stored as JSON in `action_payload` with key `meterValue`.
+      2) Webhook-wrapped payload where `action_payload.data.log.action == 'MeterValues'` and
+         `action_payload.data.log.payload` is a JSON string containing the OCPP payload.
+    """
+
     frames: List[pd.DataFrame] = []
 
     for r in rows:
@@ -122,24 +129,46 @@ def _parse_meter_values_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
             except Exception:
                 payload = None
 
-        meter_values = None
+        # Unwrap webhook-style payload if present
+        inner = None
         if isinstance(payload, dict):
-            meter_values = payload.get("meterValue")
+            log_action = _safe_get(payload, "data", "log", "action")
+            log_payload = _safe_get(payload, "data", "log", "payload")
+            if log_action == "MeterValues" and isinstance(log_payload, str):
+                try:
+                    inner = json.loads(log_payload)
+                except Exception:
+                    inner = None
+
+        mv_source = inner if isinstance(inner, dict) else (payload if isinstance(payload, dict) else None)
+
+        # Fill connector/tx from inner if DB columns are null
+        if mv_source is not None:
+            if connector_id in (None, ""):
+                connector_id = mv_source.get("connectorId")
+            if transaction_id in (None, ""):
+                transaction_id = mv_source.get("transactionId")
+
+        try:
+            connector_id = int(connector_id) if connector_id is not None else None
+        except Exception:
+            connector_id = None
+
+        if transaction_id is not None:
+            try:
+                transaction_id = str(transaction_id)
+            except Exception:
+                pass
+
+        meter_values = mv_source.get("meterValue") if mv_source is not None else None
 
         if not isinstance(meter_values, list) or not meter_values:
-            # still emit a single row at received_at
-            frames.append(
-                pd.DataFrame(
-                    [
-                        {
-                            "station_id": station_id,
-                            "connector_id": connector_id,
-                            "transaction_id": transaction_id,
-                            "timestamp": received_at,
-                        }
-                    ]
-                )
-            )
+            frames.append(pd.DataFrame([{
+                "station_id": station_id,
+                "connector_id": connector_id,
+                "transaction_id": transaction_id,
+                "timestamp": received_at,
+            }]))
             continue
 
         out_rows: List[Dict[str, Any]] = []
@@ -149,15 +178,13 @@ def _parse_meter_values_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
             ts = mv.get("timestamp") or received_at
             sampled = mv.get("sampledValue")
             metrics = _extract_sampled_values(sampled if isinstance(sampled, list) else [])
-            out_rows.append(
-                {
-                    "station_id": station_id,
-                    "connector_id": connector_id,
-                    "transaction_id": transaction_id,
-                    "timestamp": ts,
-                    **metrics,
-                }
-            )
+            out_rows.append({
+                "station_id": station_id,
+                "connector_id": connector_id,
+                "transaction_id": transaction_id,
+                "timestamp": ts,
+                **metrics,
+            })
 
         if out_rows:
             frames.append(pd.DataFrame(out_rows))
@@ -165,8 +192,7 @@ def _parse_meter_values_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
 
-    df = pd.concat(frames, ignore_index=True)
-    return df
+    return pd.concat(frames, ignore_index=True)
 
 
 # -----------------------------
@@ -323,7 +349,10 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
                  action_payload
           FROM ocpp_events
           WHERE asset_id IN ({placeholders})
-            AND action = 'MeterValues'
+            AND (
+                action = 'MeterValues'
+                OR (action IS NULL AND action_payload->'data'->'log'->>'action' = 'MeterValues')
+                )
             AND {_ts_col()} BETWEEN {between}
           ORDER BY asset_id, connector_id, transaction_id, {_ts_col()}
         """
@@ -379,6 +408,9 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
 
         rows = raw.to_dict(orient="records")
         df = _parse_meter_values_rows(rows)
+
+        if not df.empty and "action" not in df.columns:
+            df["action"] = "MeterValues"
 
         if not df.empty:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
