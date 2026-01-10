@@ -26,6 +26,175 @@ def _first_nonzero(series: pd.Series):
     return (nz.iloc[0] if not nz.empty else (s.iloc[0] if not s.empty else None))
 
 
+def _is_startlike(row: pd.Series) -> bool:
+    # StartTransaction fallback: connector_id known, tx missing, energy often 0
+    tx = row.get("transaction_id")
+    conn = row.get("connector_id")
+    if conn is None or (not isinstance(conn, str) and pd.isna(conn)):
+        return False
+    if tx is not None and not (not isinstance(tx, str) and pd.isna(tx)):
+        return False
+    return True
+
+
+def _is_stoplike(row: pd.Series) -> bool:
+    # StopTransaction fallback: tx present, connector_id often missing, energy often >0
+    tx = row.get("transaction_id")
+    if tx is None or (not isinstance(tx, str) and pd.isna(tx)):
+        return False
+    # If it only has one record in the whole tx and no power/soc, it is likely stop-only
+    return True
+
+
+def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | None):
+    """Pair Start/StopTransaction fallback rows into sessions.
+
+    Works when Start rows have connector_id but no transaction_id and Stop rows have transaction_id but no connector_id.
+    Pairing rule:
+      - Track open starts per station (and connector when available).
+      - On stop: close the most recent open start for that station (prefer same connector if stop provides it).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame(columns=["start_ts", "dur_min"])
+
+    d = df.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"], utc=True, errors="coerce")
+    d = d.dropna(subset=["timestamp"])
+
+    # Normalize ids
+    for c in ["station_id", "connector_id", "transaction_id"]:
+        if c not in d.columns:
+            d[c] = None
+
+    # Ensure connector_id numeric where possible
+    d["connector_id_num"] = pd.to_numeric(d["connector_id"], errors="coerce")
+
+    # Energy as numeric
+    if "energy_wh" in d.columns:
+        d["energy_wh_num"] = pd.to_numeric(d["energy_wh"], errors="coerce")
+    else:
+        d["energy_wh_num"] = np.nan
+
+    d = d.sort_values(["station_id", "timestamp"], kind="mergesort")
+
+    rows = []
+    starts = []
+    durs = []
+
+    # open starts: station_id -> list of dicts (stack) to support multiple connectors
+    open_starts: dict[str, list[dict]] = {}
+
+    def _pick_auth(sid: str, ts_start: pd.Timestamp) -> str:
+        if auth_df is None or auth_df.empty:
+            return ""
+        a_sid = auth_df[auth_df["station_id"] == sid]
+        if a_sid.empty:
+            return ""
+        mask = (a_sid["timestamp"] >= ts_start - pd.Timedelta(minutes=60)) & (a_sid["timestamp"] <= ts_start + pd.Timedelta(minutes=5))
+        cand = a_sid.loc[mask]
+        if cand.empty:
+            return ""
+        idx = (cand["timestamp"] - ts_start).abs().sort_values().index
+        return str(cand.loc[idx[0], "id_tag"])
+
+    for _, r in d.iterrows():
+        sid = r.get("station_id")
+        if sid is None or (not isinstance(sid, str) and pd.isna(sid)):
+            continue
+
+        if _is_startlike(r):
+            conn_int = None
+            cn = r.get("connector_id_num")
+            if pd.notna(cn):
+                conn_int = int(cn)
+            open_starts.setdefault(str(sid), []).append(
+                {
+                    "ts": r["timestamp"],
+                    "connector_id": conn_int,
+                    "energy_wh": r.get("energy_wh_num"),
+                    "row": r,
+                }
+            )
+            continue
+
+        if _is_stoplike(r):
+            stack = open_starts.get(str(sid), [])
+            if not stack:
+                continue
+
+            # If stop provides connector_id, prefer the most recent start on that connector
+            stop_conn = None
+            cn = r.get("connector_id_num")
+            if pd.notna(cn):
+                stop_conn = int(cn)
+
+            pick_idx = None
+            if stop_conn is not None:
+                for i in range(len(stack) - 1, -1, -1):
+                    if stack[i].get("connector_id") == stop_conn:
+                        pick_idx = i
+                        break
+            if pick_idx is None:
+                pick_idx = len(stack) - 1
+
+            start_rec = stack.pop(pick_idx)
+            if not stack:
+                open_starts.pop(str(sid), None)
+
+            ts_start = start_rec["ts"]
+            ts_end = r["timestamp"]
+            if pd.isna(ts_start) or pd.isna(ts_end) or ts_end < ts_start:
+                continue
+
+            dur_min = (ts_end - ts_start).total_seconds() / 60.0
+            starts.append(ts_start)
+            durs.append(dur_min)
+
+            # Energy: stop - start (start often 0)
+            e_start = start_rec.get("energy_wh")
+            e_stop = r.get("energy_wh_num")
+            e_kwh = np.nan
+            if pd.notna(e_stop):
+                if pd.notna(e_start) and e_stop >= e_start:
+                    e_kwh = (e_stop - e_start) / 1000.0
+                else:
+                    # If start is missing/NaN, treat stop as delivered since 0
+                    e_kwh = e_stop / 1000.0
+
+            tx = r.get("transaction_id")
+            tx = str(tx) if tx is not None and not (not isinstance(tx, str) and pd.isna(tx)) else ""
+
+            conn_int = start_rec.get("connector_id") if stop_conn is None else stop_conn
+
+            id_tag = _pick_auth(str(sid), ts_start)
+
+            rows.append(
+                {
+                    "Start Date/Time": _fmt_ak(ts_start),
+                    "End Date/Time": _fmt_ak(ts_end),
+                    "EVSE": EVSE_LOCATION.get(str(sid), ""),
+                    "Connector #": conn_int,
+                    "Connector Type": CONNECTOR_TYPE.get((str(sid), conn_int), ""),
+                    "Max Power (kW)": None,
+                    "Energy Delivered (kWh)": round(e_kwh, 2) if pd.notna(e_kwh) else None,
+                    "Duration (min)": round(dur_min, 2) if pd.notna(dur_min) else None,
+                    "SoC Start": None,
+                    "SoC End": None,
+                    "ID Tag": id_tag,
+                    "station_id": str(sid),
+                    "transaction_id": tx,
+                    "connector_id": conn_int,
+                }
+            )
+
+    sess = pd.DataFrame(rows)
+    if not sess.empty:
+        sess = sess.sort_values(["End Date/Time", "station_id", "transaction_id"], ascending=[False, True, True], kind="mergesort")
+
+    heat = pd.DataFrame({"start_ts": starts, "dur_min": durs}) if starts else pd.DataFrame(columns=["start_ts", "dur_min"])
+    return sess, heat
+
+
 def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
     """Build charging sessions and a simple heatmap frame.
 
@@ -51,17 +220,17 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
 
     df = df.sort_values(["station_id", "connector_id", "transaction_id", "timestamp"], kind="mergesort")
 
-    groups = df.groupby(["station_id", "connector_id", "transaction_id"], dropna=True, sort=False)
-
-    rows = []
-    starts = []
-    durs = []
-
     auth_df = None
     if auth is not None and not auth.empty:
         auth_df = auth.copy()
         auth_df["timestamp"] = pd.to_datetime(auth_df["timestamp"], utc=True, errors="coerce")
         auth_df = auth_df.dropna(subset=["timestamp"]).sort_values(["station_id", "timestamp"], kind="mergesort")
+
+    groups = df.groupby(["station_id", "connector_id", "transaction_id"], dropna=False, sort=False)
+
+    rows = []
+    starts = []
+    durs = []
 
     for (sid, conn_id, tx), g in groups:
         if tx is None or (not isinstance(tx, str) and pd.isna(tx)):
@@ -129,4 +298,11 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
         sess = sess.sort_values(["End Date/Time", "station_id", "transaction_id"], ascending=[False, True, True], kind="mergesort")
 
     heat = pd.DataFrame({"start_ts": starts, "dur_min": durs}) if starts else pd.DataFrame(columns=["start_ts", "dur_min"])
+
+    # If we produced no sessions via transaction_id grouping (common on Supabase: no MeterValues
+    # and StartTransaction has no transaction_id), attempt Start/Stop pairing fallback.
+    if sess.empty:
+        sess2, heat2 = _build_sessions_from_start_stop(df, auth_df)
+        return sess2, heat2
+
     return sess, heat
