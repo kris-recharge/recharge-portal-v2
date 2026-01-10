@@ -176,34 +176,76 @@ def _parse_start_stop_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     """Create a minimal meter-values-like dataframe from Start/StopTransaction events.
 
     This enables session building on Supabase when `MeterValues` is not available.
-    We emit two rows per transaction (start and stop) with energy_wh populated from
-    meterStart/meterStop when present.
-    """
-    out: List[Dict[str, Any]] = []
 
-    for r in rows or []:
+    Important Supabase nuance we've observed:
+      - StartTransaction often has connector_id + meterStart, but NO transaction_id
+      - StopTransaction often has transaction_id + meterStop, but NO connector_id
+
+    To make downstream session pairing possible, we:
+      - always emit an `action` column (StartTransaction / StopTransaction)
+      - infer missing StopTransaction connector_id by pairing it to the most recent
+        unmatched StartTransaction on the same station_id (stack/last-in-first-out)
+
+    The resulting dataframe keeps the schema the app expects while being explicit
+    enough for debugging and future improvements.
+    """
+
+    if not rows:
+        return pd.DataFrame()
+
+    # Normalize + sort rows so pairing is deterministic
+    norm: List[Dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        rr = dict(r)
+        # Ensure timestamp is a datetime for sorting; keep original string too if needed
+        ts = rr.get("timestamp")
+        rr["_ts_sort"] = pd.to_datetime(ts, utc=True, errors="coerce")
+        norm.append(rr)
+
+    # Sort: station_id, timestamp, Start before Stop when same timestamp
+    def _action_rank(a: Any) -> int:
+        return 0 if a == "StartTransaction" else 1
+
+    norm.sort(key=lambda x: (
+        str(x.get("station_id") or ""),
+        x.get("_ts_sort") if x.get("_ts_sort") is not pd.NaT else pd.Timestamp.min.tz_localize("UTC"),
+        _action_rank(x.get("action")),
+    ))
+
+    out: List[Dict[str, Any]] = []
+    # Track open starts per station (LIFO stack): [{"ts":..., "connector_id":...}, ...]
+    open_starts: Dict[str, List[Dict[str, Any]]] = {}
+
+    for r in norm:
         station_id = r.get("station_id")
         received_at = r.get("timestamp")
         action = r.get("action")
         payload = r.get("action_payload")
 
+        # payload may come in as dict (psycopg) or string
         if isinstance(payload, str):
             try:
                 payload = json.loads(payload)
             except Exception:
                 payload = None
-
         if not isinstance(payload, dict):
             payload = {}
 
         # Connector id can be in different places depending on platform
         connector_id = (
-            payload.get("connectorId")
+            r.get("connector_id")
+            or payload.get("connectorId")
             or _safe_get(payload, "connectorId")
             or _safe_get(payload, "connector_id")
         )
+        try:
+            connector_id = int(connector_id) if connector_id is not None else None
+        except Exception:
+            connector_id = None
 
-        # Transaction id is often only in payload on Supabase
+        # Transaction id may be in table column or inside the JSON
         tx = (
             r.get("transaction_id")
             or payload.get("transactionId")
@@ -220,12 +262,26 @@ def _parse_start_stop_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         elif action == "StopTransaction" and meter_stop is not None:
             energy_wh = _to_float(meter_stop)
 
+        # Pairing heuristic: infer missing Stop connector_id using the most recent
+        # unmatched Start on the same station.
+        if station_id is not None:
+            sid = str(station_id)
+            open_starts.setdefault(sid, [])
+
+            if action == "StartTransaction":
+                if connector_id is not None:
+                    open_starts[sid].append({"ts": r.get("_ts_sort"), "connector_id": connector_id})
+            elif action == "StopTransaction":
+                if connector_id is None and open_starts[sid]:
+                    connector_id = open_starts[sid].pop().get("connector_id")
+
         out.append(
             {
                 "station_id": station_id,
                 "connector_id": connector_id,
                 "transaction_id": str(tx) if tx is not None else None,
                 "timestamp": received_at,
+                "action": action,
                 "energy_wh": energy_wh,
                 # Other metrics are unknown in this fallback
                 "power_w": None,
@@ -237,10 +293,11 @@ def _parse_start_stop_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
             }
         )
 
-    if not out:
-        return pd.DataFrame()
-
     df = pd.DataFrame(out)
+    # Ensure timestamp is parseable/consistent
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
     return df
 
 # -----------------------------
@@ -307,7 +364,6 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
 
             df2 = _parse_start_stop_rows(raw2.to_dict(orient='records'))
             if not df2.empty:
-                df2["timestamp"] = pd.to_datetime(df2["timestamp"], utc=True, errors="coerce")
                 for c in [
                     "power_w",
                     "energy_wh",
