@@ -371,17 +371,17 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             # We select the full wrapper JSON as action_payload so `_parse_meter_values_rows` can unwrap `data.log.payload`.
             placeholders_mv = _make_placeholders(len(stations))
             between_mv = _between_placeholders()
-            mv_station_expr = "(to_jsonb(t)->'data'->'asset'->>'id')"
-            mv_ts_expr = "COALESCE((to_jsonb(t)->>'createdAt')::timestamptz, (to_jsonb(t)->'data'->>'timestamp')::timestamptz)"
+            mv_station_expr = "(t.payload->'data'->'asset'->>'id')"
+            mv_ts_expr = "COALESCE((t.payload->>'createdAt')::timestamptz, (t.payload->'data'->>'timestamp')::timestamptz, t.received_at)"
 
             sql_mv = f"""
               SELECT {mv_station_expr} AS station_id,
                      NULL::int AS connector_id,
                      NULL::text AS transaction_id,
                      {mv_ts_expr} AS timestamp,
-                     to_jsonb(t) AS action_payload
+                     t.payload AS action_payload
               FROM lynkwell_webhook_raw t
-              WHERE (to_jsonb(t)->'data'->'log'->>'action') = 'MeterValues'
+              WHERE (t.payload->'data'->'log'->>'action') = 'MeterValues'
                 AND {mv_station_expr} IN ({placeholders_mv})
                 AND {mv_ts_expr} BETWEEN {between_mv}
               ORDER BY {mv_station_expr}, {mv_ts_expr}
