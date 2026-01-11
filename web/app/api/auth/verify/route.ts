@@ -3,7 +3,7 @@ import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 
 export async function GET(req: Request) {
-  const cookieStore = cookies();
+  const cookieStore = await cookies();
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -24,13 +24,10 @@ export async function GET(req: Request) {
 
   const { data } = await supabase.auth.getUser();
 
-  // If not authenticated, redirect to /login (so forward_auth results in a browser redirect)
   if (!data?.user) {
     const url = new URL("/login", req.url);
     return NextResponse.redirect(url, 302);
   }
 
-  // Authenticated
   return NextResponse.json({ ok: true }, { status: 200 });
 }
-
