@@ -1,0 +1,44 @@
+dashboard.rechargealaska.net {
+
+  encode gzip
+
+  # --- Next.js (login + api) ---
+  handle /login* {
+    reverse_proxy web:3000
+  }
+
+  handle /api/* {
+    reverse_proxy web:3000
+  }
+
+  # --- Streamlit assets (protected) ---
+  handle /_stcore/* {
+    forward_auth web:3000 {
+      uri /api/auth/verify
+      copy_headers Cookie Authorization
+    }
+    reverse_proxy app:8501
+  }
+
+  handle /static/* {
+    forward_auth web:3000 {
+      uri /api/auth/verify
+      copy_headers Cookie Authorization
+    }
+    reverse_proxy app:8501
+  }
+
+  # --- Streamlit app protected behind forward_auth ---
+  handle_path /app* {
+    forward_auth web:3000 {
+      uri /api/auth/verify
+      copy_headers Cookie Authorization
+    }
+    reverse_proxy app:8501
+  }
+
+  # Everything else -> Next.js
+  handle {
+    reverse_proxy web:3000
+  }
+}
