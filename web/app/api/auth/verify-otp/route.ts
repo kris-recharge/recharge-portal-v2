@@ -12,8 +12,11 @@ export async function POST(req: Request) {
     );
   }
 
-  // Next 15/16: cookies() is async
+  // Next 16: cookies() is async
   const cookieStore = await cookies();
+
+  // IMPORTANT: set cookies on the response object
+  const res = NextResponse.json({ ok: true }, { status: 200 });
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -21,13 +24,12 @@ export async function POST(req: Request) {
     {
       cookies: {
         getAll() {
-          // cookieStore is ReadonlyRequestCookies; in practice getAll exists at runtime.
-          // Type differences across Next versions can be annoying, so we cast.
           return (cookieStore as any).getAll();
         },
         setAll(cookiesToSet) {
           for (const { name, value, options } of cookiesToSet) {
-            (cookieStore as any).set(name, value, options);
+            // write cookies onto response
+            res.cookies.set(name, value, options);
           }
         },
       },
@@ -41,11 +43,8 @@ export async function POST(req: Request) {
   });
 
   if (error) {
-    return NextResponse.json(
-      { ok: false, error: error.message },
-      { status: 401 }
-    );
+    return NextResponse.json({ ok: false, error: error.message }, { status: 401 });
   }
 
-  return NextResponse.json({ ok: true }, { status: 200 });
+  return res;
 }
