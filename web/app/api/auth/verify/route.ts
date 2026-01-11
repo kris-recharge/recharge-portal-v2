@@ -3,7 +3,7 @@ import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 
 export async function GET() {
-  const cookieStore = cookies();
+  const cookieStore = await cookies();
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -15,7 +15,7 @@ export async function GET() {
         },
         setAll(cookiesToSet) {
           for (const { name, value, options } of cookiesToSet) {
-            cookieStore.set(name, value, options);
+            (cookieStore as any).set(name, value, options);
           }
         },
       },
@@ -28,5 +28,5 @@ export async function GET() {
     return NextResponse.json({ ok: false }, { status: 401 });
   }
 
-  return NextResponse.json({ ok: true }, { status: 200 });
+  return NextResponse.json({ ok: true, user_id: data.user.id }, { status: 200 });
 }
