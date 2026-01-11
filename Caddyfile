@@ -37,6 +37,11 @@ dashboard.rechargealaska.net {
     reverse_proxy app:8501
   }
 
+  handle_errors {
+    @unauth expression {http.error.status_code} == 401
+    redir @unauth /login 302
+  }
+
   # Everything else -> Next.js
   handle {
     reverse_proxy web:3000

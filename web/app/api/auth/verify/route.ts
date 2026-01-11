@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 
-export async function GET(req: Request) {
+export async function GET() {
   const cookieStore = await cookies();
 
   const supabase = createServerClient(
@@ -22,11 +22,10 @@ export async function GET(req: Request) {
     }
   );
 
-  const { data } = await supabase.auth.getUser();
+  const { data, error } = await supabase.auth.getUser();
 
-  if (!data?.user) {
-    const url = new URL("/login", req.url);
-    return NextResponse.redirect(url, 302);
+  if (error || !data?.user) {
+    return NextResponse.json({ ok: false }, { status: 401 });
   }
 
   return NextResponse.json({ ok: true }, { status: 200 });
