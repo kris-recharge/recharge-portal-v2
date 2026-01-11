@@ -2,7 +2,7 @@ dashboard.rechargealaska.net {
 
   encode gzip
 
-  # --- Next.js (login + api) ---
+  # --- Next.js (UI + auth + api) ---
   handle /login* {
     reverse_proxy web:3000
   }
@@ -11,38 +11,30 @@ dashboard.rechargealaska.net {
     reverse_proxy web:3000
   }
 
-  # --- Streamlit assets (protected) ---
+  # /app is now a Next.js route (not Streamlit)
+  handle /app* {
+    reverse_proxy web:3000
+  }
+
+  # --- Streamlit behind auth, mounted at /st ---
+  handle /st* {
+    forward_auth web:3000 {
+      uri /api/auth/verify
+      copy_headers Cookie
+    }
+    reverse_proxy app:8501
+  }
+
+  # Streamlit’s static assets also need auth
   handle /_stcore/* {
     forward_auth web:3000 {
       uri /api/auth/verify
-      copy_headers Cookie Authorization
+      copy_headers Cookie
     }
     reverse_proxy app:8501
   }
 
-  handle /static/* {
-    forward_auth web:3000 {
-      uri /api/auth/verify
-      copy_headers Cookie Authorization
-    }
-    reverse_proxy app:8501
-  }
-
-  # --- Streamlit app protected behind forward_auth ---
-  handle_path /app* {
-    forward_auth web:3000 {
-      uri /api/auth/verify
-      copy_headers Cookie Authorization
-    }
-    reverse_proxy app:8501
-  }
-
-  handle_errors {
-    @unauth expression {http.error.status_code} == 401
-    redir @unauth /login 302
-  }
-
-  # Everything else -> Next.js
+  # Root goes to Next.js (your Next / page can redirect to /app)
   handle {
     reverse_proxy web:3000
   }

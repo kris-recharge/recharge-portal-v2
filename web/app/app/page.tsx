@@ -1,9 +1,8 @@
 import { redirect } from "next/navigation";
-import { cookies } from "next/headers";
 import { createServerClient } from "@supabase/ssr";
+import { cookies } from "next/headers";
 
 export default async function AppPage() {
-  // Next 16 typing: treat cookies() as async + cast getAll/set for stability
   const cookieStore = await cookies();
 
   const supabase = createServerClient(
@@ -12,29 +11,29 @@ export default async function AppPage() {
     {
       cookies: {
         getAll() {
-          return (cookieStore as any).getAll();
+          return cookieStore.getAll();
         },
         setAll(cookiesToSet) {
           for (const { name, value, options } of cookiesToSet) {
-            (cookieStore as any).set(name, value, options);
+            cookieStore.set(name, value, options);
           }
         },
       },
     }
   );
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  const { data } = await supabase.auth.getUser();
 
-  if (!user) {
+  if (!data?.user) {
     redirect("/login");
   }
 
   return (
-    <main style={{ padding: 24 }}>
-      <h1>ReCharge Alaska Dashboard</h1>
-      <p>Logged in as {user.email}</p>
-    </main>
+    <div style={{ width: "100vw", height: "100vh", margin: 0, padding: 0 }}>
+      <iframe
+        src="/st"
+        style={{ width: "100%", height: "100%", border: "none" }}
+      />
+    </div>
   );
 }
