@@ -2,6 +2,14 @@ dashboard.rechargealaska.net {
 
   encode gzip
 
+  # --- Matchers ---
+  @root path /
+
+  # --- Root redirect to /login ---
+  handle @root {
+    redir /login 302
+  }
+
   # --- Next.js (UI + auth + api) ---
   handle /login* {
     reverse_proxy web:3000
@@ -29,17 +37,13 @@ dashboard.rechargealaska.net {
     reverse_proxy app:8501
   }
 
+  # Streamlit’s static assets also need auth
   handle /_stcore/* {
     forward_auth web:3000 {
       uri /api/auth/verify
       copy_headers Cookie
     }
     reverse_proxy app:8501
-  }
-
-  # Root redirect to /login
-  handle = / {
-    redir /login 302
   }
 
   # Everything else -> Next
