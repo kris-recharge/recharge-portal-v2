@@ -33,24 +33,16 @@ dashboard.rechargealaska.net {
       header_up Cookie {http.request.header.Cookie}
     }
 
-  reverse_proxy 127.0.0.1:8501 {
+    reverse_proxy 127.0.0.1:8501 {
       header_up Host {http.request.host}
       header_up X-Forwarded-Prefix /st
       header_up Cookie {http.request.header.Cookie}
     }
   }
 
+  # Safety shim: if Streamlit ever emits root /_stcore/* URLs, redirect them under /st
   handle /_stcore/* {
-    forward_auth 127.0.0.1:3000 {
-      uri /api/auth/verify
-      header_up Cookie {http.request.header.Cookie}
-    }
-
-  reverse_proxy 127.0.0.1:8501 {
-      header_up Host {http.request.host}
-      header_up X-Forwarded-Prefix /st
-      header_up Cookie {http.request.header.Cookie}
-    }
+    redir /st{uri} 302
   }
 
   # Everything else -> Next
