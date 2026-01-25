@@ -28,20 +28,29 @@ dashboard.rechargealaska.net {
 
   # --- Streamlit behind auth, mounted at /st ---
   handle /st* {
-    forward_auth 127.0.0.1:3000 {
+    forward_auth web:3000 {
       uri /api/auth/verify
-      header_up Cookie {http.request.header.Cookie}
     }
-    reverse_proxy 127.0.0.1:8501
+
+  reverse_proxy app:8501 {
+    header_up Host {http.request.host}
+    header_up X-Forwarded-Proto {scheme}
+    header_up X-Forwarded-Prefix /st
+    header_up Cookie {http.request.header.Cookie}
+    }
   }
 
-  # Streamlit’s static assets also need auth
   handle /_stcore/* {
-    forward_auth 127.0.0.1:3000 {
+    forward_auth web:3000 {
       uri /api/auth/verify
-      header_up Cookie {http.request.header.Cookie}
     }
-    reverse_proxy 127.0.0.1:8501
+
+  reverse_proxy app:8501 {
+    header_up Host {http.request.host}
+    header_up X-Forwarded-Proto {scheme}
+    header_up X-Forwarded-Prefix /st
+    header_up Cookie {http.request.header.Cookie}
+    }
   }
 
   # Everything else -> Next
