@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Image from "next/image";
 import { supabase } from "@/lib/supabaseClient";
 
@@ -9,6 +9,10 @@ type Step = "request" | "verify";
 
 export default function LoginPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+
+  // If user was redirected here from a protected route, honor it.
+  const nextPath = searchParams.get("next") || "/app";
 
   const [step, setStep] = useState<Step>("request");
   const [email, setEmail] = useState("");
@@ -48,7 +52,7 @@ export default function LoginPage() {
     setStep("verify");
   };
 
-  // Step 2: verify OTP and create session
+  // Step 2: verify OTP and create session (cookie-based SSR session)
   const handleVerifyCode = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError(null);
@@ -59,7 +63,7 @@ export default function LoginPage() {
       setStep("request");
       return;
     }
-    
+
     if (!code || code.length !== 6) {
       setError("Please enter the 6-digit code from your email.");
       return;
@@ -68,9 +72,11 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
+      // 1) Verify OTP and mint httpOnly cookies
       const resp = await fetch("/api/auth/verify-otp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "include",
         body: JSON.stringify({ email, token: code }),
       });
 
@@ -83,8 +89,24 @@ export default function LoginPage() {
         return;
       }
 
+      // 2) Confirm session cookie actually “sticks” by hitting the auth gate
+      const gate = await fetch("/api/auth/verify", {
+        method: "GET",
+        credentials: "include",
+      });
+
+      if (!gate.ok) {
+        setError(
+          "Authenticated, but the session cookie was not established. Please try again."
+        );
+        setLoading(false);
+        return;
+      }
+
       setLoading(false);
-      router.push("/app");
+
+      // 3) Go where we intended (default /app)
+      router.push(nextPath);
     } catch (err) {
       console.error("OTP verify-otp request error:", err);
       setLoading(false);
