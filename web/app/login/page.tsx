@@ -1,19 +1,20 @@
 "use client";
 
 import { FormEvent, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import Image from "next/image";
 import { supabase } from "@/lib/supabaseClient";
 
 type Step = "request" | "verify";
 
+function getNextPath(): string {
+  if (typeof window === "undefined") return "/app";
+  const sp = new URLSearchParams(window.location.search);
+  return sp.get("next") || "/app";
+}
+
 export default function LoginPage() {
   const router = useRouter();
-  const searchParams = useSearchParams();
-
-  // If user was redirected here from a protected route, honor it.
-  const nextPath = searchParams.get("next") || "/app";
-
   const [step, setStep] = useState<Step>("request");
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
@@ -52,7 +53,7 @@ export default function LoginPage() {
     setStep("verify");
   };
 
-  // Step 2: verify OTP and create session (cookie-based SSR session)
+  // Step 2: verify OTP and create session
   const handleVerifyCode = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError(null);
@@ -72,7 +73,6 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      // 1) Verify OTP and mint httpOnly cookies
       const resp = await fetch("/api/auth/verify-otp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -89,7 +89,7 @@ export default function LoginPage() {
         return;
       }
 
-      // 2) Confirm session cookie actually “sticks” by hitting the auth gate
+      // Confirm session cookie actually exists by hitting the auth gate
       const gate = await fetch("/api/auth/verify", {
         method: "GET",
         credentials: "include",
@@ -97,16 +97,14 @@ export default function LoginPage() {
 
       if (!gate.ok) {
         setError(
-          "Authenticated, but the session cookie was not established. Please try again."
+          "Authenticated, but session cookie was not established. Please try again."
         );
         setLoading(false);
         return;
       }
 
       setLoading(false);
-
-      // 3) Go where we intended (default /app)
-      router.push(nextPath);
+      router.push(getNextPath());
     } catch (err) {
       console.error("OTP verify-otp request error:", err);
       setLoading(false);
@@ -117,7 +115,6 @@ export default function LoginPage() {
   return (
     <main className="min-h-screen flex items-center justify-center bg-slate-950">
       <div className="w-full max-w-md rounded-xl bg-slate-900 shadow-xl border border-slate-800 p-6 space-y-6">
-        {/* Logo + heading */}
         <div className="flex flex-col items-center space-y-2">
           <div className="relative h-16 w-28">
             <Image
@@ -151,12 +148,8 @@ export default function LoginPage() {
               />
             </div>
 
-            {error && (
-              <p className="text-sm text-red-400 text-center">{error}</p>
-            )}
-            {info && (
-              <p className="text-sm text-emerald-400 text-center">{info}</p>
-            )}
+            {error && <p className="text-sm text-red-400 text-center">{error}</p>}
+            {info && <p className="text-sm text-emerald-400 text-center">{info}</p>}
 
             <button
               type="submit"
@@ -198,12 +191,8 @@ export default function LoginPage() {
               />
             </div>
 
-            {error && (
-              <p className="text-sm text-red-400 text-center">{error}</p>
-            )}
-            {info && (
-              <p className="text-sm text-emerald-400 text-center">{info}</p>
-            )}
+            {error && <p className="text-sm text-red-400 text-center">{error}</p>}
+            {info && <p className="text-sm text-emerald-400 text-center">{info}</p>}
 
             <button
               type="submit"
