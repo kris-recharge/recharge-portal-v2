@@ -4,7 +4,6 @@ dashboard.rechargealaska.net {
   @root path /
   redir @root /login 302
 
-  # --- Next.js (UI + auth + api) ---
   handle /login* {
     reverse_proxy 127.0.0.1:3000
   }
@@ -13,7 +12,6 @@ dashboard.rechargealaska.net {
     reverse_proxy 127.0.0.1:3000
   }
 
-  # Protect /app via Next.js auth verify endpoint
   handle /app* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
@@ -22,21 +20,19 @@ dashboard.rechargealaska.net {
     reverse_proxy 127.0.0.1:3000
   }
 
-  # ---- Streamlit under /st ----
-  handle_path /st* {
+  handle /st* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
       copy_headers Cookie
     }
 
     reverse_proxy 127.0.0.1:8501 {
-      # keep host so streamlit generates correct absolute URLs if needed
       header_up Host {http.request.host}
       header_up X-Forwarded-Proto {scheme}
+      header_up X-Forwarded-Prefix /st
     }
   }
 
-  # Everything else -> Next
   handle {
     reverse_proxy 127.0.0.1:3000
   }
