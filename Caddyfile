@@ -22,16 +22,17 @@ dashboard.rechargealaska.net {
     reverse_proxy 127.0.0.1:3000
   }
 
-  # --- Streamlit behind auth, mounted at /st ---
-  handle /st* {
+  # ---- Streamlit under /st ----
+  handle_path /st* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
       copy_headers Cookie
     }
 
     reverse_proxy 127.0.0.1:8501 {
+      # keep host so streamlit generates correct absolute URLs if needed
       header_up Host {http.request.host}
-      header_up X-Forwarded-Prefix /st
+      header_up X-Forwarded-Proto {scheme}
     }
   }
 
