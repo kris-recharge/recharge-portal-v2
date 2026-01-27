@@ -1,51 +1,79 @@
 dashboard.rechargealaska.net {
-  encode gzip
+          encode gzip
 
-  @root path /
-  redir @root /login 302
+        @root path /
+        redir @root /login 302
 
-  handle /login* {
-    reverse_proxy 127.0.0.1:3000
-  }
+        # ---- Next.js (web) ----
+        handle /login* {
+                reverse_proxy 127.0.0.1:3000 {
+                        header_up X-Forwarded-Proto https
+                        header_up X-Forwarded-Host {host}
+                }
+        }
 
-  handle /api/* {
-    reverse_proxy 127.0.0.1:3000
-  }
+        @app_root path /app /app/
+        handle @app_root {
+          redir /st 302
+        }
 
-  handle /app* {
-    forward_auth 127.0.0.1:3000 {
-      uri /api/auth/verify
-      # Send the browser cookie to the auth endpoint
-      header_up Cookie {http.request.header.Cookie}
-      # Optional: forward original URL info (useful if you log it)
-      header_up X-Forwarded-Uri {http.request.uri}
-      # If your auth endpoint returns updated cookies, pass them back to the client
-      copy_headers Set-Cookie
-    }
-    reverse_proxy 127.0.0.1:3000
-  }
+        handle /api/* {
+                reverse_proxy 127.0.0.1:3000 {
+                        header_up X-Forwarded-Proto https
+                        header_up X-Forwarded-Host {host}
+                }
+        }
 
-  handle /st* {
-    forward_auth 127.0.0.1:3000 {
-      uri /api/auth/verify
-      # Send the browser cookie to the auth endpoint (this is the critical fix)
-      header_up Cookie {http.request.header.Cookie}
-      header_up X-Forwarded-Uri {http.request.uri}
-      copy_headers Set-Cookie
-    }
+        handle /app* {
+                forward_auth 127.0.0.1:3000 {
+                        uri /api/auth/verify
+                        copy_headers Cookie
+                }
+                reverse_proxy 127.0.0.1:3000 {
+                        header_up X-Forwarded-Proto https
+                        header_up X-Forwarded-Host {host}
+                }
+        }
 
-    reverse_proxy 127.0.0.1:8501 {
-      transport http {
-        versions 1.1
-      }
-      header_up Host {http.request.host}
-      header_up X-Forwarded-Proto {scheme}
-      header_up X-Forwarded-Host {host}
-      header_up X-Forwarded-Prefix /st
-    }
-  }
+        # ---- Streamlit (app) ----
 
-  handle {
-    reverse_proxy 127.0.0.1:3000
-  }
+        # Websocket endpoint MUST be able to upgrade cleanly.
+        # We rely on the fact that /st page load is auth-gated; the websocket is useless wit>
+        handle /st/_stcore/stream {
+                reverse_proxy 127.0.0.1:8501 {
+                        transport http {
+                                versions 1.1
+                        }
+                        header_up Host {host}
+                        header_up X-Forwarded-Proto https
+                        header_up X-Forwarded-Host {host}
+                        header_up X-Forwarded-Prefix /st
+                }
+        }
+
+        # Everything else under /st stays behind your auth check
+        handle /st* {
+                forward_auth 127.0.0.1:3000 {
+                        uri /api/auth/verify
+                        copy_headers Cookie
+                }
+
+                reverse_proxy 127.0.0.1:8501 {
+                        transport http {
+                                versions 1.1
+                        }
+                        header_up Host {host}
+                        header_up X-Forwarded-Proto https
+                        header_up X-Forwarded-Host {host}
+                        header_up X-Forwarded-Prefix /st
+                }
+        }
+
+        # Default: send to Next
+        handle {
+                reverse_proxy 127.0.0.1:3000 {
+                        header_up X-Forwarded-Proto https
+                        header_up X-Forwarded-Host {host}
+                }
+        }
 }
