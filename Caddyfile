@@ -15,7 +15,12 @@ dashboard.rechargealaska.net {
   handle /app* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
-      copy_headers Cookie
+      # Send the browser cookie to the auth endpoint
+      header_up Cookie {http.request.header.Cookie}
+      # Optional: forward original URL info (useful if you log it)
+      header_up X-Forwarded-Uri {http.request.uri}
+      # If your auth endpoint returns updated cookies, pass them back to the client
+      copy_headers Set-Cookie
     }
     reverse_proxy 127.0.0.1:3000
   }
@@ -23,12 +28,19 @@ dashboard.rechargealaska.net {
   handle /st* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
-      copy_headers Cookie
+      # Send the browser cookie to the auth endpoint (this is the critical fix)
+      header_up Cookie {http.request.header.Cookie}
+      header_up X-Forwarded-Uri {http.request.uri}
+      copy_headers Set-Cookie
     }
 
     reverse_proxy 127.0.0.1:8501 {
+      transport http {
+        versions 1.1
+      }
       header_up Host {http.request.host}
       header_up X-Forwarded-Proto {scheme}
+      header_up X-Forwarded-Host {host}
       header_up X-Forwarded-Prefix /st
     }
   }
