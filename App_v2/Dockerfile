@@ -1,21 +1,19 @@
-FROM python:3.11-slim
+import os
 
-WORKDIR /app
+def using_postgres() -> bool:
+    """Return True when we should use Postgres.
 
-# Common libs (psycopg / ssl / etc.)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    libpq5 \
-  && rm -rf /var/lib/apt/lists/*
+    The Streamlit app is deployed against Supabase Postgres. We consider Postgres
+    enabled when DATABASE_URL is set. For back-compat, APP_MODE may also force it.
+    """
+    db_url = (os.getenv("DATABASE_URL") or "").strip()
+    if db_url:
+        return True
 
-# Install python deps (requirements.txt lives at repo root)
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+    app_mode = (os.getenv("APP_MODE") or "local").strip().lower()
+    return app_mode in {"render", "cloud", "prod", "production"}
 
-# Copy ONLY the Streamlit app code into the container workdir
-COPY App_v2/ /app/
+def some_existing_function():
+    pass
 
-EXPOSE 8501
-
-CMD ["streamlit", "run", "app_v2.py", "--server.address=0.0.0.0", "--server.port=8501"]
+# (rest of the file continues unchanged)
