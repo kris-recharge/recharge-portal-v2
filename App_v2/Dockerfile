@@ -9,13 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
   && rm -rf /var/lib/apt/lists/*
 
-# Install python deps
-# (Assumes App_v2/requirements.txt exists)
+# Install python deps (requirements.txt lives at repo root)
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy the Streamlit app
-COPY . /app
+# Copy ONLY the Streamlit app code into the container workdir
+COPY App_v2/ /app/
 
 EXPOSE 8501
 
