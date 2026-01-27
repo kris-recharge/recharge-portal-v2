@@ -1,19 +1,30 @@
-import os
+# ReCharge Alaska Portal v2 - Streamlit (App_v2)
+# NOTE: This Dockerfile is intended to be built from the REPO ROOT as build context,
+# so it can copy the root-level requirements.txt and the App_v2/ source tree.
 
-def using_postgres() -> bool:
-    """Return True when we should use Postgres.
+FROM python:3.11-slim
 
-    The Streamlit app is deployed against Supabase Postgres. We consider Postgres
-    enabled when DATABASE_URL is set. For back-compat, APP_MODE may also force it.
-    """
-    db_url = (os.getenv("DATABASE_URL") or "").strip()
-    if db_url:
-        return True
+# Prevents Python from buffering stdout/stderr (useful for docker logs)
+ENV PYTHONUNBUFFERED=1
 
-    app_mode = (os.getenv("APP_MODE") or "local").strip().lower()
-    return app_mode in {"render", "cloud", "prod", "production"}
+WORKDIR /app
 
-def some_existing_function():
-    pass
+# System deps (psycopg may need libpq at runtime; build tools help with any compiled deps)
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+     build-essential \
+     gcc \
+     libpq-dev \
+     curl \
+  && rm -rf /var/lib/apt/lists/*
 
-# (rest of the file continues unchanged)
+# Install python deps (expects requirements.txt at repo root)
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Copy Streamlit app source
+COPY App_v2/ /app/
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "app_v2.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--browser.gatherUsageStats=false", "--server.baseUrlPath=st", "--server.enableCORS=false", "--server.enableXsrfProtection=false"]
