@@ -1,4 +1,3 @@
-
 import os
 import json
 
@@ -8,6 +7,17 @@ import numpy as np
 from io import BytesIO
 from datetime import datetime
 import requests
+
+# ---------------- Sidebar: Account / Logout ----------------
+
+with st.sidebar:
+    st.markdown("### Account")
+    st.markdown(
+        "[Log out](/api/auth/logout)",
+        help="Sign out of the ReCharge Portal",
+    )
+
+# -----------------------------------------------------------
 
 # Optional soft gate: require a shared embed token when running behind a portal.
 REQUIRED_EMBED_ACCESS_TOKEN = os.getenv("EMBED_ACCESS_TOKEN")
@@ -47,7 +57,7 @@ def check_embed_token() -> None:
         st.error("Access to this dashboard is restricted.")
         st.markdown(
             "Please sign in via the ReCharge Portal:\n\n"
-            "[Open ReCharge Portal](https://recharge-portal-next.onrender.com)"
+            "[Open ReCharge Portal](https://dashboard.rechargealaska.net/login)"
         )
         st.stop()
 
