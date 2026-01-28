@@ -30,7 +30,14 @@ dashboard.rechargealaska.net {
   handle /app/_stcore/stream {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
-      copy_headers Cookie
+
+      # IMPORTANT: forward the browser cookies to the auth gateway
+      # so it can validate the session.
+      header_up Cookie {http.request.header.Cookie}
+
+      # Helpful context for the auth endpoint.
+      header_up X-Forwarded-Method {method}
+      header_up X-Forwarded-Uri {uri}
     }
 
     reverse_proxy 127.0.0.1:8501 {
@@ -48,7 +55,14 @@ dashboard.rechargealaska.net {
   handle /app* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
-      copy_headers Cookie
+
+      # IMPORTANT: forward the browser cookies to the auth gateway
+      # so it can validate the session.
+      header_up Cookie {http.request.header.Cookie}
+
+      # Helpful context for the auth endpoint.
+      header_up X-Forwarded-Method {method}
+      header_up X-Forwarded-Uri {uri}
     }
 
     reverse_proxy 127.0.0.1:8501 {
