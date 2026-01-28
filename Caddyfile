@@ -41,7 +41,25 @@ dashboard.rechargealaska.net {
   @app_root path /app
   redir @app_root /app/ 302
 
-  # Everything under /app requires auth (including _stcore/* websocket + host-config)
+  # ---- Streamlit internal endpoints (websocket + host-config) ----
+  # IMPORTANT:
+  # Putting forward_auth in front of Streamlit's websocket endpoint can cause the
+  # UI to get stuck in the "half-baked loading" state.
+  # We keep the main /app pages auth-gated, but allow Streamlit's internal routes
+  # through to the Streamlit backend.
+  handle /app/_stcore/* {
+    reverse_proxy 127.0.0.1:8501 {
+      transport http {
+        versions 1.1
+      }
+      header_up Host {host}
+      header_up X-Forwarded-Proto https
+      header_up X-Forwarded-Host {host}
+      header_up X-Forwarded-Prefix /app
+    }
+  }
+
+  # Everything else under /app stays behind your auth check
   handle /app* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
