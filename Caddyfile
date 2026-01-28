@@ -1,14 +1,13 @@
 dashboard.rechargealaska.net {
   encode gzip
 
-  # If a protected route returns 401/403, send the browser to /login.
-  # (Keeps /app from showing a raw "Unauthorized" page.)
+  # If auth gating on /app returns 401/403, redirect to /login instead of showing "Unauthorized".
   handle_errors {
-    @auth_fail {
+    @app_auth_fail {
       expression {http.error.status_code} in [401, 403]
       path /app*
     }
-    redir @auth_fail /login 302
+    redir @app_auth_fail /login 302
   }
 
   # Always start at login
