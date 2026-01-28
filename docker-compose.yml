@@ -14,6 +14,8 @@ services:
       - "127.0.0.1:3000:3000"
     networks:
       - rca_net
+    depends_on:
+      - app
 
   app:
     build:
@@ -39,13 +41,6 @@ services:
       STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION: "false"
     command: >
       streamlit run app_v2.py
-      --server.port=8501
-      --server.address=0.0.0.0
-      --server.headless=true
-      --browser.gatherUsageStats=false
-      --server.baseUrlPath=app
-      --server.enableCORS=false
-      --server.enableXsrfProtection=false
 
 networks:
   rca_net:
