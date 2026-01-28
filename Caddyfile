@@ -24,10 +24,7 @@ dashboard.rechargealaska.net {
   }
 
   # (Optional but explicit) Next.js API routes
-  # NextAuth commonly uses /api/auth/signout; keep /api/auth/logout working too.
-  handle /api/auth/logout {
-    redir /api/auth/signout 302
-  }
+  # /api/* is proxied to Next.js below, including /api/auth/logout.
 
   handle /api/* {
     reverse_proxy 127.0.0.1:3000 {
@@ -41,9 +38,9 @@ dashboard.rechargealaska.net {
   @app_root path /app
   redir @app_root /app/ 302
 
-  # ---- Streamlit internal endpoints (websocket + host-config) ----
+  # ---- Streamlit internal endpoints (websocket + host-config, etc.) ----
   # IMPORTANT:
-  # Putting forward_auth in front of Streamlit's websocket endpoint can cause the
+  # Putting forward_auth in front of Streamlit's internal endpoints can cause the
   # UI to get stuck in the "half-baked loading" state.
   # We keep the main /app pages auth-gated, but allow Streamlit's internal routes
   # through to the Streamlit backend.
@@ -63,13 +60,8 @@ dashboard.rechargealaska.net {
   handle /app* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
-
       # MUST forward browser cookies so verify can validate the session
       header_up Cookie {http.request.header.Cookie}
-
-      # Optional context (handy for debugging)
-      header_up X-Forwarded-Method {method}
-      header_up X-Forwarded-Uri {uri}
     }
 
     reverse_proxy 127.0.0.1:8501 {
