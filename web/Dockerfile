@@ -38,7 +38,7 @@ RUN npm ci --omit=dev
 # Copy build output + public assets
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/public ./public
-COPY --from=builder /app/next.config.* ./ 2>/dev/null || true
+# NOTE: next.config.* is optional. If your repo doesn't include it, don't COPY it.
 
 EXPOSE 3000
 
