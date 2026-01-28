@@ -24,8 +24,13 @@ with st.sidebar:
         html(
             """
             <script>
-              // Force logout in the SAME tab/window
-              window.top.location.href = "/api/auth/logout";
+              // Logout should happen in the SAME tab/window.
+              // Do a fetch to clear cookies, then navigate to /login.
+              fetch("/api/auth/logout", { method: "GET", credentials: "include" })
+                .catch(() => {})
+                .finally(() => {
+                  window.top.location.href = "/login";
+                });
             </script>
             """,
             height=0,
