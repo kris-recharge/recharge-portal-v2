@@ -12,12 +12,25 @@ import requests
 
 # ---------------- Sidebar: Account / Logout ----------------
 
+from streamlit.components.v1 import html
+
 with st.sidebar:
     st.markdown("### Account")
-    st.markdown(
-        "[Log out](/api/auth/logout)",
-        help="Sign out of the ReCharge Portal",
-    )
+
+    # Use a real button + JS redirect so logout happens in the SAME tab.
+    # A plain markdown link often opens a new tab and leaves the Streamlit
+    # websocket session alive (making /app still usable until refresh).
+    if st.button("Log out"):
+        html(
+            """
+            <script>
+              // Force logout in the SAME tab/window
+              window.top.location.href = "/api/auth/logout";
+            </script>
+            """,
+            height=0,
+        )
+        st.stop()
 
 # -----------------------------------------------------------
 
