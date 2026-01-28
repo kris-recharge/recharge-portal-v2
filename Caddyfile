@@ -37,6 +37,15 @@ dashboard.rechargealaska.net {
   @app_root path /app
   redir @app_root /app/ 302
 
+  # If the browser has no session cookie at all, send it to /login.
+  # (This fixes the post-logout experience and incognito direct hits to /app.)
+  @app_no_cookie {
+    path /app*
+    not path /app/_stcore/*
+    not header Cookie *
+  }
+  redir @app_no_cookie /login 302
+
   # ---- Streamlit internal endpoints (websocket + host-config, etc.) ----
   # IMPORTANT:
   # Putting forward_auth in front of Streamlit's internal endpoints can cause the
