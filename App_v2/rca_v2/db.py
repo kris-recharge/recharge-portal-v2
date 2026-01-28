@@ -11,7 +11,21 @@ import os
 import socket
 from urllib.parse import urlparse, parse_qs, unquote
 
+
 import psycopg
+
+# Explicit exports expected by older modules (e.g., loaders.py)
+__all__ = ["get_conn", "using_postgres", "param_placeholder"]
+
+
+def using_postgres() -> bool:
+    """App_v2 is Postgres-only in this deployment."""
+    return True
+
+
+def param_placeholder() -> str:
+    """psycopg placeholder style."""
+    return "%s"
 
 
 def _resolve_ipv4(hostname: str) -> str | None:
@@ -61,9 +75,6 @@ def _url_to_conninfo(db_url: str) -> str:
     return " ".join(parts)
 
 
-def param_placeholder() -> str:
-    """psycopg placeholder style."""
-    return "%s"
 
 
 def get_conn():
