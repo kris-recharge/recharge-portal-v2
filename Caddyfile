@@ -12,26 +12,41 @@ dashboard.rechargealaska.net {
                 }
         }
 
-        @app_root path /app /app/
+        @app_root path /app
         handle @app_root {
-          redir /st 302
+          redir /app/ 302
         }
 
-        handle /api/* {
-                reverse_proxy 127.0.0.1:3000 {
+        # ---- Streamlit (app) served at /app ----
+
+        # Websocket endpoint MUST be able to upgrade cleanly.
+        handle /app/_stcore/stream {
+                reverse_proxy 127.0.0.1:8501 {
+                        transport http {
+                                versions 1.1
+                        }
+                        header_up Host {host}
                         header_up X-Forwarded-Proto https
                         header_up X-Forwarded-Host {host}
+                        header_up X-Forwarded-Prefix /app
                 }
         }
 
+        # Everything else under /app stays behind your auth check
         handle /app* {
                 forward_auth 127.0.0.1:3000 {
                         uri /api/auth/verify
                         copy_headers Cookie
                 }
-                reverse_proxy 127.0.0.1:3000 {
+
+                reverse_proxy 127.0.0.1:8501 {
+                        transport http {
+                                versions 1.1
+                        }
+                        header_up Host {host}
                         header_up X-Forwarded-Proto https
                         header_up X-Forwarded-Host {host}
+                        header_up X-Forwarded-Prefix /app
                 }
         }
 

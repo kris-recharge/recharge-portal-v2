@@ -1,0 +1,52 @@
+services:
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: https://tgnolprmusnapfuydubt.supabase.co
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZ>
+    container_name: recharge_web
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - rca_net
+
+  app:
+    build:
+      # IMPORTANT: root context so Docker can see ./requirements.txt
+      context: .
+      # IMPORTANT: use the Dockerfile in App_v2/
+      dockerfile: App_v2/Dockerfile
+    container_name: recharge_app
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8501:8501"
+    networks:
+      - rca_net
+    environment:
+      STREAMLIT_SERVER_PORT: "8501"
+      STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+      STREAMLIT_SERVER_BASE_URL_PATH: "app"
+      STREAMLIT_SERVER_ENABLE_CORS: "false"
+      STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION: "false"
+    command: >
+      streamlit run app_v2.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --browser.gatherUsageStats=false
+      --server.baseUrlPath=app
+      --server.enableCORS=false
+      --server.enableXsrfProtection=false
+
+networks:
+  rca_net:
+    driver: bridge
