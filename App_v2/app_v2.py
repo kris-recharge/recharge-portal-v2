@@ -2,6 +2,8 @@ import os
 import json
 
 import streamlit as st
+st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
+
 import pandas as pd
 import numpy as np
 from io import BytesIO
@@ -175,9 +177,6 @@ from rca_v2.admintab import render_admin_tab
 
 
 EVSE_DISPLAY = get_evse_display()
-
-
-st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
 
 # Soft gate: require the correct embed token when configured.
 check_embed_token()
