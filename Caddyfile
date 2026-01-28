@@ -1,6 +1,16 @@
 dashboard.rechargealaska.net {
   encode gzip
 
+  # If a protected route returns 401/403, send the browser to /login.
+  # (Keeps /app from showing a raw "Unauthorized" page.)
+  handle_errors {
+    @auth_fail {
+      expression {http.error.status_code} in [401, 403]
+      path /app*
+    }
+    redir @auth_fail /login 302
+  }
+
   # Always start at login
   @root path /
   redir @root /login 302
@@ -14,6 +24,11 @@ dashboard.rechargealaska.net {
   }
 
   # (Optional but explicit) Next.js API routes
+  # NextAuth commonly uses /api/auth/signout; keep /api/auth/logout working too.
+  handle /api/auth/logout {
+    redir /api/auth/signout 302
+  }
+
   handle /api/* {
     reverse_proxy 127.0.0.1:3000 {
       header_up X-Forwarded-Proto https
