@@ -26,31 +26,15 @@ dashboard.rechargealaska.net {
   @app_root path /app
   redir @app_root /app/ 302
 
-  # ---- Streamlit internal endpoints (websocket + config) ----
-  # These endpoints often do NOT include your app's auth cookies.
-  # Gate the main /app pages, but let Streamlit's internal routes through.
-  handle /app/_stcore/* {
-    reverse_proxy 127.0.0.1:8501 {
-      transport http {
-        versions 1.1
-      }
-      header_up Host {host}
-      header_up X-Forwarded-Proto https
-      header_up X-Forwarded-Host {host}
-      header_up X-Forwarded-Prefix /app
-    }
-  }
-
-  # Everything else under /app stays behind your auth check
+  # Everything under /app requires auth (including _stcore/* websocket + host-config)
   handle /app* {
     forward_auth 127.0.0.1:3000 {
       uri /api/auth/verify
 
-      # IMPORTANT: forward the browser cookies to the auth gateway
-      # so it can validate the session.
+      # MUST forward browser cookies so verify can validate the session
       header_up Cookie {http.request.header.Cookie}
 
-      # Helpful context for the auth endpoint.
+      # Optional context (handy for debugging)
       header_up X-Forwarded-Method {method}
       header_up X-Forwarded-Uri {uri}
     }
