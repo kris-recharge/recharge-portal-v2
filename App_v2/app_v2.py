@@ -155,11 +155,12 @@ def fetch_allowed_evse_ids_for_email(email: str | None):
 
     try:
         resp = requests.get(
-            f"{supabase_url}/rest/v1/portal_user_allowed_evse",
+            f"{supabase_url}/rest/v1/portal_users",
             params={
                 "email": f"eq.{email}",
                 "active": "eq.true",
                 "select": "allowed_evse_ids",
+                "limit": "1",
             },
             headers={
                 "apikey": service_key,
@@ -207,12 +208,19 @@ def fetch_allowed_evse_ids_from_headers():
     headers = _get_request_headers()
 
     raw = (
-        _extract_header(headers, "x-portal-allowed-evse-ids")
+        # Preferred header used by the portal/Caddy (comma-separated or JSON)
+        _extract_header(headers, "x-portal-allowed-evse")
+        # Back-compat header names (older experiments)
+        or _extract_header(headers, "x-portal-allowed-evse-ids")
         or _extract_header(headers, "x-allowed-evse-ids")
     )
 
-    if not raw:
+    if raw is None:
         return None
+    raw = str(raw)
+    if raw.strip() == "":
+        # Header present but empty -> explicit empty allowlist
+        return set()
 
     raw = raw.strip()
 
@@ -286,8 +294,22 @@ current_email = get_current_user_email()
 if current_email:
     st.session_state["__portal_user_email"] = current_email
 
-# Prefer explicit allowed EVSE ids passed via headers (best for non-embed / no-query-param cases).
+# If we are behind the portal/proxy, we should have identity headers.
+# In that case, we MUST fail-closed if the portal does not provide an EVSE allowlist.
+_headers = _get_request_headers()
+_running_behind_portal = bool(_extract_header(_headers, "x-portal-user-email") or _extract_header(_headers, "x-portal-user-id"))
+
+# Prefer explicit allowed EVSE ids passed via headers (best for portal deployments).
 ALLOWED_STATIONS = fetch_allowed_evse_ids_from_headers()
+
+# If we're behind the portal and it didn't provide an allowlist, fail closed.
+# (Otherwise a misconfigured env would show ALL EVSEs.)
+if _running_behind_portal and ALLOWED_STATIONS is None:
+    st.error(
+        "Authorization scope missing (no EVSE allowlist provided by the portal). "
+        "Please contact ReCharge Alaska support."
+    )
+    st.stop()
 
 # If headers didn't specify allowed EVSE ids, fall back to Supabase lookup by email.
 if ALLOWED_STATIONS is None:
