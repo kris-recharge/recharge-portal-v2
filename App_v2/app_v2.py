@@ -469,8 +469,78 @@ with t1:
     # Daily totals (AK-local, based on session START time)
     st.markdown("#### Daily Totals")
 
+    # Build daily totals directly here so it works reliably in Docker environments
+    # where timezone databases can differ.
     try:
-        fig_daily_count, fig_daily_energy = daily_session_counts_and_energy_figures(sess)
+        sess_for_daily = sess.copy()
+
+        # Parse the session START time.
+        # `Start Date/Time` is expected to be UTC; enforce UTC parsing.
+        if "Start Date/Time" in sess_for_daily.columns:
+            start_utc = pd.to_datetime(
+                sess_for_daily["Start Date/Time"],
+                errors="coerce",
+                utc=True,
+            )
+        elif "start_time" in sess_for_daily.columns:
+            start_utc = pd.to_datetime(
+                sess_for_daily["start_time"],
+                errors="coerce",
+                utc=True,
+            )
+        else:
+            start_utc = pd.Series([pd.NaT] * len(sess_for_daily), index=sess_for_daily.index)
+
+        # Convert to AK local time for grouping. Prefer America/Anchorage; fall back
+        # to a fixed -09:00 offset if tz conversion isn't available.
+        try:
+            start_ak = start_utc.dt.tz_convert("America/Anchorage")
+        except Exception:
+            start_ak = (start_utc + pd.Timedelta(hours=-9)).dt.tz_localize(None)
+
+        sess_for_daily["__start_ak"] = start_ak
+        sess_for_daily["__day_ak"] = pd.to_datetime(sess_for_daily["__start_ak"], errors="coerce").dt.date
+
+        # Energy (kWh) for the day is based on the session START day.
+        energy_col = "Energy Delivered (kWh)" if "Energy Delivered (kWh)" in sess_for_daily.columns else None
+        if energy_col:
+            sess_for_daily["__energy_kwh"] = pd.to_numeric(sess_for_daily[energy_col], errors="coerce").fillna(0.0)
+        else:
+            sess_for_daily["__energy_kwh"] = 0.0
+
+        # Drop rows without a start time
+        sess_for_daily = sess_for_daily.dropna(subset=["__day_ak"])
+
+        daily = (
+            sess_for_daily
+            .groupby("__day_ak", as_index=False)
+            .agg(
+                sessions=("__day_ak", "size"),
+                energy_kwh=("__energy_kwh", "sum"),
+            )
+            .sort_values("__day_ak")
+        )
+
+        # Plotly figures
+        import plotly.express as px
+
+        fig_daily_count = px.bar(
+            daily,
+            x="__day_ak",
+            y="sessions",
+            labels={"__day_ak": "Date", "sessions": "Sessions"},
+            title="Sessions per Day",
+        )
+        fig_daily_count.update_layout(margin=dict(l=10, r=10, t=40, b=10))
+
+        fig_daily_energy = px.bar(
+            daily,
+            x="__day_ak",
+            y="energy_kwh",
+            labels={"__day_ak": "Date", "energy_kwh": "kWh"},
+            title="Energy Delivered per Day (kWh)",
+        )
+        fig_daily_energy.update_layout(margin=dict(l=10, r=10, t=40, b=10))
 
         st.plotly_chart(
             fig_daily_count,
@@ -485,6 +555,7 @@ with t1:
             config={"displaylogo": False},
             key="daily_totals_energy",
         )
+
     except Exception as e:
         # Don’t fail the whole page; show the reason so we can diagnose quickly.
         st.warning(f"Unable to render daily totals charts: {e}")
