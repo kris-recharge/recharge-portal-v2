@@ -37,14 +37,25 @@ dashboard.rechargealaska.net {
   @app_root path /app
   redir @app_root /app/ 302
 
-  # If the browser has no session cookie at all, send it to /login.
-  # (This fixes the post-logout experience and incognito direct hits to /app.)
-  @app_no_cookie {
+  # If the browser does not have a VALID portal session cookie, send it to /login.
+  # NOTE:
+  # - Your login portal sets a Supabase auth cookie that looks like:
+  #     sb-<project-ref>-auth-token
+  # - Streamlit sets its own internal cookies like `_streamlit_xsrf` which are NOT auth.
+  #
+  # We redirect to /login when the Supabase auth cookie is missing.
+  @app_no_session {
     path /app*
     not path /app/_stcore/*
-    not header Cookie *
+    # Supabase may set the cookie as either:
+    #   sb-<project-ref>-auth-token
+    # or with a host prefix:
+    #   __Host-sb-<project-ref>-auth-token
+    #
+    # Redirect to /login when neither is present.
+    not header_regexp Cookie (^|;\s*)(__Host-)?sb-[^=]+-auth-token=
   }
-  redir @app_no_cookie /login 302
+  redir @app_no_session /login 302
 
   # ---- Streamlit internal endpoints (websocket + host-config, etc.) ----
   # IMPORTANT:

@@ -199,6 +199,154 @@ def session_detail_figure(mv, sid, tx):
     )
     return fig
 
+
+# -------------------------
+# Helper: Coerce energy columns to kWh
+# -------------------------
+def _coerce_energy_kwh(series: pd.Series, col_name: str | None = None) -> pd.Series:
+    """Coerce an energy column to kWh.
+
+    Accepts either kWh or Wh-ish columns and converts to kWh when needed.
+    """
+    if series is None:
+        return pd.Series(dtype=float)
+
+    s = pd.to_numeric(series, errors="coerce")
+    if s.dropna().empty:
+        return s
+
+    low = (col_name or "").lower()
+
+    # Heuristics:
+    # - Explicit *_wh or (Wh) -> convert
+    # - If values look like Wh (e.g., 95th percentile > 1000), convert
+    if ("wh" in low and "kwh" not in low) or (s.dropna().quantile(0.95) > 1000):
+        return s / 1000.0
+
+    return s
+
+
+def daily_session_counts_and_energy_figures(
+    sessions: pd.DataFrame,
+    title_counts: str = "Daily Totals — Session Starts",
+    title_energy: str = "Daily Totals — Energy Delivered (kWh)",
+):
+    """Return two bar charts (count + energy) grouped by session *start* day in AK local time.
+
+    Expected `sessions` columns (we discover flexibly):
+    - start timestamp: start_ts / start_time / started_at / start
+    - energy delivered: energy_kwh / energy_delivered_kwh / energy_wh / energy_delivered_wh
+
+    Notes:
+    - Grouping is based on the START timestamp in Alaska time.
+    - Energy is summed into the day of the START timestamp (not split across days).
+    - This function assumes `sessions` is already filtered by EVSE + date range in the caller.
+    """
+    empty = (sessions is None) or sessions.empty
+    if empty:
+        return go.Figure(), go.Figure()
+
+    df = sessions.copy()
+
+    # -------------------------
+    # Find & normalize start timestamp -> AK local date
+    # -------------------------
+    start_col = _first_col(df, [
+        "start_ts", "start_time", "started_at", "start", "session_start", "start_datetime"
+    ])
+    if start_col is None:
+        return go.Figure(), go.Figure()
+
+    start_utc = pd.to_datetime(df[start_col], errors="coerce", utc=True)
+    start_ak = start_utc.dt.tz_convert(AK_TZ)
+    df = df.assign(_start_ak=start_ak)
+
+    # Bucket by local date
+    df = df.dropna(subset=["_start_ak"])
+    if df.empty:
+        return go.Figure(), go.Figure()
+
+    df["_day"] = df["_start_ak"].dt.date
+
+    # -------------------------
+    # Energy column (optional)
+    # -------------------------
+    energy_col = _first_col(df, [
+        "energy_delivered_kwh", "energy_kwh", "Energy Delivered (kWh)", "Energy (kWh)",
+        "energy_delivered_wh", "energy_wh", "Energy Delivered (Wh)", "Energy (Wh)",
+        "energy", "energy_delivered"
+    ])
+
+    if energy_col is not None:
+        E_kwh = _coerce_energy_kwh(df[energy_col], energy_col)
+    else:
+        E_kwh = pd.Series(index=df.index, dtype=float)
+
+    df = df.assign(_energy_kwh=E_kwh)
+
+    # -------------------------
+    # Aggregate
+    # -------------------------
+    g = df.groupby("_day", dropna=True)
+
+    daily_counts = g.size().rename("count")
+    daily_energy = g["_energy_kwh"].sum(min_count=1).rename("kwh")
+
+    # Build a complete continuous date index from min->max for nicer bars
+    idx = pd.date_range(
+        pd.to_datetime(daily_counts.index.min()),
+        pd.to_datetime(daily_counts.index.max()),
+        freq="D",
+    ).date
+
+    daily_counts = daily_counts.reindex(idx, fill_value=0)
+    daily_energy = daily_energy.reindex(idx, fill_value=0.0)
+
+    # -------------------------
+    # Figures
+    # -------------------------
+    x_dates = [pd.to_datetime(d).strftime("%Y-%m-%d") for d in daily_counts.index]
+
+    fig_counts = go.Figure(
+        data=[
+            go.Bar(
+                x=x_dates,
+                y=daily_counts.values.tolist(),
+                name="Sessions",
+                hovertemplate="Date: %{x}<br>Sessions: %{y}<extra></extra>",
+            )
+        ]
+    )
+    fig_counts.update_layout(
+        title=title_counts,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(title="Date (AK)", type="category"),
+        yaxis=dict(title="Sessions", rangemode="tozero"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+
+    fig_energy = go.Figure(
+        data=[
+            go.Bar(
+                x=x_dates,
+                y=[float(v) if pd.notna(v) else 0.0 for v in daily_energy.values],
+                name="kWh",
+                hovertemplate="Date: %{x}<br>Energy: %{y:.2f} kWh<extra></extra>",
+            )
+        ]
+    )
+    fig_energy.update_layout(
+        title=title_energy,
+        margin=dict(l=10, r=10, t=40, b=10),
+        xaxis=dict(title="Date (AK)", type="category"),
+        yaxis=dict(title="Energy (kWh)", rangemode="tozero"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+
+    return fig_counts, fig_energy
+
 def heatmap_count(heat, title):
     """Session start counts per day/hour with white→blue cells, black borders and labels."""
     if heat is None or heat.empty:

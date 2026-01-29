@@ -188,7 +188,12 @@ from rca_v2.loaders import (
     load_connectivity,
 )
 from rca_v2.sessions import build_sessions
-from rca_v2.charts import session_detail_figure, heatmap_count, heatmap_duration
+from rca_v2.charts import (
+    session_detail_figure,
+    heatmap_count,
+    heatmap_duration,
+    daily_session_counts_and_energy_figures,
+)
 from rca_v2.constants import get_evse_display
 
 
@@ -460,6 +465,27 @@ with t1:
         )
     else:
         st.info("Select a session above to view details.")
+
+    # Daily totals (AK-local, based on session START time)
+    st.markdown("#### Daily Totals")
+
+    try:
+        fig_daily_count, fig_daily_energy = daily_session_counts_and_energy_figures(sess)
+
+        st.plotly_chart(
+            fig_daily_count,
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
+
+        st.plotly_chart(
+            fig_daily_energy,
+            use_container_width=True,
+            config={"displaylogo": False},
+        )
+    except Exception as e:
+        # Don’t fail the whole page; show the reason so we can diagnose quickly.
+        st.warning(f"Unable to render daily totals charts: {e}")
 
     # Heatmaps — stacked full width (to match v1 layout)
     st.plotly_chart(
