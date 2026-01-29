@@ -191,7 +191,6 @@ from rca_v2.sessions import build_sessions
 from rca_v2.charts import session_detail_figure, heatmap_count, heatmap_duration
 from rca_v2.constants import get_evse_display
 
-from rca_v2.admintab import render_admin_tab
 
 
 EVSE_DISPLAY = get_evse_display()
@@ -399,14 +398,9 @@ if not stations:
 else:
     st.session_state["__v2_all_evse"] = False
 
-# Build tabs; only show Admin when running locally
-if APP_MODE == "local":
-    TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Export", "Admin (local-only)"]
-    t1, t2, t3, t4, t5 = st.tabs(TAB_TITLES)
-else:
-    TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Export"]
-    t1, t2, t3, t4 = st.tabs(TAB_TITLES)
-    t5 = None
+# Build tabs (Admin tab removed from the shared web deployment)
+TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Export"]
+t1, t2, t3, t4 = st.tabs(TAB_TITLES)
 
 with t1:
     st.subheader("Charging Sessions")
@@ -897,6 +891,3 @@ with t4:
                 help="Exports Sessions, MeterValues (window), plus Status and Connectivity tables and a Connectivity Summary for the current filters.",
             )
 
-if APP_MODE == "local" and t5 is not None:
-    with t5:
-        render_admin_tab()
