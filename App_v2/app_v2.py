@@ -84,36 +84,51 @@ def check_embed_token() -> None:
 
 # --- Begin: Portal user helpers (query param extraction, Supabase authorization) ---
 
-def _get_query_params():
-    """
-    Helper to safely access the current query parameters in Streamlit.
+def _get_request_headers() -> dict:
+    """Best-effort access to the current request headers.
+
+    Streamlit exposes headers via `st.context.headers` in newer versions.
+    If unavailable, return an empty dict.
     """
     try:
-        return st.query_params  # type: ignore[attr-defined]
+        h = getattr(st, "context", None)
+        h = getattr(h, "headers", None)
+        if h is None:
+            return {}
+        # st.context.headers is a mapping-like object
+        return {str(k).lower(): str(v) for k, v in dict(h).items()}
     except Exception:
-        return st.experimental_get_query_params()
+        return {}
 
 
-def _extract_query_param(qp, key: str) -> str:
-    """
-    Normalize a single query-parameter value to a simple string.
-    """
-    try:
-        val = qp.get(key)
-    except Exception:
+def _extract_header(headers: dict, key: str) -> str:
+    """Fetch a header value (case-insensitive) as a simple string."""
+    if not headers:
         return ""
-    if isinstance(val, list):
-        return val[0] if val else ""
-    return val or ""
+    return (headers.get(key.lower()) or "").strip()
 
 
 def get_current_user_email() -> str | None:
-    """
-    Best-effort extraction of the portal user's email from the query string.
+    """Best-effort extraction of the portal user's email.
 
-    The Next.js shell passes ?email=... (or ?user_email=...) when embedding
-    the dashboard iframe.
+    Priority order:
+      1) Headers injected by the portal/proxy (most reliable)
+      2) Query string (?email=... or ?user_email=...) for iframe embeds
     """
+    headers = _get_request_headers()
+
+    # Common header names you may choose to inject from Next/Caddy.
+    for k in (
+        "x-portal-user-email",
+        "x-user-email",
+        "x-auth-request-email",
+        "x-forwarded-email",
+    ):
+        v = _extract_header(headers, k)
+        if v:
+            return v
+
+    # Fallback to query params
     qp = _get_query_params()
     email = _extract_query_param(qp, "email")
     if not email:
@@ -123,15 +138,15 @@ def get_current_user_email() -> str | None:
 
 
 def fetch_allowed_evse_ids_for_email(email: str | None):
-    """
-    Look up the set of station_ids this email is allowed to see from Supabase.
+    """Look up the set of station_ids this email is allowed to see from Supabase.
 
     Returns:
         - set([...])  : authorization data found and parsed
         - set()       : user is known but has no allowed EVSEs
         - None        : Supabase not configured / unreachable (no restriction)
     """
-    supabase_url = os.getenv("SUPABASE_URL")
+    # Prefer a dedicated SUPABASE_URL, but fall back to the public URL used by Next.
+    supabase_url = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").rstrip("/")
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
     if not email or not supabase_url or not service_key:
@@ -177,6 +192,69 @@ def fetch_allowed_evse_ids_for_email(email: str | None):
 
     return {str(sid) for sid in raw_ids}
 
+
+def fetch_allowed_evse_ids_from_headers():
+    """Read allowed EVSE ids from headers, if provided by the portal/proxy.
+
+    Header values may be:
+      - JSON array string: ["id1","id2"]
+      - Comma-separated: id1,id2
+
+    Returns:
+      - set([...]) if header present (even if empty)
+      - None if header not present
+    """
+    headers = _get_request_headers()
+
+    raw = (
+        _extract_header(headers, "x-portal-allowed-evse-ids")
+        or _extract_header(headers, "x-allowed-evse-ids")
+    )
+
+    if not raw:
+        return None
+
+    raw = raw.strip()
+
+    # Try JSON first
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return {str(x) for x in parsed}
+        if parsed is None:
+            return set()
+        return {str(parsed)}
+    except Exception:
+        pass
+
+    # Fallback: comma-separated
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return {str(p) for p in parts}
+
+def _get_query_params():
+    """
+    Helper to safely access the current query parameters in Streamlit.
+    """
+    try:
+        return st.query_params  # type: ignore[attr-defined]
+    except Exception:
+        return st.experimental_get_query_params()
+
+
+def _extract_query_param(qp, key: str) -> str:
+    """
+    Normalize a single query-parameter value to a simple string.
+    """
+    try:
+        val = qp.get(key)
+    except Exception:
+        return ""
+    if isinstance(val, list):
+        return val[0] if val else ""
+    return val or ""
+
+
+
 # --- End: Portal user helpers ---
 
 from rca_v2.config import APP_MODE
@@ -203,13 +281,18 @@ EVSE_DISPLAY = get_evse_display()
 # Soft gate: require the correct embed token when configured.
 check_embed_token()
 
-# Identify current portal user (if any) from the query string.
+# Identify current portal user (if any).
 current_email = get_current_user_email()
 if current_email:
     st.session_state["__portal_user_email"] = current_email
 
-# Look up allowed EVSEs for this user via Supabase (if configured).
-ALLOWED_STATIONS = fetch_allowed_evse_ids_for_email(current_email)
+# Prefer explicit allowed EVSE ids passed via headers (best for non-embed / no-query-param cases).
+ALLOWED_STATIONS = fetch_allowed_evse_ids_from_headers()
+
+# If headers didn't specify allowed EVSE ids, fall back to Supabase lookup by email.
+if ALLOWED_STATIONS is None:
+    ALLOWED_STATIONS = fetch_allowed_evse_ids_for_email(current_email)
+
 if isinstance(ALLOWED_STATIONS, set):
     if not ALLOWED_STATIONS:
         st.error(
