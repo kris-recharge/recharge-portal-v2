@@ -28,13 +28,22 @@ function toAllowedEvseHeaderValue(value: unknown): string {
 export async function GET(req: Request) {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-  const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+  // NOTE: your VPS `.env` currently uses `SUPABASE_SERVICE_ROLL_KEY` (ROLL),
+  // but the conventional name is `SUPABASE_SERVICE_ROLE_KEY` (ROLE).
+  // Accept either so a small typo doesn't silently disable authorization.
+  const supabaseServiceRoleKey =
+    process.env.SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.SUPABASE_SERVICE_ROLL_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLL_KEY ||
+    "";
 
   if (!supabaseUrl || !supabaseAnonKey) {
     return new NextResponse("Server misconfigured", { status: 500 });
   }
-  // Service role is optional, but without it portal_users lookups may be blocked by RLS.
-  // When missing, we will fail closed (no EVSE access) but keep authentication working.
+  // Service role is optional, but without it `portal_users` lookups may be blocked by RLS.
+  // When missing, we fail closed (no EVSE access) but keep authentication working.
 
   // Important: do not allow caches to store auth decisions.
   const res = NextResponse.json({ ok: true }, { status: 200 });
