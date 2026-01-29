@@ -1,6 +1,7 @@
 import os
 import streamlit as st
 import pandas as pd
+import json
 from datetime import datetime, timedelta, date, time
 from typing import Optional
 from .config import AK_TZ, UTC
@@ -47,6 +48,39 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     email = ""
     logout_url = ""
 
+    def _parse_allowed_ids(val) -> list[str]:
+        """Parse allowed EVSE ids from query params.
+
+        Accepts:
+          - JSON array string: '["id1","id2"]'
+          - Comma-separated string: 'id1,id2'
+          - Repeated query params list
+        """
+        if val is None:
+            return []
+        if isinstance(val, list):
+            # already a list from query params
+            items = [str(x).strip() for x in val if str(x).strip()]
+            return items
+        s = str(val).strip()
+        if not s:
+            return []
+        # Try JSON list first
+        if (s.startswith('[') and s.endswith(']')) or (s.startswith('"') and s.endswith('"')):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return [str(x).strip() for x in parsed if str(x).strip()]
+                if isinstance(parsed, str):
+                    # A JSON string that might contain CSV
+                    s = parsed.strip()
+            except Exception:
+                pass
+        # Fallback: comma-separated
+        return [p.strip() for p in s.split(',') if p.strip()]
+
+    allowed_from_qp: list[str] = []
+
     if isinstance(qp, dict):
         def _first(val):
             if isinstance(val, list):
@@ -54,16 +88,28 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
             return val or ""
         email = _first(qp.get("email"))
         logout_url = _first(qp.get("logout_url"))
+        # Optional allow-list passed from the portal
+        allowed_from_qp = _parse_allowed_ids(
+            qp.get("allowed_evse_ids") or qp.get("evse_ids") or qp.get("allowed")
+        )
     else:
         # st.query_params on newer Streamlit returns a Mapping[str, str]
         email = qp.get("email", "")
         logout_url = qp.get("logout_url", "")
+        allowed_from_qp = _parse_allowed_ids(
+            qp.get("allowed_evse_ids", "") or qp.get("evse_ids", "") or qp.get("allowed", "")
+        )
 
     # Allow app-level overrides (used when embedding behind the Next.js portal)
     if user_email_override:
         email = user_email_override
     if logout_url_override:
         logout_url = logout_url_override
+
+    # If the caller didn't pass an allow-list, but the portal provided one via query params,
+    # honor it so users only see EVSEs they are authorized for.
+    if allowed_evse_ids is None and allowed_from_qp:
+        allowed_evse_ids = allowed_from_qp
 
     if email:
         st.caption(f"Signed in as **{email}**")
