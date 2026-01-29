@@ -475,30 +475,52 @@ with t1:
         sess_for_daily = sess.copy()
 
         # Parse the session START time.
-        # `Start Date/Time` is expected to be UTC; enforce UTC parsing.
+        # IMPORTANT:
+        # - In some deployments, `Start Date/Time` is already an AK-local *naive* timestamp string.
+        # - In others, it may be UTC/tz-aware.
+        # We detect tz-awareness and only convert when appropriate.
         if "Start Date/Time" in sess_for_daily.columns:
-            start_utc = pd.to_datetime(
+            start_parsed = pd.to_datetime(
                 sess_for_daily["Start Date/Time"],
                 errors="coerce",
-                utc=True,
             )
         elif "start_time" in sess_for_daily.columns:
-            start_utc = pd.to_datetime(
+            start_parsed = pd.to_datetime(
                 sess_for_daily["start_time"],
                 errors="coerce",
-                utc=True,
             )
         else:
-            start_utc = pd.Series([pd.NaT] * len(sess_for_daily), index=sess_for_daily.index)
+            start_parsed = pd.Series([pd.NaT] * len(sess_for_daily), index=sess_for_daily.index)
 
-        # Convert to AK local time for grouping. Prefer America/Anchorage; fall back
-        # to a fixed -09:00 offset if tz conversion isn't available.
+        AK_TZ = "America/Anchorage"
+
+        # If tz-aware, convert to AK. If tz-naive, assume it is already AK-local and localize.
         try:
-            start_ak = start_utc.dt.tz_convert("America/Anchorage")
+            tzinfo = getattr(start_parsed.dt, "tz", None)
         except Exception:
-            start_ak = (start_utc + pd.Timedelta(hours=-9)).dt.tz_localize(None)
+            tzinfo = None
+
+        if tzinfo is not None:
+            # tz-aware timestamps (often UTC) -> convert to AK
+            try:
+                start_ak = start_parsed.dt.tz_convert(AK_TZ)
+            except Exception:
+                # As a last resort, strip tz and treat as local
+                start_ak = start_parsed.dt.tz_localize(None)
+        else:
+            # tz-naive timestamps -> assume already AK-local
+            try:
+                start_ak = start_parsed.dt.tz_localize(
+                    AK_TZ,
+                    ambiguous="NaT",
+                    nonexistent="shift_forward",
+                )
+            except Exception:
+                # Fallback: keep as naive
+                start_ak = start_parsed
 
         sess_for_daily["__start_ak"] = start_ak
+        # Grouping key: AK-local calendar day
         sess_for_daily["__day_ak"] = pd.to_datetime(sess_for_daily["__start_ak"], errors="coerce").dt.date
 
         # Energy (kWh) for the day is based on the session START day.
