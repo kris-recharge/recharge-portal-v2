@@ -476,12 +476,14 @@ with t1:
             fig_daily_count,
             use_container_width=True,
             config={"displaylogo": False},
+            key="daily_totals_count",
         )
 
         st.plotly_chart(
             fig_daily_energy,
             use_container_width=True,
             config={"displaylogo": False},
+            key="daily_totals_energy",
         )
     except Exception as e:
         # Don’t fail the whole page; show the reason so we can diagnose quickly.
