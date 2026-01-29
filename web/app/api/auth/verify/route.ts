@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createServerClient } from "@supabase/ssr";
+import { createClient } from "@supabase/supabase-js";
 import { cookies } from "next/headers";
 
 function toAllowedEvseHeaderValue(value: unknown): string {
@@ -27,10 +28,13 @@ function toAllowedEvseHeaderValue(value: unknown): string {
 export async function GET(req: Request) {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+  const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 
   if (!supabaseUrl || !supabaseAnonKey) {
     return new NextResponse("Server misconfigured", { status: 500 });
   }
+  // Service role is optional, but without it portal_users lookups may be blocked by RLS.
+  // When missing, we will fail closed (no EVSE access) but keep authentication working.
 
   // Important: do not allow caches to store auth decisions.
   const res = NextResponse.json({ ok: true }, { status: 200 });
@@ -70,39 +74,48 @@ export async function GET(req: Request) {
   res.headers.set("X-Portal-User-Email", data.user.email ?? "");
 
   // Fetch authorization scope (allowed EVSE IDs) from portal_users.
-  // We prefer lookup by email (matches your admin workflow), with a fallback to user_id.
+  // We prefer lookup by email (matches your admin workflow).
+  // IMPORTANT: portal_users is usually protected by RLS, so we use the service role key on the server.
   let allowedEvseHeader = "";
   const userEmail = (data.user.email ?? "").trim().toLowerCase();
 
   try {
-    if (userEmail) {
-      const { data: puByEmail, error: puEmailErr } = await supabase
+    if (supabaseServiceRoleKey && userEmail) {
+      const admin = createClient(supabaseUrl, supabaseServiceRoleKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+
+      // Use exact match on normalized email. (If your DB stores mixed-case emails,
+      // consider adding a generated lowercase column; for now we also try an ilike fallback.)
+      const { data: puByEmail, error: puEmailErr } = await admin
         .from("portal_users")
         .select("allowed_evse_ids")
-        .ilike("email", userEmail)
+        .eq("email", userEmail)
         .maybeSingle();
 
       if (!puEmailErr && puByEmail) {
         allowedEvseHeader = toAllowedEvseHeaderValue((puByEmail as any).allowed_evse_ids);
       }
-    }
 
-    if (!allowedEvseHeader) {
-      const { data: puById, error: puIdErr } = await supabase
-        .from("portal_users")
-        .select("allowed_evse_ids")
-        .eq("id", data.user.id)
-        .maybeSingle();
+      if (!allowedEvseHeader) {
+        const { data: puByEmail2, error: puEmailErr2 } = await admin
+          .from("portal_users")
+          .select("allowed_evse_ids")
+          .ilike("email", userEmail)
+          .maybeSingle();
 
-      if (!puIdErr && puById) {
-        allowedEvseHeader = toAllowedEvseHeaderValue((puById as any).allowed_evse_ids);
+        if (!puEmailErr2 && puByEmail2) {
+          allowedEvseHeader = toAllowedEvseHeaderValue((puByEmail2 as any).allowed_evse_ids);
+        }
       }
+
+      // Optional: if you later add a column that stores the auth user id, you can add a fallback here.
     }
   } catch {
-    // If anything goes sideways, fail closed on EVSE scope by sending empty header.
     allowedEvseHeader = "";
   }
 
+  // Fail closed: empty header means "no EVSE access" in Streamlit.
   res.headers.set("X-Portal-Allowed-EVSE", allowedEvseHeader);
 
   return res;
