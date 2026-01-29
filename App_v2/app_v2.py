@@ -202,22 +202,35 @@ def fetch_allowed_evse_ids_from_headers():
       - Comma-separated: id1,id2
 
     Returns:
-      - set([...]) if header present (even if empty)
-      - None if header not present
+      - set([...]) if an allowlist header is present (even if empty)
+      - None if no allowlist header is present
     """
     headers = _get_request_headers()
 
-    raw = (
-        # Preferred header used by the portal/Caddy (comma-separated or JSON)
-        _extract_header(headers, "x-portal-allowed-evse")
-        # Back-compat header names (older experiments)
-        or _extract_header(headers, "x-portal-allowed-evse-ids")
-        or _extract_header(headers, "x-allowed-evse-ids")
+    # Header names we recognize (in priority order)
+    header_names = (
+        "x-portal-allowed-evse",
+        "x-portal-allowed-evse-ids",
+        "x-allowed-evse-ids",
     )
 
-    if raw is None:
+    present_name = None
+    raw = None
+
+    # IMPORTANT: distinguish "missing header" from "present but empty".
+    # `headers.get()` returns None for missing keys; we must NOT treat that as "".
+    for name in header_names:
+        if name in headers:
+            present_name = name
+            raw = headers.get(name)
+            break
+
+    if present_name is None:
+        # No allowlist header at all
         return None
-    raw = str(raw)
+
+    raw = "" if raw is None else str(raw)
+
     if raw.strip() == "":
         # Header present but empty -> explicit empty allowlist
         return set()
