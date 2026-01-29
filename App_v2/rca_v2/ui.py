@@ -45,9 +45,48 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     except Exception:
         qp = st.experimental_get_query_params()
 
-    email = ""
-    logout_url = ""
+    allowed_from_qp: list[str] = []
 
+    def _qp_get(mapping, *keys):
+        """Return the raw query-param value for the first matching key."""
+        for k in keys:
+            if isinstance(mapping, dict):
+                if k in mapping:
+                    return mapping.get(k)
+            else:
+                # Streamlit >= 1.27 mapping[str, str]
+                try:
+                    if k in mapping:
+                        return mapping.get(k)
+                except Exception:
+                    pass
+        return None
+
+    def _qp_first(val):
+        if isinstance(val, list):
+            return val[0] if val else ""
+        return val or ""
+
+    # Pull common keys (support multiple aliases)
+    raw_email = _qp_get(qp, "email")
+    raw_logout = _qp_get(qp, "logout_url")
+
+    # Allow-list may come in a few shapes/names depending on the portal implementation.
+    # Support JSON list, CSV, repeated params, and common key aliases.
+    raw_allowed = (
+        _qp_get(qp, "allowed_evse_ids")
+        or _qp_get(qp, "allowed_evse_ids[]")
+        or _qp_get(qp, "evse_ids")
+        or _qp_get(qp, "evse_ids[]")
+        or _qp_get(qp, "allowed")
+        or _qp_get(qp, "allowed[]")
+    )
+
+    # Normalize email/logout
+    email = _qp_first(raw_email) if raw_email is not None else ""
+    logout_url = _qp_first(raw_logout) if raw_logout is not None else ""
+
+    # Normalize allow-list
     def _parse_allowed_ids(val) -> list[str]:
         """Parse allowed EVSE ids from query params.
 
@@ -79,26 +118,7 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
         # Fallback: comma-separated
         return [p.strip() for p in s.split(',') if p.strip()]
 
-    allowed_from_qp: list[str] = []
-
-    if isinstance(qp, dict):
-        def _first(val):
-            if isinstance(val, list):
-                return val[0] if val else ""
-            return val or ""
-        email = _first(qp.get("email"))
-        logout_url = _first(qp.get("logout_url"))
-        # Optional allow-list passed from the portal
-        allowed_from_qp = _parse_allowed_ids(
-            qp.get("allowed_evse_ids") or qp.get("evse_ids") or qp.get("allowed")
-        )
-    else:
-        # st.query_params on newer Streamlit returns a Mapping[str, str]
-        email = qp.get("email", "")
-        logout_url = qp.get("logout_url", "")
-        allowed_from_qp = _parse_allowed_ids(
-            qp.get("allowed_evse_ids", "") or qp.get("evse_ids", "") or qp.get("allowed", "")
-        )
+    allowed_from_qp = _parse_allowed_ids(raw_allowed)
 
     # Allow app-level overrides (used when embedding behind the Next.js portal)
     if user_email_override:
@@ -110,6 +130,13 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     # honor it so users only see EVSEs they are authorized for.
     if allowed_evse_ids is None and allowed_from_qp:
         allowed_evse_ids = allowed_from_qp
+
+    # SECURITY: If the portal identifies a user (email is present) but does NOT
+    # provide an allow-list, do NOT default to showing all EVSEs.
+    # This prevents accidental overexposure when the portal forgets to pass
+    # allowed_evse_ids.
+    if email and allowed_evse_ids is None:
+        allowed_evse_ids = []
 
     if email:
         st.caption(f"Signed in as **{email}**")
