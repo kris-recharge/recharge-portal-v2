@@ -572,52 +572,102 @@ with t1:
     # Effective-dated connector type override (e.g., Delta CHAdeMO -> NACS on a cutover date)
     # This ensures the table reflects your authoritative mapping rules instead of whatever
     # legacy value is stored on the session row.
+    #
+    # IMPORTANT: We compute both AK-local and UTC-aware start timestamps so that the
+    # effective-dating logic works regardless of whether the incoming Start Date/Time is
+    # tz-aware (UTC) or tz-naive (already AK-local).
     try:
-        if {
-            "station_id",
-            "Connector #",
-            "Start Date/Time",
-        }.issubset(set(sess.columns)):
+        if {"Connector #", "Start Date/Time"}.issubset(set(sess.columns)):
             AK_TZ = "America/Anchorage"
 
             # Parse session start times.
-            _start_parsed = pd.to_datetime(sess["Start Date/Time"], errors="coerce")
-            try:
-                _tzinfo = getattr(_start_parsed.dt, "tz", None)
-            except Exception:
-                _tzinfo = None
+            # First attempt: parse as UTC-aware (works if the source string is UTC or has tz info).
+            start_parsed_utc = pd.to_datetime(
+                sess["Start Date/Time"],
+                errors="coerce",
+                utc=True,
+            )
 
-            if _tzinfo is not None:
-                # tz-aware -> convert to AK
+            # Also parse without forcing UTC so we can detect tz-naive inputs.
+            start_parsed_raw = pd.to_datetime(sess["Start Date/Time"], errors="coerce")
+            try:
+                raw_tz = getattr(start_parsed_raw.dt, "tz", None)
+            except Exception:
+                raw_tz = None
+
+            if raw_tz is not None:
+                # tz-aware raw -> convert to AK and UTC
                 try:
-                    _start_ak = _start_parsed.dt.tz_convert(AK_TZ)
+                    start_ak = start_parsed_raw.dt.tz_convert(AK_TZ)
                 except Exception:
-                    _start_ak = _start_parsed
-            else:
-                # tz-naive -> assume already AK-local
+                    start_ak = start_parsed_raw
                 try:
-                    _start_ak = _start_parsed.dt.tz_localize(
+                    start_utc = start_parsed_raw.dt.tz_convert("UTC")
+                except Exception:
+                    start_utc = start_parsed_utc
+            else:
+                # tz-naive raw -> assume already AK-local, then convert to UTC
+                try:
+                    start_ak = start_parsed_raw.dt.tz_localize(
                         AK_TZ,
                         ambiguous="NaT",
                         nonexistent="shift_forward",
                     )
                 except Exception:
-                    _start_ak = _start_parsed
+                    start_ak = start_parsed_raw
 
-            # Build an override column by calling connector_type_for(station_id, connector_id, start_dt)
+                try:
+                    start_utc = start_ak.dt.tz_convert("UTC")
+                except Exception:
+                    start_utc = start_parsed_utc
+
+            # Build an override column by calling connector_type_for(...)
+            # and also apply a safety-net rule for the Delta cutover.
+            CUTOFF_AK_DATE = pd.Timestamp("2026-01-30").date()
+
             def _ct_override(row):
+                # Prefer station_id mapping when available
                 sid = row.get("station_id")
                 cid = row.get("Connector #")
-                sdt = row.get("__start_ak")
-                if pd.isna(sdt) or sid is None or cid is None:
+                sdt_utc = row.get("__start_utc")
+                sdt_ak = row.get("__start_ak")
+
+                # Normalize connector id
+                try:
+                    cid_int = int(cid)
+                except Exception:
+                    return None
+
+                # --- Safety net: Delta connector 1 changed from CHAdeMO -> NACS on 2026-01-30 (AK local) ---
+                # We key off the friendly EVSE name since station_id strings can vary by platform.
+                try:
+                    evse_name = str(row.get("EVSE") or "")
+                except Exception:
+                    evse_name = ""
+
+                try:
+                    ak_date = None
+                    if pd.notna(sdt_ak):
+                        ak_date = pd.to_datetime(sdt_ak, errors="coerce").date()
+                except Exception:
+                    ak_date = None
+
+                if evse_name in ("Delta - Left", "Delta - Right") and cid_int == 1 and ak_date:
+                    return "NACS" if ak_date >= CUTOFF_AK_DATE else "CHAdeMO"
+
+                # --- Primary rule engine ---
+                # If station_id exists, ask constants.connector_type_for() using UTC-aware timestamp.
+                if sid is None or pd.isna(sdt_utc):
                     return None
                 try:
-                    return connector_type_for(str(sid), int(cid), sdt)
+                    return connector_type_for(str(sid), cid_int, sdt_utc)
                 except Exception:
                     return None
 
             sess = sess.copy()
-            sess["__start_ak"] = _start_ak
+            sess["__start_ak"] = start_ak
+            sess["__start_utc"] = start_utc
+
             _override = sess.apply(_ct_override, axis=1)
 
             if "Connector Type" in sess.columns:
@@ -626,7 +676,7 @@ with t1:
             else:
                 sess["Connector Type"] = _override
 
-            sess = sess.drop(columns=["__start_ak"], errors="ignore")
+            sess = sess.drop(columns=["__start_ak", "__start_utc"], errors="ignore")
     except Exception:
         # Never break the sessions tab just because an override rule failed.
         pass
