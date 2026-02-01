@@ -293,7 +293,7 @@ from rca_v2.charts import (
     heatmap_duration,
     daily_session_counts_and_energy_figures,
 )
-from rca_v2.constants import get_evse_display
+from rca_v2.constants import get_evse_display, connector_type_for
 
 
 
@@ -568,6 +568,68 @@ with t1:
     elif "EVSE" not in sess.columns and "Location" in sess.columns:
         # Fallback if station_id is missing in this frame
         sess["EVSE"] = sess["Location"].astype(str)
+
+    # Effective-dated connector type override (e.g., Delta CHAdeMO -> NACS on a cutover date)
+    # This ensures the table reflects your authoritative mapping rules instead of whatever
+    # legacy value is stored on the session row.
+    try:
+        if {
+            "station_id",
+            "Connector #",
+            "Start Date/Time",
+        }.issubset(set(sess.columns)):
+            AK_TZ = "America/Anchorage"
+
+            # Parse session start times.
+            _start_parsed = pd.to_datetime(sess["Start Date/Time"], errors="coerce")
+            try:
+                _tzinfo = getattr(_start_parsed.dt, "tz", None)
+            except Exception:
+                _tzinfo = None
+
+            if _tzinfo is not None:
+                # tz-aware -> convert to AK
+                try:
+                    _start_ak = _start_parsed.dt.tz_convert(AK_TZ)
+                except Exception:
+                    _start_ak = _start_parsed
+            else:
+                # tz-naive -> assume already AK-local
+                try:
+                    _start_ak = _start_parsed.dt.tz_localize(
+                        AK_TZ,
+                        ambiguous="NaT",
+                        nonexistent="shift_forward",
+                    )
+                except Exception:
+                    _start_ak = _start_parsed
+
+            # Build an override column by calling connector_type_for(station_id, connector_id, start_dt)
+            def _ct_override(row):
+                sid = row.get("station_id")
+                cid = row.get("Connector #")
+                sdt = row.get("__start_ak")
+                if pd.isna(sdt) or sid is None or cid is None:
+                    return None
+                try:
+                    return connector_type_for(str(sid), int(cid), sdt)
+                except Exception:
+                    return None
+
+            sess = sess.copy()
+            sess["__start_ak"] = _start_ak
+            _override = sess.apply(_ct_override, axis=1)
+
+            if "Connector Type" in sess.columns:
+                # Prefer override when present, otherwise keep existing
+                sess["Connector Type"] = _override.where(_override.notna(), sess["Connector Type"])
+            else:
+                sess["Connector Type"] = _override
+
+            sess = sess.drop(columns=["__start_ak"], errors="ignore")
+    except Exception:
+        # Never break the sessions tab just because an override rule failed.
+        pass
     cols = ["Start Date/Time","End Date/Time","EVSE","Connector #","Connector Type",
             "Max Power (kW)","Energy Delivered (kWh)","Duration (min)","SoC Start","SoC End","ID Tag"]
     cols = [c for c in cols if c in sess.columns]
