@@ -623,7 +623,8 @@ with t1:
 
             # Build an override column by calling connector_type_for(...)
             # and also apply a safety-net rule for the Delta cutover.
-            CUTOFF_AK_DATE = pd.Timestamp("2026-01-30").date()
+            # Cutover is effective 2026-01-30 00:00:00 AK local.
+            CUTOFF_AK_TS = pd.Timestamp("2026-01-30 00:00:00", tz=AK_TZ)
 
             def _ct_override(row):
                 # Prefer station_id mapping when available
@@ -639,21 +640,33 @@ with t1:
                     return None
 
                 # --- Safety net: Delta connector 1 changed from CHAdeMO -> NACS on 2026-01-30 (AK local) ---
-                # We key off the friendly EVSE name since station_id strings can vary by platform.
+                # We key off the friendly EVSE name (robust match) since station_id strings can vary by platform.
                 try:
                     evse_name = str(row.get("EVSE") or "")
                 except Exception:
                     evse_name = ""
 
-                try:
-                    ak_date = None
-                    if pd.notna(sdt_ak):
-                        ak_date = pd.to_datetime(sdt_ak, errors="coerce").date()
-                except Exception:
-                    ak_date = None
+                evse_key = " ".join(evse_name.strip().lower().split())
 
-                if evse_name in ("Delta - Left", "Delta - Right") and cid_int == 1 and ak_date:
-                    return "NACS" if ak_date >= CUTOFF_AK_DATE else "CHAdeMO"
+                # Ensure we have a comparable AK-local timestamp
+                sdt_ak_ts = None
+                try:
+                    if pd.notna(sdt_ak):
+                        sdt_ak_ts = pd.to_datetime(sdt_ak, errors="coerce")
+                except Exception:
+                    sdt_ak_ts = None
+
+                # Apply Delta cutover only for connector 1
+                if cid_int == 1 and sdt_ak_ts is not None and pd.notna(sdt_ak_ts):
+                    if "delta" in evse_key and ("left" in evse_key or "right" in evse_key):
+                        try:
+                            return "NACS" if sdt_ak_ts >= CUTOFF_AK_TS else "CHAdeMO"
+                        except Exception:
+                            # If tz comparison fails for any reason, fall back to date-based check
+                            try:
+                                return "NACS" if sdt_ak_ts.date() >= CUTOFF_AK_TS.date() else "CHAdeMO"
+                            except Exception:
+                                return None
 
                 # --- Primary rule engine ---
                 # If station_id exists, ask constants.connector_type_for() using UTC-aware timestamp.
