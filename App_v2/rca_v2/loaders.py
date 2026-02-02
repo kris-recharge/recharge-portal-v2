@@ -56,22 +56,72 @@ def _normalize_station_list(stations: Any) -> List[str]:
     return out
 
 
-def _normalize_time_param(x: Any) -> str:
-    """Normalize start/end params into plain strings for DB-API drivers."""
+def _normalize_time_param(x: Any):
+    """Normalize start/end params into a single scalar time value.
+
+    Why:
+      - Callers sometimes accidentally pass a pandas Series/Index (e.g. a whole column).
+      - psycopg/Postgres cannot bind a Series to a timestamptz placeholder.
+
+    Behavior:
+      - If a list-like / Series / Index / ndarray is provided, use its first element.
+      - Always parse to a UTC timestamp when possible.
+      - For Postgres, return a timezone-aware python datetime.
+      - For SQLite, return an ISO-like string.
+    """
     if x is None:
-        return ""
-    if hasattr(x, "to_pydatetime"):
-        # pandas Timestamp
+        return None if using_postgres() else ""
+
+    # Unwrap common list-likes: Series/Index/ndarray/list/tuple/set
+    if isinstance(x, (pd.Series, pd.Index, np.ndarray, list, tuple, set)):
         try:
-            x = x.to_pydatetime()
+            seq = list(x) if not isinstance(x, np.ndarray) else x.tolist()
         except Exception:
-            pass
+            seq = []
+        x = seq[0] if seq else None
+        if x is None:
+            return None if using_postgres() else ""
+
+    # Unwrap numpy scalar
     if hasattr(x, "item") and callable(getattr(x, "item")):
         try:
             x = x.item()
         except Exception:
             pass
-    return str(x)
+
+    # If it's already a pandas Timestamp, keep it; otherwise try to parse
+    ts = None
+    if isinstance(x, pd.Timestamp):
+        ts = x
+    else:
+        try:
+            ts = pd.to_datetime(x, utc=True, errors="coerce")
+        except Exception:
+            ts = None
+
+    if ts is None or ts is pd.NaT:
+        # Last resort: stringify (but avoid passing giant Series strings)
+        return None if using_postgres() else str(x)
+
+    # Ensure UTC
+    if ts.tzinfo is None:
+        try:
+            ts = ts.tz_localize("UTC")
+        except Exception:
+            pass
+
+    if using_postgres():
+        # psycopg prefers python datetime for timestamptz params
+        try:
+            return ts.to_pydatetime()
+        except Exception:
+            return ts
+
+    # SQLite path: keep as a consistent string
+    try:
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return str(ts)
 
 
 def _ts_col() -> str:
