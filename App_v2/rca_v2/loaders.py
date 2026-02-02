@@ -7,7 +7,71 @@ from .config import AK_TZ
 from .db import get_conn, using_postgres, param_placeholder
 from .constants import EVSE_DISPLAY
 
+
 logger = logging.getLogger(__name__)
+
+
+# --- Parameter normalization helpers ---
+def _normalize_station_list(stations: Any) -> List[str]:
+    """Normalize `stations` into a flat List[str] suitable for SQL params.
+
+    This guards against callers accidentally passing pandas Series/Index, numpy arrays,
+    or nested list-likes. psycopg cannot adapt a pandas Series object.
+    """
+    if stations is None:
+        return []
+
+    # First: unwrap common array-like containers
+    if isinstance(stations, (pd.Series, pd.Index, np.ndarray)):
+        stations = stations.tolist()
+
+    # Ensure list-like
+    if isinstance(stations, (set, tuple)):
+        stations = list(stations)
+    elif not isinstance(stations, list):
+        stations = [stations]
+
+    # Flatten one level of nested list-likes (including Series/ndarray inside lists)
+    flat: List[Any] = []
+    for s in stations:
+        if s is None:
+            continue
+        if isinstance(s, (pd.Series, pd.Index, np.ndarray)):
+            flat.extend(s.tolist())
+        elif isinstance(s, (list, tuple, set)):
+            flat.extend(list(s))
+        else:
+            flat.append(s)
+
+    out: List[str] = []
+    for s in flat:
+        # Convert numpy scalar -> python scalar
+        if hasattr(s, "item") and callable(getattr(s, "item")):
+            try:
+                s = s.item()
+            except Exception:
+                pass
+        out.append(str(s))
+
+    return out
+
+
+def _normalize_time_param(x: Any) -> str:
+    """Normalize start/end params into plain strings for DB-API drivers."""
+    if x is None:
+        return ""
+    if hasattr(x, "to_pydatetime"):
+        # pandas Timestamp
+        try:
+            x = x.to_pydatetime()
+        except Exception:
+            pass
+    if hasattr(x, "item") and callable(getattr(x, "item")):
+        try:
+            x = x.item()
+        except Exception:
+            pass
+    return str(x)
 
 
 def _ts_col() -> str:
@@ -336,6 +400,11 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     if not stations:
         return pd.DataFrame()
+    stations = _normalize_station_list(stations)
+    start_utc = _normalize_time_param(start_utc)
+    end_utc = _normalize_time_param(end_utc)
+    if not stations:
+        return pd.DataFrame()
 
     # Supabase/Postgres: pull from ocpp_events and parse MeterValues payload JSON
     if using_postgres():
@@ -571,6 +640,11 @@ def load_authorize(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     if not stations:
         return pd.DataFrame()
+    stations = _normalize_station_list(stations)
+    start_utc = _normalize_time_param(start_utc)
+    end_utc = _normalize_time_param(end_utc)
+    if not stations:
+        return pd.DataFrame()
 
     # Supabase/Postgres: Authorize events live in ocpp_events
     if using_postgres():
@@ -693,6 +767,9 @@ def _in_clause_and_params(stations, start_utc: str, end_utc: str):
 
     The timestamp BETWEEN placeholders are handled separately per backend.
     """
+    stations = _normalize_station_list(stations)
+    start_utc = _normalize_time_param(start_utc)
+    end_utc = _normalize_time_param(end_utc)
     placeholders = _make_placeholders(len(stations)) if stations else ""
     where_in = f"station_id IN ({placeholders}) AND " if stations else ""
     return where_in, list(stations) + [start_utc, end_utc]
@@ -703,6 +780,9 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     Load realtime_status_notifications for the window; newest first; AKDT strings + friendly names.
     Includes vendor_error_code if the column exists (falls back cleanly if not).
     """
+    stations = _normalize_station_list(stations)
+    start_utc = _normalize_time_param(start_utc)
+    end_utc = _normalize_time_param(end_utc)
     if using_postgres():
         # Supabase/Postgres: StatusNotification events live in ocpp_events
         placeholders = _make_placeholders(len(stations)) if stations else ""
@@ -900,6 +980,9 @@ def load_connectivity(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
     Load realtime_websocket CONNECT/DISCONNECT events; newest first; AKDT strings + friendly names.
     """
+    stations = _normalize_station_list(stations)
+    start_utc = _normalize_time_param(start_utc)
+    end_utc = _normalize_time_param(end_utc)
     if using_postgres():
         # Supabase/Postgres: websocket CONNECT/DISCONNECT is not yet normalized.
         # Return an empty frame with expected columns for now.
