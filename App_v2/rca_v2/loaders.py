@@ -1,4 +1,5 @@
 import logging
+import os
 import pandas as pd
 import numpy as np
 import json
@@ -835,6 +836,23 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     end_utc = _normalize_time_param(end_utc)
     if using_postgres():
         # Supabase/Postgres: StatusNotification events live in ocpp_events
+        # To prevent accidental "only a few hours" views when StatusNotification volume is high,
+        # we apply a HIGH default row limit that can be tuned via env var.
+        # Set STATUS_HISTORY_MAX_ROWS=0 to disable limiting entirely.
+        try:
+            max_rows = int(os.getenv("STATUS_HISTORY_MAX_ROWS", "20000"))
+        except Exception:
+            max_rows = 20000
+        limit_clause = f"LIMIT {max_rows}" if max_rows and max_rows > 0 else ""
+
+        logger.info(
+            "load_status_history: stations=%s window=%s→%s max_rows=%s",
+            (len(stations) if stations else 0),
+            start_utc,
+            end_utc,
+            max_rows,
+        )
+
         placeholders = _make_placeholders(len(stations)) if stations else ""
         where_in = f"asset_id IN ({placeholders}) AND " if stations else ""
         between = _between_placeholders()
@@ -850,6 +868,7 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
           WHERE {where_in} action = 'StatusNotification'
             AND {_ts_col()} BETWEEN {between}
           ORDER BY {_ts_col()} DESC
+          {limit_clause}
         """
         params = (list(stations) if stations else []) + [start_utc, end_utc]
 
@@ -875,6 +894,19 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             )
 
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+
+        try:
+            min_ts = df["timestamp"].min()
+            max_ts = df["timestamp"].max()
+            logger.info(
+                "load_status_history: returned_rows=%s returned_window=%s→%s",
+                len(df),
+                min_ts,
+                max_ts,
+            )
+        except Exception:
+            logger.exception("load_status_history: failed to log returned window")
+
         df["AKDT"] = df["timestamp"].dt.tz_convert(AK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
         df["Location"] = df["station_id"].map(EVSE_DISPLAY).fillna(df["station_id"])
 
