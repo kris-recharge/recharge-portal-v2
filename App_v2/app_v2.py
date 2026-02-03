@@ -602,9 +602,9 @@ with t1:
                 except Exception:
                     start_ak = start_parsed_raw
                 try:
-                    start_utc = start_parsed_raw.dt.tz_convert("UTC")
+                    start_utc_ts = start_parsed_raw.dt.tz_convert("UTC")
                 except Exception:
-                    start_utc = start_parsed_utc
+                    start_utc_ts = start_parsed_utc
             else:
                 # tz-naive raw -> assume already AK-local, then convert to UTC
                 try:
@@ -617,9 +617,9 @@ with t1:
                     start_ak = start_parsed_raw
 
                 try:
-                    start_utc = start_ak.dt.tz_convert("UTC")
+                    start_utc_ts = start_ak.dt.tz_convert("UTC")
                 except Exception:
-                    start_utc = start_parsed_utc
+                    start_utc_ts = start_parsed_utc
 
             # Build an override column by calling connector_type_for(...)
             # and also apply a safety-net rule for the Delta cutover.
@@ -679,7 +679,7 @@ with t1:
 
             sess = sess.copy()
             sess["__start_ak"] = start_ak
-            sess["__start_utc"] = start_utc
+            sess["__start_utc"] = start_utc_ts
 
             _override = sess.apply(_ct_override, axis=1)
 
