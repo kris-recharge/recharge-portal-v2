@@ -1185,12 +1185,20 @@ with t4:
             # Sessions sheet: convert SoC columns to percentage and apply Excel % formatting
             if not sess_last.empty:
                 sess_df = sess_last.copy()
+
+                # Remove redundant connector column(s) in the export.
+                # We prefer to keep a single connector identifier. If both are present,
+                # drop the human-friendly "Connector #" and keep "connector_id".
+                if "Connector #" in sess_df.columns and "connector_id" in sess_df.columns:
+                    sess_df = sess_df.drop(columns=["Connector #"])
+
                 # Convert SoC values from 0–100 to 0–1 so they are true percentages
                 for col in ("SoC Start", "SoC End"):
                     if col in sess_df.columns:
                         sess_df[col] = (
                             pd.to_numeric(sess_df[col], errors="coerce") / 100.0
                         )
+
                 sess_df.to_excel(xw, sheet_name="Sessions", index=False)
 
                 # Best-effort: apply percentage number format to those columns
@@ -1242,7 +1250,7 @@ with t4:
                             sheet_name="Connectivity Summary",
                             index=False,
                         )
-                conn_export.to_excel(xw, sheet_name="Connectivity", index=False)
+                conn_export.to_excel(xw, sheet_name="Connectivity Data", index=False)
         data = bio.getvalue()
         # Center the download button beneath the export controls
         spacer_left, center_col, spacer_right = st.columns([1, 1, 1])
