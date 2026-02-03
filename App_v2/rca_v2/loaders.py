@@ -44,6 +44,10 @@ def _normalize_station_list(stations: Any) -> List[str]:
         else:
             flat.append(s)
 
+    # Allow callers to pass either asset_id (as_...) or a friendly display name.
+    # If a friendly name is provided, map it back to its asset_id.
+    reverse_display = {v: k for k, v in (EVSE_DISPLAY or {}).items()}
+
     out: List[str] = []
     for s in flat:
         # Convert numpy scalar -> python scalar
@@ -52,7 +56,12 @@ def _normalize_station_list(stations: Any) -> List[str]:
                 s = s.item()
             except Exception:
                 pass
-        out.append(str(s))
+
+        ss = str(s)
+        # If the station value matches a display name, convert back to asset id
+        if ss in reverse_display:
+            ss = str(reverse_display[ss])
+        out.append(ss)
 
     return out
 
@@ -854,18 +863,21 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
         )
 
         placeholders = _make_placeholders(len(stations)) if stations else ""
-        where_in = f"asset_id IN ({placeholders}) AND " if stations else ""
         between = _between_placeholders()
 
+        # Broaden to allow both direct and webhook-wrapped StatusNotification events.
+        station_expr = "COALESCE(asset_id, action_payload->'data'->'asset'->>'id')"
+        is_statusnotification = "(action = 'StatusNotification' OR (action IS NULL AND action_payload->'data'->'log'->>'action' = 'StatusNotification'))"
+
         sql = f"""
-          SELECT asset_id AS station_id,
+          SELECT {station_expr} AS station_id,
                  connector_id,
                  {_ts_col()} AS timestamp,
                  (action_payload->>'status') AS status,
                  (action_payload->>'errorCode') AS error_code,
                  (action_payload->>'vendorErrorCode') AS vendor_error_code
           FROM ocpp_events
-          WHERE {where_in} action = 'StatusNotification'
+          WHERE { (f"{station_expr} IN ({placeholders}) AND " if stations else "") } {is_statusnotification}
             AND {_ts_col()} BETWEEN {between}
           ORDER BY {_ts_col()} DESC
           {limit_clause}
@@ -879,6 +891,42 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             conn.close()
 
         if df is None or df.empty:
+            # Diagnostics: verify the DB has rows for this same filter.
+            try:
+                conn2 = get_conn()
+                cur = conn2.cursor()
+                # Build the same WHERE clause, but only return counts + min/max.
+                where_station = ""
+                params2 = []
+                if stations:
+                    where_station = f"{station_expr} IN ({placeholders}) AND "
+                    params2.extend(list(stations))
+                params2.extend([start_utc, end_utc])
+
+                diag_sql = f"""
+                  SELECT count(*) AS n,
+                         min({_ts_col()}) AS min_ts,
+                         max({_ts_col()}) AS max_ts
+                  FROM ocpp_events
+                  WHERE {where_station}{is_statusnotification}
+                    AND {_ts_col()} BETWEEN {between}
+                """
+                cur.execute(diag_sql, tuple(params2))
+                n, min_ts, max_ts = cur.fetchone()
+                logger.warning(
+                    "load_status_history EMPTY: stations=%s window=%s→%s diag_count=%s diag_window=%s→%s",
+                    (len(stations) if stations else 0),
+                    start_utc,
+                    end_utc,
+                    n,
+                    min_ts,
+                    max_ts,
+                )
+                cur.close()
+                conn2.close()
+            except Exception:
+                logger.exception("load_status_history EMPTY: diagnostic query failed")
+
             return pd.DataFrame(
                 columns=[
                     "AKDT",
