@@ -1186,18 +1186,20 @@ with t4:
             if not sess_last.empty:
                 sess_df = sess_last.copy()
 
-                # Remove redundant connector column(s) in the export.
-                # We prefer to keep a single connector identifier. If both are present,
-                # drop the human-friendly "Connector #" and keep "connector_id".
-                if "Connector #" in sess_df.columns and "connector_id" in sess_df.columns:
+                # Remove redundant connector number column from the export.
+                # Keep only one connector identifier (connector_id).
+                if "Connector #" in sess_df.columns:
                     sess_df = sess_df.drop(columns=["Connector #"])
+
+                # Remove redundant EVSE id columns from the export (friendly EVSE name is already present).
+                for col in ("asset_id", "station_id", "Stations_id", "Station_id"):
+                    if col in sess_df.columns:
+                        sess_df = sess_df.drop(columns=[col])
 
                 # Convert SoC values from 0–100 to 0–1 so they are true percentages
                 for col in ("SoC Start", "SoC End"):
                     if col in sess_df.columns:
-                        sess_df[col] = (
-                            pd.to_numeric(sess_df[col], errors="coerce") / 100.0
-                        )
+                        sess_df[col] = pd.to_numeric(sess_df[col], errors="coerce") / 100.0
 
                 sess_df.to_excel(xw, sheet_name="Sessions", index=False)
 
@@ -1230,7 +1232,15 @@ with t4:
             if not status_export.empty:
                 se_cols = [c for c in _status_cols if c in status_export.columns]
                 status_export[se_cols].to_excel(xw, sheet_name="Status", index=False)
-            if not conn_export.empty:
+            # Always write Connectivity sheets so the tabs exist in every export.
+            if conn_export is None or not isinstance(conn_export, pd.DataFrame) or conn_export.empty:
+                pd.DataFrame(
+                    columns=["Date/Time (AK Local)", "EVSE", "Connectivity", "Duration (min)"]
+                ).to_excel(xw, sheet_name="Connectivity Data", index=False)
+                pd.DataFrame(
+                    columns=["EVSE", "Total Disconnect Time (min)"]
+                ).to_excel(xw, sheet_name="Connectivity Summary", index=False)
+            else:
                 # Summary sheet: total DISCONNECT time per EVSE for this window
                 conn_summary = conn_export.copy()
                 if "Duration (min)" in conn_summary.columns:
@@ -1244,13 +1254,15 @@ with t4:
                         .rename(columns={"Duration (min)": "Total Disconnect Time (min)"})
                         .sort_values("Total Disconnect Time (min)", ascending=False)
                     )
-                    if not conn_summary.empty:
-                        conn_summary.to_excel(
-                            xw,
-                            sheet_name="Connectivity Summary",
-                            index=False,
-                        )
+
+                # Write detail + summary sheets
                 conn_export.to_excel(xw, sheet_name="Connectivity Data", index=False)
+                if conn_summary is None or not isinstance(conn_summary, pd.DataFrame) or conn_summary.empty:
+                    pd.DataFrame(
+                        columns=["EVSE", "Total Disconnect Time (min)"]
+                    ).to_excel(xw, sheet_name="Connectivity Summary", index=False)
+                else:
+                    conn_summary.to_excel(xw, sheet_name="Connectivity Summary", index=False)
         data = bio.getvalue()
         # Center the download button beneath the export controls
         spacer_left, center_col, spacer_right = st.columns([1, 1, 1])
