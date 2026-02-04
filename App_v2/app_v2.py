@@ -1073,7 +1073,6 @@ with t4:
         xlsx_bytes = build_export_xlsx_bytes(
             sessions_df=sess_last,
             meter_values_df=mv_last,
-            stations=stations,
             start_utc=export_start_utc,
             end_utc=export_end_utc,
             evse_display=EVSE_DISPLAY,
