@@ -578,20 +578,40 @@ with t1:
         sess = sess[sess["station_id"].astype(str).isin(_wanted)]
     if sess.empty:
         st.warning("No sessions found."); st.stop()
-    # Filter out non-charging/invalid rows (no tx, bad connector, or no power/energy)
+    # Filter out invalid rows (must have a transaction_id and a valid connector)
+    # NOTE: We intentionally KEEP 0 kWh sessions here so attempted/failed sessions
+    # are visible in the table and export. Daily Totals will exclude them via a
+    # success threshold.
     sess = sess.copy()
     if "transaction_id" in sess.columns:
         sess = sess[sess["transaction_id"].notna()]
         sess = sess[sess["transaction_id"].astype(str).str.strip().ne("")]
         sess = sess[~sess["transaction_id"].astype(str).str.lower().isin(["none", "nan"])]
+
     if "Connector #" in sess.columns:
         sess = sess[sess["Connector #"].isin([1, 2])]
-    # keep only sessions with activity (either power or energy)
-    pow_ok = pd.to_numeric(sess.get("Max Power (kW)"), errors="coerce").fillna(0) > 0
-    eng_ok = pd.to_numeric(sess.get("Energy Delivered (kWh)"), errors="coerce").fillna(0) > 0
-    sess = sess[pow_ok | eng_ok]
+
+    # Coerce numeric columns we rely on
+    sess["Energy Delivered (kWh)"] = pd.to_numeric(sess.get("Energy Delivered (kWh)"), errors="coerce")
+    sess["Max Power (kW)"] = pd.to_numeric(sess.get("Max Power (kW)"), errors="coerce")
+    sess["Duration (min)"] = pd.to_numeric(sess.get("Duration (min)"), errors="coerce")
+
+    # Define success threshold (kWh). Anything below this is treated as an attempt/failed.
+    SUCCESS_KWH_THRESHOLD = 0.5
+
+    # Add an outcome flag for UI + export (does not affect raw values)
+    if "Energy Delivered (kWh)" in sess.columns:
+        sess["Outcome"] = np.where(
+            sess["Energy Delivered (kWh)"].fillna(0.0) >= SUCCESS_KWH_THRESHOLD,
+            "Success",
+            "Attempt/Failed",
+        )
+    else:
+        sess["Outcome"] = "Unknown"
+
+    # If everything is empty after basic validation, stop.
     if sess.empty:
-        st.warning("No valid charging sessions found in this window."); st.stop()
+        st.warning("No sessions found in this window."); st.stop()
     # Normalize and sort sessions by start time (most recent first)
     if "Start Date/Time" in sess.columns:
         try:
@@ -734,8 +754,20 @@ with t1:
     except Exception:
         # Never break the sessions tab just because an override rule failed.
         pass
-    cols = ["Start Date/Time","End Date/Time","EVSE","Connector #","Connector Type",
-            "Max Power (kW)","Energy Delivered (kWh)","Duration (min)","SoC Start","SoC End","ID Tag"]
+    cols = [
+        "Start Date/Time",
+        "End Date/Time",
+        "EVSE",
+        "Connector #",
+        "Connector Type",
+        "Max Power (kW)",
+        "Energy Delivered (kWh)",
+        "Duration (min)",
+        "Outcome",
+        "SoC Start",
+        "SoC End",
+        "ID Tag",
+    ]
     cols = [c for c in cols if c in sess.columns]
     # Render the sessions table and capture the selected (station_id, transaction_id)
     selected_sid, selected_tx = sessions_table_single_select(sess)
@@ -813,6 +845,10 @@ with t1:
             sess_for_daily["__energy_kwh"] = pd.to_numeric(sess_for_daily[energy_col], errors="coerce").fillna(0.0)
         else:
             sess_for_daily["__energy_kwh"] = 0.0
+        # Exclude attempts/failed sessions from Daily Totals.
+        # We keep them in the table/export, but do not count them in KPI charts.
+        SUCCESS_KWH_THRESHOLD = 0.5
+        sess_for_daily = sess_for_daily[sess_for_daily["__energy_kwh"].fillna(0.0) >= SUCCESS_KWH_THRESHOLD]
 
         # Drop rows without a start time
         sess_for_daily = sess_for_daily.dropna(subset=["__day_ak"])
