@@ -455,6 +455,46 @@ def _load_per_evse(loader_fn, ids, start_iso, end_iso):
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+# Helper to sanitize DataFrame datetime columns for Excel export (remove timezone info)
+def _excel_safe_datetimes(df: pd.DataFrame, local_tz: str = "America/Anchorage") -> pd.DataFrame:
+    """Return a copy of df with timezone-aware datetimes converted to tz-naive.
+
+    Excel writers (xlsxwriter/openpyxl) do not support timezone-aware datetimes.
+    We convert tz-aware datetime columns to `local_tz` and then drop the tzinfo.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    out = df.copy()
+
+    # Handle true datetime64 columns first
+    for col in out.columns:
+        s = out[col]
+        # pandas datetime dtype
+        if pd.api.types.is_datetime64_any_dtype(s):
+            try:
+                # If tz-aware, convert to local then make naive
+                tz = getattr(getattr(s.dt, "tz", None), "zone", None) or getattr(s.dt, "tz", None)
+                if tz is not None:
+                    out[col] = s.dt.tz_convert(local_tz).dt.tz_localize(None)
+                else:
+                    # tz-naive already
+                    out[col] = s
+            except Exception:
+                # If anything weird happens, try a safe coercion path
+                try:
+                    tmp = pd.to_datetime(s, errors="coerce")
+                    tz2 = getattr(getattr(tmp.dt, "tz", None), "zone", None) or getattr(tmp.dt, "tz", None)
+                    if tz2 is not None:
+                        out[col] = tmp.dt.tz_convert(local_tz).dt.tz_localize(None)
+                    else:
+                        out[col] = tmp
+                except Exception:
+                    pass
+
+    return out
+
+
 
 
 def _make_station_key(stations):
@@ -1064,6 +1104,10 @@ with t4:
 
     sess_last = st.session_state.get("__v2_last_sessions", pd.DataFrame())
     mv_last = st.session_state.get("__v2_last_meter", pd.DataFrame())
+
+    # Excel cannot write timezone-aware datetimes; make export frames tz-naive.
+    sess_last = _excel_safe_datetimes(sess_last)
+    mv_last = _excel_safe_datetimes(mv_last)
 
     if sess_last.empty and mv_last.empty:
         st.info("No data available to export from this view. Visit the Charging Sessions tab first.")
