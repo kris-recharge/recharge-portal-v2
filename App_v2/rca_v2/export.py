@@ -247,6 +247,14 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
 
     out = out.rename(columns=rename_map)
 
+    # Flag attempted/failed sessions (keeps them visible in export without forcing them into totals).
+    # Convention: anything under 1 kWh is considered an "attempt" for reporting.
+    if "Energy Delivered (kWh)" in out.columns:
+        try:
+            out["Attempted (<1 kWh)"] = pd.to_numeric(out["Energy Delivered (kWh)"], errors="coerce").fillna(0) < 1
+        except Exception:
+            pass
+
     # Drop columns Kris called redundant
     # - Connector number (often connector_id or connector_number)
     # - Remove connector_id only if both connector type and transaction id are present
@@ -285,6 +293,8 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
         "ID Tag",
         "transaction_id",
         "connector_id",
+        # Add the new flag at the end of preferred columns
+        "Attempted (<1 kWh)",
     ]
 
     # Some datasets use different casing/labels; allow those too.
@@ -361,12 +371,32 @@ def prep_status_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name
     if station_col:
         out["EVSE"] = out[station_col].map(evse_display).fillna(out[station_col])
 
+    # Convert common UTC timestamp columns to local clock time (tz-naive for Excel)
     out = _convert_time_cols(out, tz_name=tz_name, cols=["timestamp", "received_at", "ts"])
 
-    # Normalize timestamp column for export
-    ts_col = _first_existing(out, ["timestamp", "received_at", "ts"])
-    if ts_col and ts_col in out.columns:
+    # Normalize timestamp column for export.
+    # Some upstream dataframes already include a local-time column named AKDT/AKST.
+    ts_col = _first_existing(
+        out,
+        [
+            "Timestamp (AKST)",
+            "Timestamp (AKDT)",
+            "AKST",
+            "AKDT",
+            "timestamp",
+            "received_at",
+            "ts",
+        ],
+    )
+    if ts_col and ts_col in out.columns and ts_col != "Timestamp (AKST)":
         out = out.rename(columns={ts_col: "Timestamp (AKST)"})
+
+    # If the timestamp is present but still object/string, try to coerce to datetime.
+    if "Timestamp (AKST)" in out.columns:
+        try:
+            out["Timestamp (AKST)"] = pd.to_datetime(out["Timestamp (AKST)"], errors="coerce")
+        except Exception:
+            pass
 
     # Normalize vendor error meta to requested labels
     if "vendor_error_impact" in out.columns:
@@ -386,7 +416,10 @@ def prep_status_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name
         "description",
     ]
 
-    out = out.drop(columns=[c for c in ["Location", "location", "station_id", "error_code"] if c in out.columns], errors="ignore")
+    out = out.drop(
+        columns=[c for c in ["Location", "location", "station_id", "error_code"] if c in out.columns],
+        errors="ignore",
+    )
     out = _order_cols(out, preferred)
 
     return out
