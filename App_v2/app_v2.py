@@ -1095,8 +1095,13 @@ with t4:
     except Exception:
         end_dt_local = end_local
 
+    # NOTE: Excel writers do not support timezone-aware datetimes.
+    # We keep UTC semantics but drop tzinfo before passing to the exporter.
     export_start_utc = start_dt_local.tz_convert("UTC")
     export_end_utc = end_dt_local.tz_convert("UTC")
+
+    export_start_utc_naive = export_start_utc.tz_localize(None)
+    export_end_utc_naive = export_end_utc.tz_localize(None)
 
     if export_end_utc <= export_start_utc:
         st.warning("Export end time must be after start time.")
@@ -1117,8 +1122,8 @@ with t4:
         xlsx_bytes = build_export_xlsx_bytes(
             sessions_df=sess_last,
             meter_values_df=mv_last,
-            start_utc=export_start_utc,
-            end_utc=export_end_utc,
+            start_utc=export_start_utc_naive,
+            end_utc=export_end_utc_naive,
             evse_display=EVSE_DISPLAY,
         )
 
