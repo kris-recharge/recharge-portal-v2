@@ -229,10 +229,10 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
     drop_cols = []
     drop_cols += [c for c in ["connector_num", "connector_number", "connector", "Connector #"] if c in out.columns]
 
+    # Keep connector_id for reporting (Kris wants it in the export).
     has_connector_type = any(c in out.columns for c in ["connector_type", "Connector Type"])
     has_txn = any(c in out.columns for c in ["transaction_id", "Transaction ID"])
-    if has_connector_type and has_txn:
-        drop_cols += [c for c in ["connector_id", "Connector ID"] if c in out.columns]
+    # Intentionally do NOT drop connector_id.
 
     # Remove the raw station id columns if we have friendly EVSE,
     # but only if the column is exactly asset_id or station_id
@@ -245,12 +245,53 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
 
     out = out.drop(columns=[c for c in drop_cols if c in out.columns], errors="ignore")
 
-    # Put EVSE early if present
+    # Prefer a stable export column order.
+    preferred = [
+        "Start Time (local)",
+        "End Time (local)",
+        "EVSE",
+        "Connector Type",
+        "Max Power (kW)",
+        "Energy Delivered (kWh)",
+        "Duration (min)",
+        "SoC Start (%)",
+        "SoC End (%)",
+        "ID Tag",
+        "station_id",
+        "transaction_id",
+        "connector_id",
+    ]
+
+    # Some datasets use different casing/labels; allow those too.
+    preferred += [
+        "connector_type",
+        "max_power_kw",
+        "energy_kwh",
+        "duration_min",
+        "soc_start",
+        "soc_end",
+        "id_tag",
+        "Transaction ID",
+        "Connector ID",
+    ]
+
+    out = _order_cols(out, preferred)
+
+    # If connector_id exists, place it immediately after transaction_id (Column L goal).
     cols = list(out.columns)
-    if "EVSE" in cols:
-        cols = [c for c in cols if c != "EVSE"]
-        cols.insert(2, "EVSE")
-        out = out[cols]
+    if "connector_id" in cols:
+        # Move connector_id right after transaction_id if both exist.
+        if "transaction_id" in cols:
+            cols.remove("connector_id")
+            cols.insert(cols.index("transaction_id") + 1, "connector_id")
+            out = out[cols]
+
+    # Put EVSE early if present (already handled by preferred order, but keep for compatibility)
+    # cols = list(out.columns)
+    # if "EVSE" in cols:
+    #     cols = [c for c in cols if c != "EVSE"]
+    #     cols.insert(2, "EVSE")
+    #     out = out[cols]
 
     return out
 
@@ -295,19 +336,27 @@ def prep_status_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name
 
     out = _convert_time_cols(out, tz_name=tz_name, cols=["timestamp", "received_at", "ts"])
 
-    # Prefer a friendly ordering
+    # Normalize timestamp column for export
+    ts_col = _first_existing(out, ["timestamp", "received_at", "ts"])
+    if ts_col and ts_col in out.columns:
+        out = out.rename(columns={ts_col: "Timestamp (AKST)"})
+
+    # Normalize vendor error meta to requested labels
+    if "vendor_error_impact" in out.columns:
+        out = out.rename(columns={"vendor_error_impact": "impact"})
+    if "vendor_error_desc" in out.columns:
+        out = out.rename(columns={"vendor_error_desc": "description"})
+    elif "vendor_error_description" in out.columns:
+        out = out.rename(columns={"vendor_error_description": "description"})
+
     preferred = [
-        "timestamp",
-        "received_at",
-        "ts",
+        "Timestamp (AKST)",
         "EVSE",
         "connector_id",
         "status",
-        "error_code",
         "vendor_error_code",
-        "vendor_error_desc",
-        "vendor_error_impact",
-        "message",
+        "impact",
+        "description",
     ]
     out = _order_cols(out, preferred)
 

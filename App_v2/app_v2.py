@@ -1114,6 +1114,25 @@ with t4:
     sess_last = _excel_safe_datetimes(sess_last)
     mv_last = _excel_safe_datetimes(mv_last)
 
+    # Load Status + Connectivity for the export window.
+    # IMPORTANT: these are loaded for the export-specific date/time inputs (not the main sidebar window).
+    try:
+        export_start_iso = export_start_utc.isoformat()
+        export_end_iso = export_end_utc.isoformat()
+
+        # Always use the same station filter the user selected (or "all EVSE" fallback).
+        export_stations = stations
+
+        status_export = _load_per_evse(load_status_history, export_stations, export_start_iso, export_end_iso)
+        conn_export = _load_per_evse(load_connectivity, export_stations, export_start_iso, export_end_iso)
+
+        # Make them Excel-safe too.
+        status_export = _excel_safe_datetimes(status_export)
+        conn_export = _excel_safe_datetimes(conn_export)
+    except Exception:
+        status_export = pd.DataFrame()
+        conn_export = pd.DataFrame()
+
     if sess_last.empty and mv_last.empty:
         st.info("No data available to export from this view. Visit the Charging Sessions tab first.")
         st.stop()
@@ -1122,6 +1141,8 @@ with t4:
         xlsx_bytes = build_export_xlsx_bytes(
             sessions_df=sess_last,
             meter_values_df=mv_last,
+            status_df=status_export,
+            connectivity_df=conn_export,
             start_utc=export_start_utc_naive,
             end_utc=export_end_utc_naive,
             evse_display=EVSE_DISPLAY,
