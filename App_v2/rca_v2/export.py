@@ -1,0 +1,593 @@
+
+
+"""Excel export helpers for ReCharge Alaska Portal v2.
+
+This module centralizes all Excel export logic so `app_v2.py` can stay lean.
+
+Design goals:
+- Works with both Postgres-backed data (Supabase) and local SQLite dev data.
+- Defensive about column names (schemas can evolve).
+- Keeps sheet creation and formatting in one place.
+
+Expected usage from app_v2.py:
+
+    from rca_v2.export import build_export_xlsx_bytes
+
+    xlsx_bytes = build_export_xlsx_bytes(
+        sessions_df=sessions_df,
+        meter_values_df=meter_values_df,
+        status_df=status_df,
+        connectivity_events_df=connectivity_events_df,
+        evse_display=evse_display,
+        tz_name="America/Anchorage",
+        start_utc=start_utc,
+        end_utc=end_utc,
+    )
+
+Then feed `xlsx_bytes` to st.download_button.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from io import BytesIO
+from typing import Any, Dict, Iterable, Optional, Tuple
+
+import pandas as pd
+
+try:
+    # Python 3.9+
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None  # type: ignore
+
+
+# ----------------------------
+# Public API
+# ----------------------------
+
+
+def build_export_xlsx_bytes(
+    *,
+    sessions_df: pd.DataFrame | None = None,
+    meter_values_df: pd.DataFrame | None = None,
+    status_df: pd.DataFrame | None = None,
+    connectivity_events_df: pd.DataFrame | None = None,
+    evse_display: Dict[str, str] | None = None,
+    tz_name: str = "America/Anchorage",
+    start_utc: datetime | None = None,
+    end_utc: datetime | None = None,
+    filename_prefix: str = "recharge_export",
+) -> bytes:
+    """Build an .xlsx export (bytes).
+
+    Sheets:
+      - Sessions
+      - MeterValues (window)
+      - Status
+      - Connectivity Data
+      - Connectivity Summary
+
+    The caller controls what data to include by passing dataframes.
+
+    Notes:
+      - This is the canonical export entrypoint used by `app_v2.py`.
+      - It is intentionally tolerant of schema differences between local SQLite and
+        Supabase/Postgres.
+    """
+
+    evse_display = evse_display or {}
+
+    sheets: Dict[str, pd.DataFrame] = {}
+
+    # --- Sessions ---
+    if sessions_df is not None and not sessions_df.empty:
+        sessions_sheet = prep_sessions_sheet(sessions_df, evse_display, tz_name=tz_name)
+        sheets["Sessions"] = sessions_sheet
+    else:
+        sheets["Sessions"] = pd.DataFrame()
+
+    # --- MeterValues (window) ---
+    if meter_values_df is not None and not meter_values_df.empty:
+        sheets["MeterValues (window)"] = prep_metervalues_sheet(
+            meter_values_df, evse_display, tz_name=tz_name
+        )
+    else:
+        sheets["MeterValues (window)"] = pd.DataFrame()
+
+    # --- Status ---
+    if status_df is not None and not status_df.empty:
+        sheets["Status"] = prep_status_sheet(status_df, evse_display, tz_name=tz_name)
+    else:
+        sheets["Status"] = pd.DataFrame()
+
+    # --- Connectivity ---
+    if connectivity_events_df is not None and not connectivity_events_df.empty:
+        conn_data = prep_connectivity_data_sheet(connectivity_events_df, evse_display, tz_name=tz_name)
+        conn_summary = prep_connectivity_summary_sheet(conn_data)
+        sheets["Connectivity Data"] = conn_data
+        sheets["Connectivity Summary"] = conn_summary
+    else:
+        sheets["Connectivity Data"] = pd.DataFrame()
+        sheets["Connectivity Summary"] = pd.DataFrame()
+
+    return write_xlsx_bytes(
+        sheets,
+        tz_name=tz_name,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        filename_prefix=filename_prefix,
+    )
+
+
+def build_export_xlsx(
+    *,
+    sess_df: pd.DataFrame | None = None,
+    mv_df: pd.DataFrame | None = None,
+    status_df: pd.DataFrame | None = None,
+    connectivity_events_df: pd.DataFrame | None = None,
+    evse_display: Dict[str, str] | None = None,
+    tz_name: str = "America/Anchorage",
+    start_utc: datetime | None = None,
+    end_utc: datetime | None = None,
+    filename_prefix: str = "recharge_export",
+) -> bytes:
+    return build_export_xlsx_bytes(
+        sessions_df=sess_df,
+        meter_values_df=mv_df,
+        status_df=status_df,
+        connectivity_events_df=connectivity_events_df,
+        evse_display=evse_display,
+        tz_name=tz_name,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        filename_prefix=filename_prefix,
+    )
+
+
+# ----------------------------
+# Sheet prep helpers
+# ----------------------------
+
+
+def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name: str) -> pd.DataFrame:
+    """Prepare Sessions sheet.
+
+    Requirements from Kris:
+      - remove redundant connector column D (connector #)
+      - remove redundant asset_id/station_id column (they called it Column K earlier)
+      - keep friendly EVSE name
+
+    Because column names vary between local/cloud, this function is defensive.
+    """
+
+    out = df.copy()
+
+    # Normalize station id column
+    station_col = _first_existing(out, [
+        "station_id",
+        "asset_id",
+        "evse_id",
+        "station",
+    ])
+
+    # Add/normalize friendly name
+    if station_col:
+        out["EVSE"] = out[station_col].map(evse_display).fillna(out[station_col])
+
+    # Convert time columns to local
+    out = _convert_time_cols(out, tz_name=tz_name, cols=[
+        "start_time",
+        "end_time",
+        "start",
+        "end",
+        "Start Time",
+        "End Time",
+        "Start Date/Time",
+        "End Date/Time",
+    ])
+
+    # Prefer consistent column names if present
+    rename_map = {}
+    # Start
+    for c in ["start_time", "start", "Start Date/Time", "Start Time"]:
+        if c in out.columns:
+            rename_map[c] = "Start Time (local)"
+            break
+    # End
+    for c in ["end_time", "end", "End Date/Time", "End Time"]:
+        if c in out.columns:
+            rename_map[c] = "End Time (local)"
+            break
+
+    # Energy
+    if "energy_kwh" in out.columns:
+        rename_map["energy_kwh"] = "Energy Delivered (kWh)"
+    elif "kwh" in out.columns:
+        rename_map["kwh"] = "Energy Delivered (kWh)"
+
+    # Duration
+    if "duration_min" in out.columns:
+        rename_map["duration_min"] = "Duration (min)"
+
+    # SoC
+    if "soc_start" in out.columns:
+        rename_map["soc_start"] = "SoC Start (%)"
+    if "soc_end" in out.columns:
+        rename_map["soc_end"] = "SoC End (%)"
+
+    # Id Tag
+    if "id_tag" in out.columns:
+        rename_map["id_tag"] = "ID Tag"
+
+    out = out.rename(columns=rename_map)
+
+    # Drop columns Kris called redundant
+    # - Connector number (often connector_id or connector_number)
+    # - Remove connector_id only if both connector type and transaction id are present
+    drop_cols = []
+    drop_cols += [c for c in ["connector_num", "connector_number", "connector", "Connector #"] if c in out.columns]
+
+    has_connector_type = any(c in out.columns for c in ["connector_type", "Connector Type"])
+    has_txn = any(c in out.columns for c in ["transaction_id", "Transaction ID"])
+    if has_connector_type and has_txn:
+        drop_cols += [c for c in ["connector_id", "Connector ID"] if c in out.columns]
+
+    # Remove the raw station id columns if we have friendly EVSE,
+    # but only if the column is exactly asset_id or station_id
+    if "EVSE" in out.columns and station_col in {"station_id", "asset_id"} and station_col in out.columns:
+        drop_cols.append(station_col)
+
+    # Also drop any explicitly requested "asset_id" column
+    if "asset_id" in out.columns:
+        drop_cols.append("asset_id")
+
+    out = out.drop(columns=[c for c in drop_cols if c in out.columns], errors="ignore")
+
+    # Put EVSE early if present
+    cols = list(out.columns)
+    if "EVSE" in cols:
+        cols = [c for c in cols if c != "EVSE"]
+        cols.insert(2, "EVSE")
+        out = out[cols]
+
+    return out
+
+
+def prep_metervalues_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name: str) -> pd.DataFrame:
+    """Prepare MeterValues (window) sheet."""
+    out = df.copy()
+
+    station_col = _first_existing(out, ["station_id", "asset_id", "evse_id"])
+    if station_col:
+        out["EVSE"] = out[station_col].map(evse_display).fillna(out[station_col])
+
+    out = _convert_time_cols(out, tz_name=tz_name, cols=["timestamp", "received_at", "ts"])
+
+    # Prefer a friendly ordering
+    preferred = [
+        "timestamp",
+        "received_at",
+        "ts",
+        "EVSE",
+        "connector_id",
+        "transaction_id",
+        "power_w",
+        "energy_wh",
+        "energy_kwh",
+        "soc",
+        "voltage_v",
+        "current_a",
+    ]
+    out = _order_cols(out, preferred)
+
+    return out
+
+
+def prep_status_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name: str) -> pd.DataFrame:
+    """Prepare Status sheet."""
+    out = df.copy()
+
+    station_col = _first_existing(out, ["station_id", "asset_id", "evse_id"])
+    if station_col:
+        out["EVSE"] = out[station_col].map(evse_display).fillna(out[station_col])
+
+    out = _convert_time_cols(out, tz_name=tz_name, cols=["timestamp", "received_at", "ts"])
+
+    # Prefer a friendly ordering
+    preferred = [
+        "timestamp",
+        "received_at",
+        "ts",
+        "EVSE",
+        "connector_id",
+        "status",
+        "error_code",
+        "vendor_error_code",
+        "vendor_error_desc",
+        "vendor_error_impact",
+        "message",
+    ]
+    out = _order_cols(out, preferred)
+
+    return out
+
+
+def prep_connectivity_data_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name: str) -> pd.DataFrame:
+    """Build per-event connectivity rows and compute durations.
+
+    Input expectations (best-effort):
+      - station/asset id column: station_id|asset_id|evse_id
+      - timestamp column: timestamp|received_at|ts
+      - event/action column: event|action|type (values include CONNECT/DISCONNECT)
+
+    Output columns:
+      - Start (local)
+      - End (local)
+      - Duration (min)
+      - EVSE
+      - station_id (kept for traceability)
+    """
+
+    src = df.copy()
+
+    station_col = _first_existing(src, ["station_id", "asset_id", "evse_id"])
+    ts_col = _first_existing(src, ["timestamp", "received_at", "ts"])
+    ev_col = _first_existing(src, ["event", "action", "type"])
+
+    if not station_col or not ts_col or not ev_col:
+        # Can't compute; return raw-ish with best-effort friendly mapping
+        if station_col:
+            src["EVSE"] = src[station_col].map(evse_display).fillna(src[station_col])
+        return src
+
+    # Ensure timestamps are datetime
+    src[ts_col] = pd.to_datetime(src[ts_col], utc=True, errors="coerce")
+
+    # Standardize event names
+    src[ev_col] = src[ev_col].astype(str).str.upper()
+
+    # Sort per EVSE
+    src = src.sort_values([station_col, ts_col])
+
+    rows = []
+    for sid, g in src.groupby(station_col, sort=False):
+        g = g.sort_values(ts_col)
+        last_connect = None
+        last_disconnect = None
+
+        # We create a duration row whenever we see a transition.
+        for _, r in g.iterrows():
+            ev = r[ev_col]
+            t = r[ts_col]
+            if pd.isna(t):
+                continue
+
+            if "CONNECT" in ev:
+                # if we have a preceding DISCONNECT, duration is disconnect->connect (downtime)
+                if last_disconnect is not None and t >= last_disconnect:
+                    rows.append(
+                        {
+                            "station_id": sid,
+                            "EVSE": evse_display.get(str(sid), str(sid)),
+                            "Start (UTC)": last_disconnect,
+                            "End (UTC)": t,
+                            "Duration (min)": (t - last_disconnect).total_seconds() / 60.0,
+                            "Type": "DISCONNECT→CONNECT",
+                        }
+                    )
+                    last_disconnect = None
+                last_connect = t
+
+            elif "DISCONNECT" in ev:
+                # if we have a preceding CONNECT, duration is connect->disconnect (uptime)
+                if last_connect is not None and t >= last_connect:
+                    rows.append(
+                        {
+                            "station_id": sid,
+                            "EVSE": evse_display.get(str(sid), str(sid)),
+                            "Start (UTC)": last_connect,
+                            "End (UTC)": t,
+                            "Duration (min)": (t - last_connect).total_seconds() / 60.0,
+                            "Type": "CONNECT→DISCONNECT",
+                        }
+                    )
+                    last_connect = None
+                last_disconnect = t
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    # Convert to local
+    out["Start (local)"] = _to_local(out["Start (UTC)"], tz_name)
+    out["End (local)"] = _to_local(out["End (UTC)"], tz_name)
+
+    out = out.drop(columns=["Start (UTC)", "End (UTC)"])
+
+    # Ordering
+    out = _order_cols(
+        out,
+        ["Start (local)", "End (local)", "Duration (min)", "Type", "EVSE", "station_id"],
+    )
+
+    # Sort newest first for export readability
+    if "Start (local)" in out.columns:
+        out = out.sort_values("Start (local)", ascending=False)
+
+    return out
+
+
+def prep_connectivity_summary_sheet(conn_data_df: pd.DataFrame) -> pd.DataFrame:
+    """Summarize connectivity minutes by EVSE."""
+
+    if conn_data_df is None or conn_data_df.empty:
+        return pd.DataFrame()
+
+    src = conn_data_df.copy()
+
+    # We only sum minutes for downtime rows by default (DISCONNECT→CONNECT),
+    # but if Type isn't present, just sum all.
+    if "Type" in src.columns:
+        downtime = src[src["Type"] == "DISCONNECT→CONNECT"].copy()
+        if downtime.empty:
+            downtime = src
+    else:
+        downtime = src
+
+    if "Duration (min)" not in downtime.columns:
+        return pd.DataFrame()
+
+    group_cols = [c for c in ["EVSE", "station_id"] if c in downtime.columns]
+    if not group_cols:
+        group_cols = ["EVSE"] if "EVSE" in downtime.columns else []
+
+    out = (
+        downtime.groupby(group_cols, dropna=False)["Duration (min)"]
+        .sum()
+        .reset_index()
+        .rename(columns={"Duration (min)": "Total Minutes"})
+    )
+
+    out["Total Hours"] = out["Total Minutes"] / 60.0
+
+    # Sort largest downtime first
+    out = out.sort_values("Total Minutes", ascending=False)
+
+    return out
+
+
+# ----------------------------
+# Writer
+# ----------------------------
+
+
+def write_xlsx_bytes(
+    sheets: Dict[str, pd.DataFrame],
+    *,
+    tz_name: str,
+    start_utc: datetime | None,
+    end_utc: datetime | None,
+    filename_prefix: str,
+) -> bytes:
+    """Write sheets to XLSX bytes.
+
+    Uses xlsxwriter if available, otherwise openpyxl.
+    """
+
+    output = BytesIO()
+
+    # Prefer xlsxwriter (faster + better column widths)
+    engine = "xlsxwriter"
+    try:
+        __import__("xlsxwriter")
+    except Exception:
+        engine = "openpyxl"
+
+    with pd.ExcelWriter(output, engine=engine, datetime_format="yyyy-mm-dd hh:mm:ss") as writer:
+        for name, df in sheets.items():
+            safe_name = _safe_sheet_name(name)
+            (df if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=safe_name, index=False)
+
+            # Best-effort: autosize columns for xlsxwriter
+            if engine == "xlsxwriter":
+                try:
+                    worksheet = writer.sheets[safe_name]
+                    _autosize_xlsxwriter(worksheet, df)
+                except Exception:
+                    pass
+
+        # Add a tiny "Meta" sheet for traceability
+        meta_rows = []
+        if start_utc is not None:
+            meta_rows.append({"key": "start_utc", "value": str(start_utc)})
+        if end_utc is not None:
+            meta_rows.append({"key": "end_utc", "value": str(end_utc)})
+        meta_rows.append({"key": "tz_name", "value": tz_name})
+        meta_rows.append({"key": "generated_at_utc", "value": str(pd.Timestamp.utcnow())})
+        meta_df = pd.DataFrame(meta_rows)
+        meta_df.to_excel(writer, sheet_name="Meta", index=False)
+
+        if engine == "xlsxwriter":
+            try:
+                worksheet = writer.sheets["Meta"]
+                _autosize_xlsxwriter(worksheet, meta_df)
+            except Exception:
+                pass
+
+    return output.getvalue()
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+
+def _first_existing(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _order_cols(df: pd.DataFrame, preferred: Iterable[str]) -> pd.DataFrame:
+    cols = list(df.columns)
+    out_cols = [c for c in preferred if c in cols]
+    out_cols += [c for c in cols if c not in out_cols]
+    return df[out_cols]
+
+
+def _convert_time_cols(df: pd.DataFrame, *, tz_name: str, cols: Iterable[str]) -> pd.DataFrame:
+    out = df
+    for c in cols:
+        if c in out.columns:
+            try:
+                s = pd.to_datetime(out[c], utc=True, errors="coerce")
+                out[c] = _to_local(s, tz_name)
+            except Exception:
+                # leave as-is
+                pass
+    return out
+
+
+def _to_local(series: pd.Series, tz_name: str) -> pd.Series:
+    """Convert a UTC-aware datetime series to a local tz-aware series."""
+    s = pd.to_datetime(series, utc=True, errors="coerce")
+    try:
+        # pandas uses dateutil tz strings; ZoneInfo is optional
+        return s.dt.tz_convert(tz_name)
+    except Exception:
+        # If tz_convert fails (rare), just return UTC
+        return s
+
+
+def _safe_sheet_name(name: str) -> str:
+    # Excel sheet names max 31 chars and cannot contain : \/ ? * [ ]
+    bad = [":", "\\", "/", "?", "*", "[", "]"]
+    out = name
+    for b in bad:
+        out = out.replace(b, "-")
+    out = out.strip()
+    return out[:31] if len(out) > 31 else out
+
+
+def _autosize_xlsxwriter(worksheet: Any, df: pd.DataFrame) -> None:
+    """Autosize columns in an xlsxwriter worksheet."""
+    if df is None:
+        return
+    # Cap width so it doesn't get absurd
+    max_width = 70
+
+    for i, col in enumerate(df.columns):
+        try:
+            series = df[col]
+            # Convert to strings for width calc, but keep NaNs short
+            max_len = max(
+                [len(str(col))]
+                + [len("" if pd.isna(v) else str(v)) for v in series.head(500)]
+            )
+            width = min(max_len + 2, max_width)
+            worksheet.set_column(i, i, width)
+        except Exception:
+            continue

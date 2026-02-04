@@ -294,6 +294,7 @@ from rca_v2.charts import (
     daily_session_counts_and_energy_figures,
 )
 from rca_v2.constants import get_evse_display, connector_type_for
+from rca_v2.export import build_export_xlsx_bytes
 
 
 
@@ -1064,214 +1065,32 @@ with t4:
     sess_last = st.session_state.get("__v2_last_sessions", pd.DataFrame())
     mv_last = st.session_state.get("__v2_last_meter", pd.DataFrame())
 
-    # Build Status and Connectivity exports on-demand using the export-specific filters
-    stations_key = _make_station_key(stations)
-    status_src = cached_status_history(stations_key, export_start_utc, export_end_utc)
-    status_export = pd.DataFrame()
-    if isinstance(status_src, pd.DataFrame) and not status_src.empty:
-        s = status_src.copy()
-
-        # Friendly EVSE name
-        if "station_id" in s.columns:
-            s["EVSE"] = s["station_id"].map(EVSE_DISPLAY).fillna(s["station_id"])
-        else:
-            s["EVSE"] = s.get("EVSE", "")
-
-        # AK‑local timestamp for sort/print
-        AK = "America/Anchorage"
-        if "AKDT_dt" in s.columns:
-            ts = pd.to_datetime(s["AKDT_dt"], errors="coerce")
-            try:
-                ts = ts.dt.tz_convert(AK)
-            except Exception:
-                pass
-        elif "AKDT" in s.columns:
-            ts = pd.to_datetime(s["AKDT"], errors="coerce")
-            try:
-                ts = ts.dt.tz_localize(AK)
-            except Exception:
-                pass
-        else:
-            ts = pd.to_datetime(s.get("timestamp"), errors="coerce", utc=True).dt.tz_convert(AK)
-        s["_ts"] = ts
-
-        # Tritium enrichment (adds impact/description when available)
-        s = _enrich_status_with_tritium(s)
-        # Always create the columns so they appear in the export, even if the lookup is unavailable
-        if "vendor_error_code" not in s.columns:
-            s["vendor_error_code"] = ""
-        if "impact" not in s.columns:
-            s["impact"] = ""
-        if "description" not in s.columns:
-            s["description"] = ""
-
-        status_export = s.copy()
-        status_export["Date/Time (AK Local)"] = status_export["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S")
-        _status_cols = [
-            "Date/Time (AK Local)",
-            "EVSE",
-            "connector_id",
-            "status",
-            "error_code",
-            "vendor_error_code",
-            "impact",
-            "description",
-        ]
-        status_export = status_export.sort_values("_ts", ascending=False, kind="mergesort")
-
-    conn_src = cached_connectivity(stations_key, export_start_utc, export_end_utc)
-    conn_export = pd.DataFrame()
-    if isinstance(conn_src, pd.DataFrame) and not conn_src.empty:
-        c = conn_src.copy()
-
-        # Timestamp (AK local)
-        if "AKDT_dt" in c.columns:
-            ts_ak = pd.to_datetime(c["AKDT_dt"], errors="coerce")
-        elif "AKDT" in c.columns:
-            ts_ak = pd.to_datetime(c["AKDT"], errors="coerce")
-        else:
-            ts_utc = pd.to_datetime(c.get("timestamp"), errors="coerce", utc=True)
-            try:
-                ts_ak = ts_utc.dt.tz_convert("America/Anchorage")
-            except Exception:
-                ts_ak = ts_utc
-        c["_ts"] = ts_ak
-
-        # Friendly EVSE names
-        if "station_id" in c.columns:
-            c["EVSE"] = c["station_id"].map(EVSE_DISPLAY).fillna(c.get("Location"))
-        else:
-            c["EVSE"] = c.get("Location")
-
-        # Normalize event label
-        if "Connectivity" in c.columns:
-            c["Connectivity"] = c["Connectivity"].astype(str)
-        elif "event" in c.columns:
-            c["Connectivity"] = c["event"].astype(str)
-        else:
-            c["Connectivity"] = ""
-
-        # Compute duration (min) between previous DISCONNECT and this CONNECT per station
-        sort_cols = ["station_id", "_ts"] if "station_id" in c.columns else ["EVSE", "_ts"]
-        c = c.sort_values(sort_cols, kind="mergesort")
-        evt = c["Connectivity"].str.upper()
-        prev_evt = evt.shift(1)
-        prev_ts = c["_ts"].shift(1)
-        same_station = (
-            c["station_id"].eq(c["station_id"].shift(1))
-            if "station_id" in c.columns else
-            c["EVSE"].eq(c["EVSE"].shift(1))
-        )
-        mask = same_station & evt.str.contains("CONNECT") & prev_evt.str.contains("DISCONNECT")
-        c["Duration (min)"] = np.where(
-            mask,
-            (c["_ts"] - prev_ts).dt.total_seconds() / 60.0,
-            np.nan,
-        )
-
-        conn_export = pd.DataFrame({
-            "Date/Time (AK Local)": c["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "EVSE": c["EVSE"],
-            "Connectivity": c["Connectivity"],
-            "Duration (min)": pd.to_numeric(c["Duration (min)"], errors="coerce").round(2),
-        })
-        conn_export = conn_export.assign(__ts=c["_ts"]).sort_values("__ts", ascending=False, kind="mergesort").drop(columns="__ts")
-
     if sess_last.empty and mv_last.empty:
         st.info("No data available to export from this view. Visit the Charging Sessions tab first.")
-    else:
-        bio = BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as xw:
-            # Sessions sheet: convert SoC columns to percentage and apply Excel % formatting
-            if not sess_last.empty:
-                sess_df = sess_last.copy()
+        st.stop()
 
-                # Remove redundant connector number column from the export.
-                # Keep only one connector identifier (connector_id).
-                if "Connector #" in sess_df.columns:
-                    sess_df = sess_df.drop(columns=["Connector #"])
+    try:
+        xlsx_bytes = build_export_xlsx_bytes(
+            sessions_df=sess_last,
+            meter_values_df=mv_last,
+            stations=stations,
+            start_utc=export_start_utc,
+            end_utc=export_end_utc,
+            evse_display=EVSE_DISPLAY,
+        )
 
-                # Remove redundant EVSE id columns from the export (friendly EVSE name is already present).
-                for col in ("asset_id", "station_id", "Stations_id", "Station_id"):
-                    if col in sess_df.columns:
-                        sess_df = sess_df.drop(columns=[col])
-
-                # Convert SoC values from 0–100 to 0–1 so they are true percentages
-                for col in ("SoC Start", "SoC End"):
-                    if col in sess_df.columns:
-                        sess_df[col] = pd.to_numeric(sess_df[col], errors="coerce") / 100.0
-
-                sess_df.to_excel(xw, sheet_name="Sessions", index=False)
-
-                # Best-effort: apply percentage number format to those columns
-                try:
-                    from openpyxl.utils import get_column_letter
-
-                    sheet = xw.book["Sessions"]
-                    for col_name in ("SoC Start", "SoC End"):
-                        if col_name in sess_df.columns:
-                            col_idx = sess_df.columns.get_loc(col_name) + 1  # 1-based
-                            col_letter = get_column_letter(col_idx)
-                            for row_idx in range(2, len(sess_df) + 2):  # skip header
-                                cell = sheet[f"{col_letter}{row_idx}"]
-                                if cell.value is not None:
-                                    cell.number_format = "0%"
-                except Exception:
-                    # Keep export working even if formatting fails
-                    pass
-            if not mv_last.empty:
-                mvx = mv_last.copy()
-                # Excel can't handle tz-aware datetimes. Provide AKDT/UTC strings and drop the tz-aware column.
-                if "timestamp" in mvx.columns:
-                    ts = pd.to_datetime(mvx["timestamp"], errors="coerce", utc=True)
-                    mvx["timestamp_akdt"] = ts.dt.tz_convert("America/Anchorage").dt.strftime("%Y-%m-%d %H:%M:%S")
-                    mvx["timestamp_utc"] = ts.dt.tz_convert("UTC").dt.strftime("%Y-%m-%d %H:%M:%S")
-                    mvx = mvx.drop(columns=["timestamp"])
-                mvx.to_excel(xw, sheet_name="MeterValues (window)", index=False)
-            # Extra sheets: Status & Connectivity (matching the on-screen tables)
-            if not status_export.empty:
-                se_cols = [c for c in _status_cols if c in status_export.columns]
-                status_export[se_cols].to_excel(xw, sheet_name="Status", index=False)
-            # Always write Connectivity sheets so the tabs exist in every export.
-            if conn_export is None or not isinstance(conn_export, pd.DataFrame) or conn_export.empty:
-                pd.DataFrame(
-                    columns=["Date/Time (AK Local)", "EVSE", "Connectivity", "Duration (min)"]
-                ).to_excel(xw, sheet_name="Connectivity Data", index=False)
-                pd.DataFrame(
-                    columns=["EVSE", "Total Disconnect Time (min)"]
-                ).to_excel(xw, sheet_name="Connectivity Summary", index=False)
-            else:
-                # Summary sheet: total DISCONNECT time per EVSE for this window
-                conn_summary = conn_export.copy()
-                if "Duration (min)" in conn_summary.columns:
-                    conn_summary["Duration (min)"] = pd.to_numeric(
-                        conn_summary["Duration (min)"], errors="coerce"
-                    )
-                    conn_summary = conn_summary[conn_summary["Duration (min)"] > 0]
-                    conn_summary = (
-                        conn_summary.groupby("EVSE", as_index=False)["Duration (min)"]
-                        .sum()
-                        .rename(columns={"Duration (min)": "Total Disconnect Time (min)"})
-                        .sort_values("Total Disconnect Time (min)", ascending=False)
-                    )
-
-                # Write detail + summary sheets
-                conn_export.to_excel(xw, sheet_name="Connectivity Data", index=False)
-                if conn_summary is None or not isinstance(conn_summary, pd.DataFrame) or conn_summary.empty:
-                    pd.DataFrame(
-                        columns=["EVSE", "Total Disconnect Time (min)"]
-                    ).to_excel(xw, sheet_name="Connectivity Summary", index=False)
-                else:
-                    conn_summary.to_excel(xw, sheet_name="Connectivity Summary", index=False)
-        data = bio.getvalue()
         # Center the download button beneath the export controls
         spacer_left, center_col, spacer_right = st.columns([1, 1, 1])
         with center_col:
             st.download_button(
                 "⬇ Download Excel",
-                data=data,
+                data=xlsx_bytes,
                 file_name="recharge_export.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                help="Exports Sessions, MeterValues (window), plus Status and Connectivity tables and a Connectivity Summary for the current filters.",
+                help=(
+                    "Exports Sessions, MeterValues (window), Status, Connectivity Data, and Connectivity Summary "
+                    "for the selected window and EVSE filter."
+                ),
             )
-
+    except Exception as e:
+        st.error(f"Export failed: {e}")
