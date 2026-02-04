@@ -201,16 +201,12 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
         out["EVSE"] = out[station_col].map(evse_display).fillna(out[station_col])
 
     # Convert time columns to local
-    out = _convert_time_cols(out, tz_name=tz_name, cols=[
-        "start_time",
-        "end_time",
-        "start",
-        "end",
-        "Start Time",
-        "End Time",
-        "Start Date/Time",
-        "End Date/Time",
-    ])
+    out = _convert_time_cols(
+        out,
+        tz_name=tz_name,
+        cols=["timestamp", "received_at", "ts"],
+        assume_utc_for_naive=True,
+    )
 
     # Prefer consistent column names if present
     rename_map = {}
@@ -246,6 +242,24 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
         rename_map["id_tag"] = "ID Tag"
 
     out = out.rename(columns=rename_map)
+    def _soc_to_fraction(val: Any) -> Any:
+        try:
+            x = float(val)
+        except Exception:
+            return val
+        if pd.isna(x):
+            return x
+        # Already fraction
+        if 0.0 <= x <= 1.0:
+            return x
+        # Percent -> fraction
+        if 1.0 < x <= 100.0:
+            return x / 100.0
+        return x
+
+    for soc_col in ["SoC Start (%)", "SoC End (%)", "SoC Start", "SoC End"]:
+        if soc_col in out.columns:
+            out[soc_col] = out[soc_col].apply(_soc_to_fraction)
 
     # Flag attempted/failed sessions (keeps them visible in export without forcing them into totals).
     # Convention: anything under 1 kWh is considered an "attempt" for reporting.
@@ -650,16 +664,43 @@ def _order_cols(df: pd.DataFrame, preferred: Iterable[str]) -> pd.DataFrame:
     return df[out_cols]
 
 
-def _convert_time_cols(df: pd.DataFrame, *, tz_name: str, cols: Iterable[str]) -> pd.DataFrame:
+def _convert_time_cols(
+    df: pd.DataFrame,
+    *,
+    tz_name: str,
+    cols: Iterable[str],
+    assume_utc_for_naive: bool = True,
+) -> pd.DataFrame:
+    """Convert listed datetime columns to local time (Excel-safe tz-naive).
+
+    - tz-aware values are converted to `tz_name`.
+    - tz-naive values:
+        * assume_utc_for_naive=True  -> treat as UTC, convert to local
+        * assume_utc_for_naive=False -> assume already local, leave as-is
+    """
     out = df
     for c in cols:
-        if c in out.columns:
-            try:
-                s = pd.to_datetime(out[c], utc=True, errors="coerce")
+        if c not in out.columns:
+            continue
+        try:
+            s = pd.to_datetime(out[c], errors="coerce")
+
+            # tz-aware -> convert to local
+            if pd.api.types.is_datetime64tz_dtype(s):
                 out[c] = _to_local(s, tz_name)
-            except Exception:
-                # leave as-is
-                pass
+                continue
+
+            # tz-naive -> either treat as UTC and convert, or leave as-is
+            if assume_utc_for_naive:
+                try:
+                    s_utc = s.dt.tz_localize("UTC")
+                    out[c] = _to_local(s_utc, tz_name)
+                except Exception:
+                    out[c] = s
+            else:
+                out[c] = s
+        except Exception:
+            pass
     return out
 
 
