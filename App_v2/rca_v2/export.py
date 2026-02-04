@@ -488,7 +488,8 @@ def write_xlsx_bytes(
     with pd.ExcelWriter(output, engine=engine, datetime_format="yyyy-mm-dd hh:mm:ss") as writer:
         for name, df in sheets.items():
             safe_name = _safe_sheet_name(name)
-            (df if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=safe_name, index=False)
+            df_out = _excel_sanitize_df(df if df is not None else pd.DataFrame())
+            df_out.to_excel(writer, sheet_name=safe_name, index=False)
 
             # Best-effort: autosize columns for xlsxwriter
             if engine == "xlsxwriter":
@@ -507,7 +508,7 @@ def write_xlsx_bytes(
         meta_rows.append({"key": "tz_name", "value": tz_name})
         meta_rows.append({"key": "generated_at_utc", "value": str(pd.Timestamp.utcnow())})
         meta_df = pd.DataFrame(meta_rows)
-        meta_df.to_excel(writer, sheet_name="Meta", index=False)
+        _excel_sanitize_df(meta_df).to_excel(writer, sheet_name="Meta", index=False)
 
         if engine == "xlsxwriter":
             try:
@@ -552,14 +553,52 @@ def _convert_time_cols(df: pd.DataFrame, *, tz_name: str, cols: Iterable[str]) -
 
 
 def _to_local(series: pd.Series, tz_name: str) -> pd.Series:
-    """Convert a UTC-aware datetime series to a local tz-aware series."""
+    """Convert to local time and strip tzinfo (Excel-safe).
+
+    Excel writers (xlsxwriter/openpyxl) cannot write tz-aware datetimes.
+    We keep the local *clock time* but return tz-naive values.
+    """
     s = pd.to_datetime(series, utc=True, errors="coerce")
+
     try:
-        # pandas uses dateutil tz strings; ZoneInfo is optional
-        return s.dt.tz_convert(tz_name)
+        local = s.dt.tz_convert(tz_name)
     except Exception:
-        # If tz_convert fails (rare), just return UTC
-        return s
+        local = s
+
+    # Strip timezone to make Excel happy (keep displayed clock time)
+    try:
+        return local.dt.tz_localize(None)
+    except Exception:
+        return pd.to_datetime(local, errors="coerce")
+def _excel_sanitize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy safe for Excel writers.
+
+    Pandas Excel writers cannot handle tz-aware datetimes. This converts any
+    tz-aware datetime columns to tz-naive (keeping the displayed clock time).
+    """
+    if df is None or df.empty:
+        return df if df is not None else pd.DataFrame()
+
+    out = df.copy()
+
+    for c in out.columns:
+        try:
+            col = out[c]
+
+            # If it's already datetime with tz, strip tz
+            if pd.api.types.is_datetime64tz_dtype(col):
+                out[c] = col.dt.tz_localize(None)
+                continue
+
+            # If it's object that contains tz-aware timestamps, try coercing
+            if col.dtype == object:
+                parsed = pd.to_datetime(col, errors="ignore")
+                if isinstance(parsed, pd.Series) and pd.api.types.is_datetime64tz_dtype(parsed):
+                    out[c] = parsed.dt.tz_localize(None)
+        except Exception:
+            continue
+
+    return out
 
 
 def _safe_sheet_name(name: str) -> str:
