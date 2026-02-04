@@ -280,8 +280,9 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
         "Duration (min)",
         "SoC Start (%)",
         "SoC End (%)",
+        "SoC Start",
+        "SoC End",
         "ID Tag",
-        "station_id",
         "transaction_id",
         "connector_id",
     ]
@@ -290,7 +291,9 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
     preferred += [
         "connector_type",
         "max_power_kw",
+        "Max Power",
         "energy_kwh",
+        "Energy Delivered",
         "duration_min",
         "soc_start",
         "soc_end",
@@ -378,10 +381,12 @@ def prep_status_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name
         "EVSE",
         "connector_id",
         "status",
-        "vendor_error_code",
         "impact",
+        "vendor_error_code",
         "description",
     ]
+
+    out = out.drop(columns=[c for c in ["Location", "location", "station_id", "error_code"] if c in out.columns], errors="ignore")
     out = _order_cols(out, preferred)
 
     return out
