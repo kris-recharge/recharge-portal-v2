@@ -54,11 +54,15 @@ def build_export_xlsx_bytes(
     meter_values_df: pd.DataFrame | None = None,
     status_df: pd.DataFrame | None = None,
     connectivity_events_df: pd.DataFrame | None = None,
+    # Back-compat aliases used by older app_v2.py exports
+    connectivity_df: pd.DataFrame | None = None,
+    stations: Any = None,
     evse_display: Dict[str, str] | None = None,
     tz_name: str = "America/Anchorage",
     start_utc: datetime | None = None,
     end_utc: datetime | None = None,
     filename_prefix: str = "recharge_export",
+    **kwargs: Any,
 ) -> bytes:
     """Build an .xlsx export (bytes).
 
@@ -78,6 +82,19 @@ def build_export_xlsx_bytes(
     """
 
     evse_display = evse_display or {}
+
+    # ----------------------------
+    # Backwards-compatible argument handling
+    # ----------------------------
+    # Some call-sites still pass `connectivity_df` instead of `connectivity_events_df`.
+    if connectivity_events_df is None and connectivity_df is not None:
+        connectivity_events_df = connectivity_df
+
+    # Older call-sites passed extra keyword args (e.g. `stations`). We don't need them
+    # in the export module; ignore safely.
+    _ = stations
+    kwargs.pop("stations", None)
+    kwargs.pop("connectivity_df", None)
 
     sheets: Dict[str, pd.DataFrame] = {}
 
@@ -127,22 +144,29 @@ def build_export_xlsx(
     mv_df: pd.DataFrame | None = None,
     status_df: pd.DataFrame | None = None,
     connectivity_events_df: pd.DataFrame | None = None,
+    # Back-compat alias
+    connectivity_df: pd.DataFrame | None = None,
+    stations: Any = None,
     evse_display: Dict[str, str] | None = None,
     tz_name: str = "America/Anchorage",
     start_utc: datetime | None = None,
     end_utc: datetime | None = None,
     filename_prefix: str = "recharge_export",
+    **kwargs: Any,
 ) -> bytes:
     return build_export_xlsx_bytes(
         sessions_df=sess_df,
         meter_values_df=mv_df,
         status_df=status_df,
         connectivity_events_df=connectivity_events_df,
+        connectivity_df=connectivity_df,
+        stations=stations,
         evse_display=evse_display,
         tz_name=tz_name,
         start_utc=start_utc,
         end_utc=end_utc,
         filename_prefix=filename_prefix,
+        **kwargs,
     )
 
 
