@@ -42,7 +42,18 @@ EVSE_DISPLAY = get_evse_display()
 
 # Identify portal user + allowed EVSEs (deny-by-default when behind portal)
 portal = get_portal_user()  # reads x-portal-user-* headers injected by Next/Caddy
-allowed_ids = filter_allowed_evse_ids(portal)
+
+# `filter_allowed_evse_ids` expects both the portal context and the raw allowlist
+# payload (as stored in Supabase). When running in local-dev / fail-open mode,
+# the allowlist may be missing.
+_portal_allowed_raw = None
+if isinstance(portal, dict):
+    for _k in ("allowed_evse_ids", "allowed_evse_ids_text", "allowed_evse_ids_json"):
+        if _k in portal and portal.get(_k) not in (None, ""):
+            _portal_allowed_raw = portal.get(_k)
+            break
+
+allowed_ids = filter_allowed_evse_ids(portal, _portal_allowed_raw)
 
 # Restrict the global EVSE display map to the allowed set only (when allowlist is present)
 if isinstance(allowed_ids, set):
