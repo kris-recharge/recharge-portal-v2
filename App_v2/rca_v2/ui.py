@@ -60,10 +60,30 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
 
     # If allowed_from_portal is a JSON/text blob, normalize to list[str]
     if isinstance(allowed_from_portal, str):
-        try:
-            allowed_from_portal = json.loads(allowed_from_portal)
-        except Exception:
-            allowed_from_portal = []
+        s = allowed_from_portal.strip()
+        parsed: list[str] = []
+        # JSON list (preferred)
+        if s.startswith("["):
+            try:
+                v = json.loads(s)
+                if isinstance(v, list):
+                    parsed = [str(x).strip() for x in v if str(x).strip()]
+            except Exception:
+                parsed = []
+        # Postgres text array like {"a","b"} or {a,b}
+        elif s.startswith("{") and s.endswith("}"):
+            inner = s[1:-1].strip()
+            if inner:
+                parts = inner.split(",")
+                for p in parts:
+                    p = p.strip().strip('"').strip("'")
+                    if p:
+                        parsed.append(p)
+        # Fallback: comma-separated
+        elif "," in s:
+            parsed = [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
+
+        allowed_from_portal = parsed
     if allowed_evse_ids is None:
         if allowed_from_portal:
             allowed_evse_ids = list(allowed_from_portal)
@@ -98,6 +118,29 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
 
     # Filter EVSEs by allow-list when provided.
     visible_keys = filter_allowed_evse_ids(all_keys, allowed_evse_ids)
+
+    # ---------- Optional auth debug (set RCA_AUTH_DEBUG=1 in env) ----------
+    auth_debug = os.getenv("RCA_AUTH_DEBUG", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if auth_debug:
+        try:
+            raw_allowed = allowed_from_portal
+        except Exception:
+            raw_allowed = None
+
+        debug_payload = {
+            "portal_type": type(portal).__name__ if portal is not None else None,
+            "email": email,
+            "logout_url": logout_url,
+            "allowed_evse_ids_arg": allowed_evse_ids,
+            "allowed_from_portal_normalized": raw_allowed,
+            "all_station_ids_count": len(all_keys) if all_keys else 0,
+            "all_station_ids_sample": list(all_keys)[:10] if all_keys else [],
+            "visible_station_ids_count": len(visible_keys) if visible_keys else 0,
+            "visible_station_ids": list(visible_keys) if visible_keys else [],
+        }
+        st.divider()
+        st.caption("Auth debug (RCA_AUTH_DEBUG=1)")
+        st.code(json.dumps(debug_payload, indent=2), language="json")
 
     # Build label → station_id mapping from the visible keys
     pairs = sorted([(display_name(k), k) for k in visible_keys], key=lambda x: x[0])
