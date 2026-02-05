@@ -1,5 +1,3 @@
-
-
 """Auth helpers for the Streamlit dashboard.
 
 This module is intentionally small and dependency-light.
@@ -211,6 +209,7 @@ def get_portal_user() -> PortalUser:
     email = _h(
         "x-portal-user-email",
         "x-portal-email",
+        "x-debug-portal-email",
         "x-user-email",
         "x-auth-request-email",
         "cf-access-authenticated-user-email",
@@ -219,6 +218,7 @@ def get_portal_user() -> PortalUser:
     user_id = _h(
         "x-portal-user-id",
         "x-portal-userid",
+        "x-debug-portal-userid",
         "x-user-id",
         "x-auth-request-user",
     )
@@ -228,6 +228,8 @@ def get_portal_user() -> PortalUser:
         "x-portal-allowed-evse-ids",
         "x-portal-allowed-evse",
         "x-allowed-evse-ids",
+        "x-debug-portal-allowed-evse-alt",
+        "x-debug-portal-allowed-evse",
     )
 
     # If the proxy isn't providing portal headers at all, treat as local/dev.
@@ -235,6 +237,19 @@ def get_portal_user() -> PortalUser:
         return PortalUser(email=None, user_id=None, allowed_evse_ids=None)
 
     allowed = _parse_allowed_evse(allowed_raw)
+
+    if os.getenv("RCA_AUTH_DEBUG") == "1":
+        present = {
+            "x-portal-user-email": "x-portal-user-email" in h,
+            "x-portal-user-id": "x-portal-user-id" in h,
+            "x-portal-allowed-evse-ids": "x-portal-allowed-evse-ids" in h,
+            "x-portal-allowed-evse": "x-portal-allowed-evse" in h,
+            "x-debug-portal-email": "x-debug-portal-email" in h,
+            "x-debug-portal-userid": "x-debug-portal-userid" in h,
+            "x-debug-portal-allowed-evse-alt": "x-debug-portal-allowed-evse-alt" in h,
+        }
+        print("RCA_AUTH_DEBUG portal_header_presence:")
+        print(json.dumps(present, indent=2, sort_keys=True))
 
     return PortalUser(email=email, user_id=user_id, allowed_evse_ids=allowed)
 
