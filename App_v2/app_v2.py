@@ -10,273 +10,12 @@ from io import BytesIO
 from datetime import datetime
 import requests
 
-# ---------------- Sidebar: Account / Logout ----------------
-
-from streamlit.components.v1 import html
-
-with st.sidebar:
-    st.markdown("### Account")
-
-    # Use a real button + JS redirect so logout happens in the SAME tab.
-    # A plain markdown link often opens a new tab and leaves the Streamlit
-    # websocket session alive (making /app still usable until refresh).
-    if st.button("Log out"):
-        html(
-            """
-            <script>
-              // Logout should happen in the SAME tab/window.
-              // Do a fetch to clear cookies, then navigate to /login.
-              fetch("/api/auth/logout", { method: "GET", credentials: "include" })
-                .catch(() => {})
-                .finally(() => {
-                  window.top.location.href = "/login";
-                });
-            </script>
-            """,
-            height=0,
-        )
-        st.stop()
-
-# -----------------------------------------------------------
-
-# Optional soft gate: require a shared embed token when running behind a portal.
-REQUIRED_EMBED_ACCESS_TOKEN = os.getenv("EMBED_ACCESS_TOKEN")
-
-
-def check_embed_token() -> None:
-    """
-    Block direct access to the dashboard unless a valid embed token is present.
-
-    This is a soft gate intended to discourage direct hits to the Streamlit URL.
-    The primary authentication and authorization still live in the Next.js + Supabase portal.
-    """
-    # If no token is configured in the environment, do nothing (gate disabled).
-    if not REQUIRED_EMBED_ACCESS_TOKEN:
-        return
-
-    # Streamlit 1.27+ has st.query_params; older releases use experimental_get_query_params.
-    try:
-        qp = st.query_params  # type: ignore[attr-defined]
-    except Exception:
-        qp = st.experimental_get_query_params()
-
-    token = ""
-
-    if isinstance(qp, dict):
-        # qp may be Mapping[str, List[str]] or Mapping[str, str]
-        val = qp.get("token")
-        if isinstance(val, list):
-            token = val[0] if val else ""
-        else:
-            token = val or ""
-    else:
-        # Newer Mapping-like object
-        token = qp.get("token", "")
-
-    if token != REQUIRED_EMBED_ACCESS_TOKEN:
-        st.error("Access to this dashboard is restricted.")
-        st.markdown(
-            "Please sign in via the ReCharge Portal:\n\n"
-            "[Open ReCharge Portal](https://dashboard.rechargealaska.net/login)"
-        )
-        st.stop()
-
-
-# --- Begin: Portal user helpers (query param extraction, Supabase authorization) ---
-
-def _get_request_headers() -> dict:
-    """Best-effort access to the current request headers.
-
-    Streamlit exposes headers via `st.context.headers` in newer versions.
-    If unavailable, return an empty dict.
-    """
-    try:
-        h = getattr(st, "context", None)
-        h = getattr(h, "headers", None)
-        if h is None:
-            return {}
-        # st.context.headers is a mapping-like object
-        return {str(k).lower(): str(v) for k, v in dict(h).items()}
-    except Exception:
-        return {}
-
-
-def _extract_header(headers: dict, key: str) -> str:
-    """Fetch a header value (case-insensitive) as a simple string."""
-    if not headers:
-        return ""
-    return (headers.get(key.lower()) or "").strip()
-
-
-def get_current_user_email() -> str | None:
-    """Best-effort extraction of the portal user's email.
-
-    Priority order:
-      1) Headers injected by the portal/proxy (most reliable)
-      2) Query string (?email=... or ?user_email=...) for iframe embeds
-    """
-    headers = _get_request_headers()
-
-    # Common header names you may choose to inject from Next/Caddy.
-    for k in (
-        "x-portal-user-email",
-        "x-user-email",
-        "x-auth-request-email",
-        "x-forwarded-email",
-    ):
-        v = _extract_header(headers, k)
-        if v:
-            return v
-
-    # Fallback to query params
-    qp = _get_query_params()
-    email = _extract_query_param(qp, "email")
-    if not email:
-        email = _extract_query_param(qp, "user_email")
-    email = (email or "").strip()
-    return email or None
-
-
-def fetch_allowed_evse_ids_for_email(email: str | None):
-    """Look up the set of station_ids this email is allowed to see from Supabase.
-
-    Returns:
-        - set([...])  : authorization data found and parsed
-        - set()       : user is known but has no allowed EVSEs
-        - None        : Supabase not configured / unreachable (no restriction)
-    """
-    # Prefer a dedicated SUPABASE_URL, but fall back to the public URL used by Next.
-    supabase_url = (os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or "").rstrip("/")
-    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-
-    if not email or not supabase_url or not service_key:
-        # Treat missing config as "no restriction" so the app still works locally.
-        return None
-
-    try:
-        resp = requests.get(
-            f"{supabase_url}/rest/v1/portal_users",
-            params={
-                "email": f"eq.{email}",
-                "active": "eq.true",
-                "select": "allowed_evse_ids",
-                "limit": "1",
-            },
-            headers={
-                "apikey": service_key,
-                "Authorization": f"Bearer {service_key}",
-            },
-            timeout=5,
-        )
-        resp.raise_for_status()
-        rows = resp.json()
-    except Exception:
-        # Fail open: if Supabase is unavailable, don't break the dashboard.
-        return None
-
-    if not rows:
-        # User exists in auth but has no portal_user_allowed_evse row.
-        return set()
-
-    raw_ids = rows[0].get("allowed_evse_ids") or []
-
-    # Supabase normally returns a JSON array here; normalize defensively.
-    if isinstance(raw_ids, str):
-        try:
-            parsed = json.loads(raw_ids)
-            if isinstance(parsed, list):
-                raw_ids = parsed
-            else:
-                raw_ids = [parsed]
-        except Exception:
-            raw_ids = [raw_ids]
-
-    return {str(sid) for sid in raw_ids}
-
-
-def fetch_allowed_evse_ids_from_headers():
-    """Read allowed EVSE ids from headers, if provided by the portal/proxy.
-
-    Header values may be:
-      - JSON array string: ["id1","id2"]
-      - Comma-separated: id1,id2
-
-    Returns:
-      - set([...]) if an allowlist header is present (even if empty)
-      - None if no allowlist header is present
-    """
-    headers = _get_request_headers()
-
-    # Header names we recognize (in priority order)
-    header_names = (
-        "x-portal-allowed-evse",
-        "x-portal-allowed-evse-ids",
-        "x-allowed-evse-ids",
-    )
-
-    present_name = None
-    raw = None
-
-    # IMPORTANT: distinguish "missing header" from "present but empty".
-    # `headers.get()` returns None for missing keys; we must NOT treat that as "".
-    for name in header_names:
-        if name in headers:
-            present_name = name
-            raw = headers.get(name)
-            break
-
-    if present_name is None:
-        # No allowlist header at all
-        return None
-
-    raw = "" if raw is None else str(raw)
-
-    if raw.strip() == "":
-        # Header present but empty -> explicit empty allowlist
-        return set()
-
-    raw = raw.strip()
-
-    # Try JSON first
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list):
-            return {str(x) for x in parsed}
-        if parsed is None:
-            return set()
-        return {str(parsed)}
-    except Exception:
-        pass
-
-    # Fallback: comma-separated
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    return {str(p) for p in parts}
-
-def _get_query_params():
-    """
-    Helper to safely access the current query parameters in Streamlit.
-    """
-    try:
-        return st.query_params  # type: ignore[attr-defined]
-    except Exception:
-        return st.experimental_get_query_params()
-
-
-def _extract_query_param(qp, key: str) -> str:
-    """
-    Normalize a single query-parameter value to a simple string.
-    """
-    try:
-        val = qp.get(key)
-    except Exception:
-        return ""
-    if isinstance(val, list):
-        return val[0] if val else ""
-    return val or ""
 
 
 
-# --- End: Portal user helpers ---
+
+# Add new auth helpers import before config import
+from rca_v2.auth import get_portal_user, filter_allowed_evse_ids
 
 from rca_v2.config import APP_MODE
 from rca_v2.ui import render_sidebar, sessions_table_single_select
@@ -298,72 +37,53 @@ from rca_v2.export import build_export_xlsx_bytes
 
 
 
+
 EVSE_DISPLAY = get_evse_display()
 
-# Soft gate: require the correct embed token when configured.
-check_embed_token()
+# Identify portal user + allowed EVSEs (deny-by-default when behind portal)
+portal = get_portal_user()  # reads x-portal-user-* headers injected by Next/Caddy
+allowed_ids = filter_allowed_evse_ids(portal)
 
-# Identify current portal user (if any).
-current_email = get_current_user_email()
-if current_email:
-    st.session_state["__portal_user_email"] = current_email
-
-# If we are behind the portal/proxy, we should have identity headers.
-# In that case, we MUST fail-closed if the portal does not provide an EVSE allowlist.
-_headers = _get_request_headers()
-_running_behind_portal = bool(_extract_header(_headers, "x-portal-user-email") or _extract_header(_headers, "x-portal-user-id"))
-
-# Prefer explicit allowed EVSE ids passed via headers (best for portal deployments).
-ALLOWED_STATIONS = fetch_allowed_evse_ids_from_headers()
-
-# If we're behind the portal and it didn't provide an allowlist, fail closed.
-# (Otherwise a misconfigured env would show ALL EVSEs.)
-if _running_behind_portal and ALLOWED_STATIONS is None:
-    st.error(
-        "Authorization scope missing (no EVSE allowlist provided by the portal). "
-        "Please contact ReCharge Alaska support."
-    )
-    st.stop()
-
-# If headers didn't specify allowed EVSE ids, fall back to Supabase lookup by email.
-if ALLOWED_STATIONS is None:
-    ALLOWED_STATIONS = fetch_allowed_evse_ids_for_email(current_email)
-
-if isinstance(ALLOWED_STATIONS, set):
-    if not ALLOWED_STATIONS:
+# Restrict the global EVSE display map to the allowed set only (when allowlist is present)
+if isinstance(allowed_ids, set):
+    if not allowed_ids:
         st.error(
             "Your account does not have access to any EVSEs. "
             "Please contact ReCharge Alaska if you believe this is an error."
         )
         st.stop()
 
-    # Restrict the global EVSE display map to the allowed set only.
     EVSE_DISPLAY = {
         sid: name
         for sid, name in EVSE_DISPLAY.items()
-        if sid in ALLOWED_STATIONS
+        if str(sid) in {str(x) for x in allowed_ids}
     }
-    st.session_state["__portal_allowed_station_ids"] = ALLOWED_STATIONS
+
+    st.session_state["__portal_allowed_station_ids"] = {str(x) for x in allowed_ids}
 else:
-    # None = fail-open / local dev: no authorization filter applied.
+    # None means fail-open/local-dev mode (no portal headers)
     st.session_state["__portal_allowed_station_ids"] = None
 
+
 with st.sidebar:
-    # Pass the filtered EVSE_DISPLAY into the sidebar renderer so that
-    # users only see EVSEs they are authorized for. Fall back gracefully
-    # if the function signature does not accept any arguments.
+    # Sidebar handles account/logout + EVSE filter UI.
+    # Provide portal context so it can display the signed-in email.
     try:
-        stations, start_utc, end_utc = render_sidebar(EVSE_DISPLAY)
+        stations, start_utc, end_utc = render_sidebar(EVSE_DISPLAY, portal=portal)
     except TypeError:
-        # Older/local versions of render_sidebar() may not take parameters.
-        stations, start_utc, end_utc = render_sidebar()
+        # Backward-compatible fallback for older/local sidebar signature.
+        try:
+            stations, start_utc, end_utc = render_sidebar(EVSE_DISPLAY)
+        except TypeError:
+            stations, start_utc, end_utc = render_sidebar()
 
 # Enforce EVSE authorization on the selected station list as a second line of defense.
 _allowed = st.session_state.get("__portal_allowed_station_ids")
-if isinstance(_allowed, (set, list, tuple)) and _allowed:
+if isinstance(_allowed, (set, list, tuple)):
     allowed_set = {str(s) for s in _allowed}
-    if stations:
-        stations = [s for s in stations if str(s) in allowed_set]
+    if allowed_set:
+        if stations:
+            stations = [s for s in stations if str(s) in allowed_set]
 
 
 # Best-effort enrichment of status rows with Tritium error metadata.

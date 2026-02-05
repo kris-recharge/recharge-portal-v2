@@ -5,9 +5,15 @@ Postgres-only DB connector for App_v2.
 - Uses psycopg (v3).
 - Adds hostaddr=<ipv4> when possible to avoid IPv6-only connection attempts.
 - Autocommit enabled (read-heavy app; avoids idle-in-transaction issues).
+
+RLS support:
+- Optionally applies Supabase/PostgREST-compatible request.jwt.claims to the session
+  (via `set_config('request.jwt.claims', <json>, false)`) so Postgres RLS policies
+  can enforce per-user access.
 """
 
 import os
+import json
 import socket
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -15,7 +21,13 @@ from urllib.parse import urlparse, parse_qs, unquote
 import psycopg
 
 # Explicit exports expected by older modules (e.g., loaders.py)
-__all__ = ["get_conn", "using_postgres", "param_placeholder"]
+__all__ = [
+    "get_conn",
+    "using_postgres",
+    "param_placeholder",
+    "apply_jwt_claims",
+    "clear_jwt_claims",
+]
 
 
 def using_postgres() -> bool:
@@ -75,10 +87,65 @@ def _url_to_conninfo(db_url: str) -> str:
     return " ".join(parts)
 
 
+def apply_jwt_claims(conn, claims) -> None:
+    """Apply Supabase/PostgREST-style JWT claims to this DB session.
+
+    This enables Postgres RLS policies that reference `auth.uid()` / JWT claims.
+
+    Parameters
+    ----------
+    conn:
+        psycopg Connection
+    claims:
+        Either a dict of decoded JWT claims, or a JSON string.
+
+    Notes
+    -----
+    - We intentionally set `is_local = false` so the config persists for the
+      session even with autocommit enabled.
+    - Supabase/PostgREST sets `request.jwt.claims` (plural). We follow that.
+    """
+    if claims is None:
+        return
+
+    if isinstance(claims, dict):
+        claims_json = json.dumps(claims)
+    else:
+        claims_json = str(claims)
+
+    # Best-effort: set request.jwt.claims for RLS.
+    # Using set_config with is_local=false so it persists for the session.
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT set_config('request.jwt.claims', %s, false)", (claims_json,))
+    except Exception:
+        # If this fails, we leave the session unmodified.
+        return
 
 
-def get_conn():
-    """Return a Postgres connection (psycopg). Requires DATABASE_URL."""
+def clear_jwt_claims(conn) -> None:
+    """Clear any previously-applied JWT claims from the DB session."""
+    try:
+        with conn.cursor() as cur:
+            # Empty JSON object is a safe default
+            cur.execute("SELECT set_config('request.jwt.claims', %s, false)", ("{}",))
+    except Exception:
+        return
+
+
+def get_conn(jwt_claims=None):
+    """Return a Postgres connection (psycopg). Requires DATABASE_URL.
+
+    Parameters
+    ----------
+    jwt_claims:
+        Optional decoded JWT claims (dict) or JSON string. If provided, the
+        connection session will be tagged with `request.jwt.claims` so Postgres
+        RLS policies can enforce per-user access.
+
+    Backwards compatible:
+        Existing callers can continue calling `get_conn()` with no args.
+    """
     db_url = (os.getenv("DATABASE_URL") or "").strip()
     if not db_url:
         raise RuntimeError(
@@ -105,5 +172,9 @@ def get_conn():
                 cur.execute("SET statement_timeout = %s", (ms,))
         except Exception:
             pass
+
+    # Optional: apply RLS JWT claims to this session
+    if jwt_claims is not None:
+        apply_jwt_claims(conn, jwt_claims)
 
     return conn

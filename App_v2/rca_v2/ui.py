@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, date, time
 from typing import Optional
 from .config import AK_TZ, UTC
 from .constants import EVSE_DISPLAY, display_name, get_all_station_ids
+from .auth import get_portal_user, filter_allowed_evse_ids, user_label
 
 def _round_up_to_hour(dt: datetime) -> datetime:
     base = dt.replace(minute=0, second=0, microsecond=0)
@@ -39,114 +40,38 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     else:
         st.markdown("### ReCharge Alaska")
 
-    # User info (optional, driven by query params passed from the portal)
-    try:
-        qp = st.query_params  # Streamlit >= 1.27
-    except Exception:
-        qp = st.experimental_get_query_params()
+    # Portal-provided user context (preferred): we read request headers forwarded by Caddy.
+    portal = get_portal_user()
 
-    allowed_from_qp: list[str] = []
+    # Allow app-level overrides (used for local/dev or explicit embedding overrides)
+    email = (user_email_override or portal.get("email") or "").strip()
+    logout_url = (logout_url_override or portal.get("logout_url") or "").strip()
 
-    def _qp_get(mapping, *keys):
-        """Return the raw query-param value for the first matching key."""
-        for k in keys:
-            if isinstance(mapping, dict):
-                if k in mapping:
-                    return mapping.get(k)
-            else:
-                # Streamlit >= 1.27 mapping[str, str]
-                try:
-                    if k in mapping:
-                        return mapping.get(k)
-                except Exception:
-                    pass
-        return None
+    # Allowed EVSEs: prefer explicit arg, else portal header, else (if we know the user) deny-by-default
+    allowed_from_portal = portal.get("allowed_evse_ids") or []
+    if allowed_evse_ids is None:
+        if allowed_from_portal:
+            allowed_evse_ids = list(allowed_from_portal)
+        elif email:
+            # SECURITY: user identified but allow-list missing -> show nothing
+            allowed_evse_ids = []
 
-    def _qp_first(val):
-        if isinstance(val, list):
-            return val[0] if val else ""
-        return val or ""
+    # --- Account / Logout ---
+    # Prefer an explicit logout_url from the portal, but fall back to our known route.
+    if not logout_url:
+        logout_url = "/api/auth/logout"
 
-    # Pull common keys (support multiple aliases)
-    raw_email = _qp_get(qp, "email")
-    raw_logout = _qp_get(qp, "logout_url")
-
-    # Allow-list may come in a few shapes/names depending on the portal implementation.
-    # Support JSON list, CSV, repeated params, and common key aliases.
-    raw_allowed = (
-        _qp_get(qp, "allowed_evse_ids")
-        or _qp_get(qp, "allowed_evse_ids[]")
-        or _qp_get(qp, "evse_ids")
-        or _qp_get(qp, "evse_ids[]")
-        or _qp_get(qp, "allowed")
-        or _qp_get(qp, "allowed[]")
-    )
-
-    # Normalize email/logout
-    email = _qp_first(raw_email) if raw_email is not None else ""
-    logout_url = _qp_first(raw_logout) if raw_logout is not None else ""
-
-    # Normalize allow-list
-    def _parse_allowed_ids(val) -> list[str]:
-        """Parse allowed EVSE ids from query params.
-
-        Accepts:
-          - JSON array string: '["id1","id2"]'
-          - Comma-separated string: 'id1,id2'
-          - Repeated query params list
-        """
-        if val is None:
-            return []
-        if isinstance(val, list):
-            # already a list from query params
-            items = [str(x).strip() for x in val if str(x).strip()]
-            return items
-        s = str(val).strip()
-        if not s:
-            return []
-        # Try JSON list first
-        if (s.startswith('[') and s.endswith(']')) or (s.startswith('"') and s.endswith('"')):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [str(x).strip() for x in parsed if str(x).strip()]
-                if isinstance(parsed, str):
-                    # A JSON string that might contain CSV
-                    s = parsed.strip()
-            except Exception:
-                pass
-        # Fallback: comma-separated
-        return [p.strip() for p in s.split(',') if p.strip()]
-
-    allowed_from_qp = _parse_allowed_ids(raw_allowed)
-
-    # Allow app-level overrides (used when embedding behind the Next.js portal)
-    if user_email_override:
-        email = user_email_override
-    if logout_url_override:
-        logout_url = logout_url_override
-
-    # If the caller didn't pass an allow-list, but the portal provided one via query params,
-    # honor it so users only see EVSEs they are authorized for.
-    if allowed_evse_ids is None and allowed_from_qp:
-        allowed_evse_ids = allowed_from_qp
-
-    # SECURITY: If the portal identifies a user (email is present) but does NOT
-    # provide an allow-list, do NOT default to showing all EVSEs.
-    # This prevents accidental overexposure when the portal forgets to pass
-    # allowed_evse_ids.
-    if email and allowed_evse_ids is None:
-        allowed_evse_ids = []
-
+    # Keep the sidebar clean: always show who is signed in (when we know),
+    # and show logout next to it.
     if email:
-        st.caption(f"Signed in as **{email}**")
+        left, right = st.columns([3, 2])
+        with left:
+            st.caption(user_label(email))
+        with right:
+            st.link_button("Log out", logout_url, use_container_width=True)
     else:
-        st.caption("Signed in via ReCharge Portal")
-
-    if logout_url:
+        # If we don't know the email, still show a logout button (portal session is cookie-based)
         st.link_button("Log out", logout_url, use_container_width=True)
-    else:
-        st.caption("To sign out, use the controls in the portal header.")
 
     st.divider()
 
@@ -156,17 +81,8 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     # All known EVSE station_ids from the DB
     all_keys = get_all_station_ids()
 
-    # If the caller passed an allow-list, intersect with all_keys so users only
-    # see EVSEs they are allowed to access.
-    if allowed_evse_ids is not None:
-        allowed_set = set(allowed_evse_ids)
-        visible_keys = [k for k in all_keys if k in allowed_set]
-        # If nothing overlaps (e.g. new EVSE not yet in the DB snapshot),
-        # fall back to whatever was passed in.
-        if not visible_keys:
-            visible_keys = list(allowed_set)
-    else:
-        visible_keys = list(all_keys)
+    # Filter EVSEs by allow-list when provided.
+    visible_keys = filter_allowed_evse_ids(all_keys, allowed_evse_ids)
 
     # Build label → station_id mapping from the visible keys
     pairs = sorted([(display_name(k), k) for k in visible_keys], key=lambda x: x[0])
