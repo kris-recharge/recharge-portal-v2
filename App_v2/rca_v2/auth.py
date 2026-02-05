@@ -19,6 +19,7 @@ When running locally (no proxy headers), these helpers gracefully fall back to
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -72,6 +73,26 @@ def _get_request_headers() -> dict[str, str]:
     return headers
 
 
+def _debug_headers_if_enabled(headers: dict[str, str]) -> None:
+    """Print request header diagnostics when RCA_AUTH_DEBUG=1.
+
+    We only print a safe subset of headers (x-*, forwarded/proxy) to avoid leaking
+    cookies or other secrets.
+    """
+    if os.getenv("RCA_AUTH_DEBUG") != "1":
+        return
+
+    safe: dict[str, str] = {}
+    for k, v in headers.items():
+        lk = k.lower()
+        if lk.startswith("x-") or lk.startswith("cf-") or lk.startswith("forwarded") or lk.startswith("x-forwarded"):
+            safe[lk] = v
+
+    # Print to server logs (Render / Docker logs)
+    print("RCA_AUTH_DEBUG headers_seen_by_streamlit:")
+    print(json.dumps(safe, indent=2, sort_keys=True))
+
+
 def _parse_allowed_evse(value: str | None) -> list[str] | None:
     """Parse allowed EVSE header value.
 
@@ -117,26 +138,61 @@ def _parse_allowed_evse(value: str | None) -> list[str] | None:
 # -----------------------------
 
 
+
 def get_portal_user() -> PortalUser:
     """Return the current portal user identity/authorization, if present.
 
-    Expected headers (case-insensitive):
+    Expected headers (case-insensitive) in the web deployment (via Caddy forward_auth):
     - x-portal-user-email
     - x-portal-user-id
-    - x-portal-allowed-evse  (JSON list or comma-separated)
+    - x-portal-allowed-evse-ids   (JSON list or comma-separated)
+
+    Backwards-compatible/alternate header names we also accept:
+    - x-portal-email, x-user-email, x-auth-request-email
+    - x-portal-allowed-evse (older)
 
     If headers are not present (typical local run), allowed_evse_ids is None.
     """
-    h = _get_request_headers()
 
-    email = h.get("x-portal-user-email")
-    user_id = h.get("x-portal-user-id")
+    h = _get_request_headers()
+    _debug_headers_if_enabled(h)
+
+    def _h(*names: str) -> str | None:
+        for name in names:
+            v = h.get(name.lower())
+            if v is None:
+                continue
+            s = str(v).strip()
+            if s != "":
+                return s
+        return None
+
+    email = _h(
+        "x-portal-user-email",
+        "x-portal-email",
+        "x-user-email",
+        "x-auth-request-email",
+        "cf-access-authenticated-user-email",
+    )
+
+    user_id = _h(
+        "x-portal-user-id",
+        "x-portal-userid",
+        "x-user-id",
+        "x-auth-request-user",
+    )
+
+    # Prefer the explicit allow-list header name.
+    allowed_raw = _h(
+        "x-portal-allowed-evse-ids",
+        "x-portal-allowed-evse",
+        "x-allowed-evse-ids",
+    )
 
     # If the proxy isn't providing portal headers at all, treat as local/dev.
-    if not email and not user_id and "x-portal-allowed-evse" not in h:
+    if not email and not user_id and allowed_raw is None:
         return PortalUser(email=None, user_id=None, allowed_evse_ids=None)
 
-    allowed_raw = h.get("x-portal-allowed-evse")
     allowed = _parse_allowed_evse(allowed_raw)
 
     return PortalUser(email=email, user_id=user_id, allowed_evse_ids=allowed)
@@ -181,5 +237,5 @@ def user_label(user: PortalUser) -> str:
 
 
 def debug_portal_headers() -> dict[str, str]:
-    """Return headers for troubleshooting (do not display in production by default)."""
+    """Return lower-cased request headers for troubleshooting (do not display in production by default)."""
     return _get_request_headers()
