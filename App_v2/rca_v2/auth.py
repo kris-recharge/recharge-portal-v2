@@ -46,31 +46,72 @@ class PortalUser:
 def _get_request_headers() -> dict[str, str]:
     """Best-effort access to request headers.
 
-    Streamlit has evolved header access over time. We try a few approaches so this
-    keeps working across versions.
+    IMPORTANT CONTEXT
+    - Your browser DevTools shows only the headers the browser *sent*.
+    - In your setup, identity/authorization headers (x-portal-*) are injected
+      server-side by Caddy after forward_auth succeeds, and then forwarded
+      upstream to Streamlit.
+
+    Streamlit itself does not expose request headers consistently across
+    versions/runtimes, so we try multiple approaches.
 
     Returns a **lower-cased** dict of header -> value.
     """
-    headers: dict[str, str] = {}
 
-    # Streamlit 1.27+ (varies by version): st.context.headers may exist.
+    def _normalize(raw_obj: Any) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if not raw_obj:
+            return out
+
+        # raw_obj may be Mapping-like, or something convertible to dict
+        try:
+            items = dict(raw_obj).items()
+        except Exception:
+            try:
+                items = raw_obj.items()  # type: ignore[attr-defined]
+            except Exception:
+                return out
+
+        for k, v in items:
+            if v is None:
+                continue
+            out[str(k).lower()] = str(v)
+        return out
+
+    # 1) Streamlit "public" context headers (varies by version)
     try:
         ctx = getattr(st, "context", None)
         if ctx is not None:
             raw = getattr(ctx, "headers", None)
-            if raw:
-                # raw is a Mapping-like
-                for k, v in dict(raw).items():
-                    if v is None:
-                        continue
-                    headers[str(k).lower()] = str(v)
-                return headers
+            h = _normalize(raw)
+            if h:
+                return h
     except Exception:
         pass
 
-    # Older fallback: experimental_get_query_params exists, but not headers.
-    # We intentionally do not attempt private Streamlit internals here.
-    return headers
+    # 2) Streamlit internal websocket headers (commonly works with reverse proxies)
+    # NOTE: this is a private API, but it's the most reliable way to access headers
+    # across many Streamlit versions.
+    try:
+        # Newer/older versions have different names.
+        try:
+            from streamlit.web.server.websocket_headers import (  # type: ignore
+                _get_websocket_headers as _ws_headers,
+            )
+        except Exception:
+            from streamlit.web.server.websocket_headers import (  # type: ignore
+                get_websocket_headers as _ws_headers,
+            )
+
+        raw = _ws_headers()  # type: ignore[misc]
+        h = _normalize(raw)
+        if h:
+            return h
+    except Exception:
+        pass
+
+    # 3) No headers available (common in local/dev or some deployments)
+    return {}
 
 
 def _debug_headers_if_enabled(headers: dict[str, str]) -> None:
