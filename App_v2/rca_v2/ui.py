@@ -43,12 +43,27 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     # Portal-provided user context (preferred): we read request headers forwarded by Caddy.
     portal = get_portal_user()
 
+    # `portal` may be either a dict (older/local paths) or a PortalUser object (new auth.py).
+    def _pget(key: str, default=None):
+        if portal is None:
+            return default
+        if isinstance(portal, dict):
+            return portal.get(key, default)
+        return getattr(portal, key, default)
+
     # Allow app-level overrides (used for local/dev or explicit embedding overrides)
-    email = (user_email_override or portal.get("email") or "").strip()
-    logout_url = (logout_url_override or portal.get("logout_url") or "").strip()
+    email = (user_email_override or (_pget("email", "") or "")).strip()
+    logout_url = (logout_url_override or (_pget("logout_url", "") or "")).strip()
 
     # Allowed EVSEs: prefer explicit arg, else portal header, else (if we know the user) deny-by-default
-    allowed_from_portal = portal.get("allowed_evse_ids") or []
+    allowed_from_portal = _pget("allowed_evse_ids", []) or []
+
+    # If allowed_from_portal is a JSON/text blob, normalize to list[str]
+    if isinstance(allowed_from_portal, str):
+        try:
+            allowed_from_portal = json.loads(allowed_from_portal)
+        except Exception:
+            allowed_from_portal = []
     if allowed_evse_ids is None:
         if allowed_from_portal:
             allowed_evse_ids = list(allowed_from_portal)
