@@ -81,11 +81,13 @@ export async function GET(req: Request) {
   // Caddy can copy these headers from the auth response to the proxied request.
   res.headers.set("X-Portal-User-Id", data.user.id);
   res.headers.set("X-Portal-User-Email", data.user.email ?? "");
+  res.headers.set("X-Portal-Logout-Url", "/api/auth/logout");
 
   // Fetch authorization scope (allowed EVSE IDs) from portal_users.
   // We prefer lookup by email (matches your admin workflow).
   // IMPORTANT: portal_users is usually protected by RLS, so we use the service role key on the server.
   let allowedEvseHeader = "";
+  let portalUserFound = false;
   const userEmail = (data.user.email ?? "").trim().toLowerCase();
 
   try {
@@ -94,38 +96,52 @@ export async function GET(req: Request) {
         auth: { persistSession: false, autoRefreshToken: false },
       });
 
-      // Use exact match on normalized email. (If your DB stores mixed-case emails,
-      // consider adding a generated lowercase column; for now we also try an ilike fallback.)
+      // Primary: exact match on normalized email.
       const { data: puByEmail, error: puEmailErr } = await admin
         .from("portal_users")
-        .select("allowed_evse_ids")
+        .select("email, allowed_evse_ids")
         .eq("email", userEmail)
         .maybeSingle();
 
       if (!puEmailErr && puByEmail) {
+        portalUserFound = true;
         allowedEvseHeader = toAllowedEvseHeaderValue((puByEmail as any).allowed_evse_ids);
       }
 
-      if (!allowedEvseHeader) {
+      // Fallback: case-insensitive match (helps if DB stored mixed-case emails).
+      if (!portalUserFound) {
         const { data: puByEmail2, error: puEmailErr2 } = await admin
           .from("portal_users")
-          .select("allowed_evse_ids")
+          .select("email, allowed_evse_ids")
           .ilike("email", userEmail)
           .maybeSingle();
 
         if (!puEmailErr2 && puByEmail2) {
+          portalUserFound = true;
           allowedEvseHeader = toAllowedEvseHeaderValue((puByEmail2 as any).allowed_evse_ids);
         }
       }
-
-      // Optional: if you later add a column that stores the auth user id, you can add a fallback here.
     }
   } catch {
     allowedEvseHeader = "";
+    portalUserFound = false;
   }
 
-  // Fail closed: empty header means "no EVSE access" in Streamlit.
+  // Fail closed: empty allowlist means "no EVSE access" in Streamlit.
+  // IMPORTANT: NULL or [] in portal_users.allowed_evse_ids should also result in empty allowlist.
+  // We also expose a debug/header flag so it’s obvious whether the portal_users row was found.
+  res.headers.set("X-Portal-User-Found", portalUserFound ? "1" : "0");
+
+  // Primary header used by Streamlit/Caddy wiring (comma-separated EVSE IDs)
+  res.headers.set("X-Portal-Allowed-Evse-Ids", allowedEvseHeader);
+
+  // Back-compat / alias (some places used this older name)
   res.headers.set("X-Portal-Allowed-EVSE", allowedEvseHeader);
+
+  // Debug mirrors (handy in browser devtools)
+  res.headers.set("X-Debug-Portal-Allowed-Evse", allowedEvseHeader);
+  res.headers.set("X-Debug-Portal-Email", userEmail);
+  res.headers.set("X-Debug-Portal-UserId", data.user.id);
 
   return res;
 }
