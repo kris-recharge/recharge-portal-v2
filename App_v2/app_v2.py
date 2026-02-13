@@ -40,8 +40,28 @@ from rca_v2.export import build_export_xlsx_bytes
 
 EVSE_DISPLAY = get_evse_display()
 
-# Identify portal user + allowed EVSEs (deny-by-default when behind portal)
+#
+# Identify portal user + allowed EVSEs
+# In production (when behind the portal), we enforce deny-by-default:
+# - If the user has NULL/empty allowed_evse_ids, they see ZERO EVSEs.
+# - If the allowlist exists, the app shows ALL allowed EVSEs by default.
+# In local/dev (no portal headers), we fail-open for convenience.
 portal = get_portal_user()  # reads x-portal-user-* headers injected by Next/Caddy
+
+# Detect whether this request is coming through the portal (i.e., headers are present).
+# We treat "has an email" OR "has a logout_url" OR "has any allowlist field" as portal context.
+portal_email = ""
+portal_logout_url = ""
+try:
+    if isinstance(portal, dict):
+        portal_email = (portal.get("email") or "").strip()
+        portal_logout_url = (portal.get("logout_url") or "").strip()
+    else:
+        portal_email = (getattr(portal, "email", "") or "").strip()
+        portal_logout_url = (getattr(portal, "logout_url", "") or "").strip()
+except Exception:
+    portal_email = ""
+    portal_logout_url = ""
 
 # Pull allowlist raw value from portal context (supports dict OR PortalUser object).
 _portal_allowed_raw = None
@@ -57,29 +77,43 @@ for _k in ("allowed_evse_ids", "allowed_evse_ids_text", "allowed_evse_ids_json")
     except Exception:
         pass
 
-# New signature: (portal_user, allowed_raw)
+is_portal_context = bool(portal_email or portal_logout_url or _portal_allowed_raw)
+
+# Ask auth.py to normalize the allowlist.
+# IMPORTANT: when we're in portal context and allowlist is missing/empty -> deny-by-default.
+allowed_ids = None
 try:
     allowed_ids = filter_allowed_evse_ids(portal, _portal_allowed_raw)
-except TypeError:
-    # Backward-compat / safety: if auth.py signature differs, fail open in local-dev
-    allowed_ids = None
+except Exception:
+    # If auth filtering blows up for any reason:
+    # - portal context => deny by default
+    # - local/dev      => fail open
+    allowed_ids = set() if is_portal_context else None
 
-# Restrict the global EVSE display map to the allowed set only (when allowlist is present)
-if isinstance(allowed_ids, set):
-    if not allowed_ids:
+# Normalize to a set of strings when present.
+allowed_ids_set = None
+if isinstance(allowed_ids, (set, list, tuple)):
+    allowed_ids_set = {str(x) for x in allowed_ids if str(x).strip() != ""}
+
+# Enforce deny-by-default when behind the portal.
+if is_portal_context:
+    # If the user has no allowlist (NULL/empty), they should see nothing.
+    if not allowed_ids_set:
         st.error(
             "Your account does not have access to any EVSEs. "
             "Please contact ReCharge Alaska if you believe this is an error."
         )
         st.stop()
 
+    # Restrict the global EVSE display map to ONLY the allowed set.
     EVSE_DISPLAY = {
         sid: name
         for sid, name in EVSE_DISPLAY.items()
-        if str(sid) in {str(x) for x in allowed_ids}
+        if str(sid) in allowed_ids_set
     }
 
-    st.session_state["__portal_allowed_station_ids"] = {str(x) for x in allowed_ids}
+    # Store allowed station ids in session_state for downstream loaders/filters.
+    st.session_state["__portal_allowed_station_ids"] = allowed_ids_set
 else:
     # None means fail-open/local-dev mode (no portal headers)
     st.session_state["__portal_allowed_station_ids"] = None
@@ -97,13 +131,6 @@ with st.sidebar:
         except TypeError:
             stations, start_utc, end_utc = render_sidebar()
 
-# Enforce EVSE authorization on the selected station list as a second line of defense.
-_allowed = st.session_state.get("__portal_allowed_station_ids")
-if isinstance(_allowed, (set, list, tuple)):
-    allowed_set = {str(s) for s in _allowed}
-    if allowed_set:
-        if stations:
-            stations = [s for s in stations if str(s) in allowed_set]
 
 
 # Best-effort enrichment of status rows with Tritium error metadata.
@@ -295,12 +322,29 @@ def load_mv_auth_and_sessions(stations_key, start_iso, end_iso):
     sess, heat = build_sessions(mv, auth)
     return mv, auth, sess, heat
 
-# Treat "no selection" as ALL EVSEs (matches sidebar hint)
+#
+# Treat "no selection" as ALL EVSEs the user is allowed to see.
+# This avoids the UX where a user must manually tick each EVSE to see data.
 if not stations:
     stations = list(EVSE_DISPLAY.keys())
     st.session_state["__v2_all_evse"] = True
 else:
     st.session_state["__v2_all_evse"] = False
+
+# Second line of defense: if a portal allowlist exists, keep selections within it.
+_allowed = st.session_state.get("__portal_allowed_station_ids")
+if isinstance(_allowed, (set, list, tuple)):
+    allowed_set = {str(s) for s in _allowed}
+    if allowed_set:
+        stations = [s for s in stations if str(s) in allowed_set]
+
+        # If the user somehow ends up with no stations after filtering, stop early.
+        if not stations:
+            st.error(
+                "Your account does not have access to any EVSEs in the current selection. "
+                "Please contact ReCharge Alaska if you believe this is an error."
+            )
+            st.stop()
 
 # Build tabs (Admin tab removed from the shared web deployment)
 TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Export"]

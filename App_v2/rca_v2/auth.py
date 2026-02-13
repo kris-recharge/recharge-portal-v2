@@ -257,11 +257,26 @@ def get_portal_user() -> PortalUser:
 def filter_allowed_evse_ids(all_evse_ids: Iterable[str], allowed_evse_ids: list[str] | None) -> list[str]:
     """Filter a list of EVSE ids by an allowed list.
 
-    - allowed_evse_ids is None => return all (no restriction)
-    - allowed_evse_ids is [] => return []
+    Security model (production-safe):
+    - allowed_evse_ids is None => DENY (return [])
+    - allowed_evse_ids is [] => DENY (return [])
+    - allowed_evse_ids contains "__ALL__" => allow all
+    - otherwise => return intersection
+
+    NOTE:
+    We intentionally treat None as "deny" so that a portal user
+    with no allowed_evse_ids configured cannot see any EVSE data.
+    Local/dev environments should explicitly bypass this at a higher layer
+    (e.g., by not supplying portal headers).
     """
     all_list = list(all_evse_ids)
-    if allowed_evse_ids is None:
+
+    # Hard deny if nothing configured
+    if not allowed_evse_ids:
+        return []
+
+    # Explicit superuser flag
+    if "__ALL__" in allowed_evse_ids:
         return all_list
 
     allowed_set = set(allowed_evse_ids)
