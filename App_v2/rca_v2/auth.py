@@ -2,22 +2,25 @@
 
 This module is intentionally small and dependency-light.
 
-In the web deployment, Caddy forward_auth calls the Next.js portal `/api/auth/verify`
-which (when valid) returns useful identity/authorization information via response headers.
-Caddy forwards those headers to Streamlit.
+In the web deployment, the Next.js portal `/api/auth/verify` is the source of truth.
 
-We read those headers (when available) to:
-- display the signed-in user next to the logout control
-- restrict EVSE visibility to the user's `allowed_evse_ids`
+Important note about Streamlit:
+- The Streamlit UI is maintained over a WebSocket (`/_stcore/stream`). Browsers do not send
+  arbitrary custom headers on that WebSocket upgrade.
+- Because of that, relying on `x-portal-*` headers being visible inside Streamlit is brittle.
 
-When running locally (no proxy headers), these helpers gracefully fall back to
-"no restriction".
+So, when possible, we call the portal verify endpoint from Streamlit (forwarding the browser
+cookies) to retrieve the user's email and `allowed_evse_ids`.
+
+When running locally (no portal), these helpers can fall back to a configurable dev mode.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -173,29 +176,149 @@ def _parse_allowed_evse(value: str | None) -> list[str] | None:
 
 
 # -----------------------------
+# Portal verify (Option 1)
+# -----------------------------
+
+
+def _portal_verify_url() -> str:
+    """Return the portal verify URL for server-side calls from Streamlit.
+
+    In Docker, Streamlit can reach the Next.js container via the service name.
+    Override with RCA_PORTAL_VERIFY_URL if needed.
+    """
+    return os.getenv("RCA_PORTAL_VERIFY_URL", "http://recharge_web:3000/api/auth/verify")
+
+
+def _call_portal_verify(cookie_header: str | None) -> tuple[int, dict[str, str], dict[str, Any] | None]:
+    """Call the portal `/api/auth/verify` endpoint.
+
+    Returns (status_code, response_headers_lower, json_body_or_none).
+
+    We forward the browser Cookie header so the portal can authenticate the user.
+    """
+    url = _portal_verify_url()
+
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Accept", "application/json")
+    if cookie_header:
+        req.add_header("Cookie", cookie_header)
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            status = getattr(resp, "status", 200)
+            headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+            body_bytes = resp.read() or b""
+
+        body_json: dict[str, Any] | None = None
+        if body_bytes:
+            try:
+                body_json = json.loads(body_bytes.decode("utf-8", errors="replace"))
+            except Exception:
+                body_json = None
+
+        return status, headers, body_json
+
+    except urllib.error.HTTPError as e:
+        headers = {str(k).lower(): str(v) for k, v in getattr(e, "headers", {}).items()}  # type: ignore[arg-type]
+        # Try to parse the error body (often empty)
+        try:
+            raw = e.read()  # type: ignore[attr-defined]
+        except Exception:
+            raw = b""
+        body_json: dict[str, Any] | None = None
+        if raw:
+            try:
+                body_json = json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                body_json = None
+        return int(getattr(e, "code", 0) or 0), headers, body_json
+
+    except Exception:
+        # Network error / timeout
+        return 0, {}, None
+
+
+def _portal_user_from_verify_response(headers: dict[str, str], body: dict[str, Any] | None) -> PortalUser:
+    """Extract PortalUser from verify response headers/body.
+
+    Preferred: JSON body fields (if your verify endpoint returns them).
+    Fallback: response headers (x-portal-*).
+    """
+
+    def _s(x: Any) -> str | None:
+        if x is None:
+            return None
+        s = str(x).strip()
+        return s or None
+
+    email: str | None = None
+    user_id: str | None = None
+    allowed: list[str] | None = None
+
+    if isinstance(body, dict):
+        email = _s(body.get("email") or body.get("user_email") or body.get("userEmail"))
+        user_id = _s(body.get("user_id") or body.get("userId") or body.get("id"))
+        # allowed IDs can be returned as list or string
+        allowed_val = body.get("allowed_evse_ids") or body.get("allowedEvseIds") or body.get("allowed_evse")
+        if allowed_val is not None:
+            if isinstance(allowed_val, list):
+                allowed = [str(v).strip() for v in allowed_val if str(v).strip()]
+            else:
+                allowed = _parse_allowed_evse(_s(allowed_val))
+
+    if email is None:
+        email = _s(headers.get("x-portal-user-email") or headers.get("x-debug-portal-email") or headers.get("x-portal-email"))
+    if user_id is None:
+        user_id = _s(headers.get("x-portal-user-id") or headers.get("x-debug-portal-userid") or headers.get("x-portal-userid"))
+    if allowed is None:
+        allowed_raw = headers.get("x-portal-allowed-evse-ids") or headers.get("x-portal-allowed-evse") or headers.get("x-debug-portal-allowed-evse-alt") or headers.get("x-debug-portal-allowed-evse")
+        allowed = _parse_allowed_evse(allowed_raw)
+
+    return PortalUser(email=email, user_id=user_id, allowed_evse_ids=allowed)
+
+
+# -----------------------------
 # Public API
 # -----------------------------
 
 
-
 def get_portal_user() -> PortalUser:
-    """Return the current portal user identity/authorization, if present.
+    """Return the current portal user identity/authorization.
 
-    Expected headers (case-insensitive) in the web deployment (via Caddy forward_auth):
-    - x-portal-user-email
-    - x-portal-user-id
-    - x-portal-allowed-evse-ids   (JSON list or comma-separated)
+    Preferred (production): call the portal `/api/auth/verify` endpoint from Streamlit,
+    forwarding the browser cookies.
 
-    Backwards-compatible/alternate header names we also accept:
-    - x-portal-email, x-user-email, x-auth-request-email
-    - x-portal-allowed-evse (older)
-
-    If headers are not present (typical local run), allowed_evse_ids is None.
+    Fallback: try to read proxy-injected headers from the Streamlit request context.
     """
 
     h = _get_request_headers()
     _debug_headers_if_enabled(h)
 
+    cookie = h.get("cookie")
+
+    # Option 1: ask the portal who the user is (cookie-based)
+    status, resp_headers, body = _call_portal_verify(cookie)
+    if status == 200:
+        u = _portal_user_from_verify_response(resp_headers, body)
+        # If portal says ok but provides no identity, treat as unauthenticated
+        if u.email or u.user_id or (u.allowed_evse_ids is not None):
+            if os.getenv("RCA_AUTH_DEBUG") == "1":
+                debug = {
+                    "portal_verify_status": status,
+                    "portal_verify_url": _portal_verify_url(),
+                    "portal_verify_has_body": bool(body),
+                    "portal_verify_email": u.email or "",
+                    "portal_verify_allowed_count": (len(u.allowed_evse_ids) if isinstance(u.allowed_evse_ids, list) else None),
+                }
+                print("RCA_AUTH_DEBUG portal_verify_result:")
+                print(json.dumps(debug, indent=2, sort_keys=True))
+            return u
+
+    # If verify explicitly says unauthorized, lock down.
+    if status in (401, 403):
+        return PortalUser(email=None, user_id=None, allowed_evse_ids=[])
+
+    # Fallback: attempt to use headers visible to Streamlit (best-effort)
     def _h(*names: str) -> str | None:
         for name in names:
             v = h.get(name.lower())
@@ -223,7 +346,6 @@ def get_portal_user() -> PortalUser:
         "x-auth-request-user",
     )
 
-    # Prefer the explicit allow-list header name.
     allowed_raw = _h(
         "x-portal-allowed-evse-ids",
         "x-portal-allowed-evse",
@@ -232,23 +354,23 @@ def get_portal_user() -> PortalUser:
         "x-debug-portal-allowed-evse",
     )
 
-    # If the proxy isn't providing portal headers at all, treat as local/dev.
+    # If no identity is present at all, treat as local/dev (no restriction)
     if not email and not user_id and allowed_raw is None:
+        # Local/dev: allow all by returning None (the caller must decide if this is OK)
         return PortalUser(email=None, user_id=None, allowed_evse_ids=None)
 
     allowed = _parse_allowed_evse(allowed_raw)
 
     if os.getenv("RCA_AUTH_DEBUG") == "1":
         present = {
-            "x-portal-user-email": "x-portal-user-email" in h,
-            "x-portal-user-id": "x-portal-user-id" in h,
-            "x-portal-allowed-evse-ids": "x-portal-allowed-evse-ids" in h,
-            "x-portal-allowed-evse": "x-portal-allowed-evse" in h,
-            "x-debug-portal-email": "x-debug-portal-email" in h,
-            "x-debug-portal-userid": "x-debug-portal-userid" in h,
-            "x-debug-portal-allowed-evse-alt": "x-debug-portal-allowed-evse-alt" in h,
+            "fallback_x_portal_user_email": "x-portal-user-email" in h,
+            "fallback_x_portal_user_id": "x-portal-user-id" in h,
+            "fallback_x_portal_allowed_evse_ids": "x-portal-allowed-evse-ids" in h,
+            "fallback_x_debug_portal_email": "x-debug-portal-email" in h,
+            "fallback_cookie_present": bool(cookie),
+            "portal_verify_status": status,
         }
-        print("RCA_AUTH_DEBUG portal_header_presence:")
+        print("RCA_AUTH_DEBUG portal_fallback_header_presence:")
         print(json.dumps(present, indent=2, sort_keys=True))
 
     return PortalUser(email=email, user_id=user_id, allowed_evse_ids=allowed)
