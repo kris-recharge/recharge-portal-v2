@@ -167,10 +167,37 @@ def _debug_headers_if_enabled(headers: dict[str, str]) -> None:
             ck, _ = part.split("=", 1)
             cookie_keys.append(ck.strip())
         safe["cookie_keys"] = sorted(set(cookie_keys))
+        safe["cookie_has_rca_email"] = "rca_email" in set(cookie_keys)
+        # Common Supabase cookie names vary by project ref; record whether any sb-*-auth-token appears.
+        safe["cookie_has_supabase_sb_auth"] = any(re.match(r"^sb-[A-Za-z0-9_-]+-auth-token$", ck) for ck in cookie_keys)
+        safe["cookie_has_supabase_auth_token"] = "supabase-auth-token" in set(cookie_keys)
 
     # Print to server logs (Render / Docker logs)
     print("RCA_AUTH_DEBUG headers_seen_by_streamlit:")
     print(json.dumps(safe, indent=2, sort_keys=True))
+# -----------------------------
+
+# Cookie -> email (Supabase)
+# -----------------------------
+
+
+# Helper to extract a single cookie value by name from a Cookie header
+def _extract_cookie_value(cookie_header: str | None, name: str) -> str | None:
+    """Extract a cookie value by name from a Cookie header.
+
+    Returns the URL-decoded value, or None if not present.
+    """
+    if not cookie_header:
+        return None
+    for part in cookie_header.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        if k.strip() == name:
+            val = urllib.parse.unquote(v.strip())
+            return val or None
+    return None
 
 
 def _parse_allowed_evse(value: str | None) -> list[str] | None:
@@ -516,7 +543,14 @@ def get_portal_user() -> PortalUser:
         cookie_dict = None
 
     cookie = h.get("cookie")
-    cookie_email = _extract_email_from_supabase_cookie(cookie, cookie_dict=cookie_dict)
+
+    # Prefer a simple portal-issued cookie if available (e.g., set by Next.js after login)
+    # This avoids relying on Supabase cookie formats and works reliably with Streamlit.
+    cookie_email = _extract_cookie_value(cookie, "rca_email")
+
+    # Fallback: attempt to extract from Supabase auth cookies (sb-*-auth-token, etc.)
+    if not cookie_email:
+        cookie_email = _extract_email_from_supabase_cookie(cookie, cookie_dict=cookie_dict)
     if os.getenv("RCA_AUTH_DEBUG") == "1":
         print("RCA_AUTH_DEBUG cookie_email_extracted:")
         print(json.dumps({"email": cookie_email or ""}, indent=2))
@@ -543,6 +577,9 @@ def get_portal_user() -> PortalUser:
                     "portal_verify_allowed_count": (len(u.allowed_evse_ids) if isinstance(u.allowed_evse_ids, list) else None),
                     "portal_verify_cookie_email_used": bool(cookie_email and (u.email == cookie_email)),
                     "supabase_lookup_enabled": bool(_supabase_url() and _supabase_service_role_key()),
+                    "portal_verify_body_keys": (sorted(list(body.keys())) if isinstance(body, dict) else None),
+                    "cookie_email_present": bool(cookie_email),
+                    "cookie_email_value": (cookie_email or ""),
                 }
                 print("RCA_AUTH_DEBUG portal_verify_result:")
                 print(json.dumps(debug, indent=2, sort_keys=True))
