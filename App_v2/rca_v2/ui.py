@@ -55,36 +55,59 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     email = (user_email_override or (_pget("email", "") or "")).strip()
     logout_url = (logout_url_override or (_pget("logout_url", "") or "")).strip()
 
+    def _normalize_id_list(value) -> list[str]:
+        """Normalize various allow-list representations into list[str]."""
+        if value is None:
+            return []
+        # Already a list/tuple/set-like
+        if isinstance(value, (list, tuple, set)):
+            out: list[str] = []
+            for x in value:
+                s = str(x).strip()
+                if s:
+                    out.append(s)
+            return out
+        # Strings: JSON list, Postgres array, comma-separated, or single token
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return []
+            parsed: list[str] = []
+            # JSON list (preferred)
+            if s.startswith("["):
+                try:
+                    v = json.loads(s)
+                    if isinstance(v, list):
+                        parsed = [str(x).strip() for x in v if str(x).strip()]
+                        return parsed
+                except Exception:
+                    pass
+            # Postgres text array like {"a","b"} or {a,b}
+            if s.startswith("{") and s.endswith("}"):
+                inner = s[1:-1].strip()
+                if inner:
+                    parts = inner.split(",")
+                    for p in parts:
+                        p = p.strip().strip('"').strip("'")
+                        if p:
+                            parsed.append(p)
+                    return parsed
+            # Comma-separated
+            if "," in s:
+                return [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
+            # Single token
+            return [s]
+        # Anything else: stringify
+        s = str(value).strip()
+        return [s] if s else []
+
     # Allowed EVSEs: prefer explicit arg, else portal header, else (if we know the user) deny-by-default
-    allowed_from_portal = _pget("allowed_evse_ids", []) or []
+    allowed_from_portal = _normalize_id_list(_pget("allowed_evse_ids", []))
 
-    # If allowed_from_portal is a JSON/text blob, normalize to list[str]
-    if isinstance(allowed_from_portal, str):
-        s = allowed_from_portal.strip()
-        parsed: list[str] = []
-        # JSON list (preferred)
-        if s.startswith("["):
-            try:
-                v = json.loads(s)
-                if isinstance(v, list):
-                    parsed = [str(x).strip() for x in v if str(x).strip()]
-            except Exception:
-                parsed = []
-        # Postgres text array like {"a","b"} or {a,b}
-        elif s.startswith("{") and s.endswith("}"):
-            inner = s[1:-1].strip()
-            if inner:
-                parts = inner.split(",")
-                for p in parts:
-                    p = p.strip().strip('"').strip("'")
-                    if p:
-                        parsed.append(p)
-        # Fallback: comma-separated
-        elif "," in s:
-            parsed = [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
+    # Normalize explicit arg too (we have seen cases where this arrives as a string)
+    allowed_evse_ids = _normalize_id_list(allowed_evse_ids)
 
-        allowed_from_portal = parsed
-    if allowed_evse_ids is None:
+    if not allowed_evse_ids:
         if allowed_from_portal:
             allowed_evse_ids = list(allowed_from_portal)
         elif email:
@@ -116,6 +139,9 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     # All known EVSE station_ids from the DB
     all_keys = get_all_station_ids()
 
+    # Ensure we have a list[str] for downstream set ops / filtering
+    all_keys = [str(k).strip() for k in (all_keys or []) if str(k).strip()]
+
     # Filter EVSEs by allow-list when provided.
     visible_keys = filter_allowed_evse_ids(all_keys, allowed_evse_ids)
 
@@ -127,16 +153,26 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
         except Exception:
             raw_allowed = None
 
+        allowed_set = set(allowed_evse_ids or [])
+        all_set = set(all_keys or [])
+        visible_set = set(visible_keys or [])
+
         debug_payload = {
             "portal_type": type(portal).__name__ if portal is not None else None,
             "email": email,
             "logout_url": logout_url,
             "allowed_evse_ids_arg": allowed_evse_ids,
-            "allowed_from_portal_normalized": raw_allowed,
+            "allowed_evse_ids_arg_type": type(allowed_evse_ids).__name__,
+            "allowed_from_portal_normalized": allowed_from_portal,
+            "allowed_from_portal_type": type(_pget("allowed_evse_ids", None)).__name__ if portal is not None else None,
             "all_station_ids_count": len(all_keys) if all_keys else 0,
             "all_station_ids_sample": list(all_keys)[:10] if all_keys else [],
             "visible_station_ids_count": len(visible_keys) if visible_keys else 0,
             "visible_station_ids": list(visible_keys) if visible_keys else [],
+            # The money shot: mismatch diagnostics
+            "allowed_not_in_db": sorted(list(allowed_set - all_set))[:50],
+            "db_not_in_allowed": sorted(list(all_set - allowed_set))[:50],
+            "visible_not_in_db": sorted(list(visible_set - all_set))[:50],
         }
         st.divider()
         st.caption("Auth debug (RCA_AUTH_DEBUG=1)")
