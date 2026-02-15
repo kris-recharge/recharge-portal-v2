@@ -91,6 +91,27 @@ def _get_request_headers() -> dict[str, str]:
             h = _normalize(raw)
             if h:
                 return h
+            # Some Streamlit versions expose cookies separately (not inside ctx.headers).
+            # If we have cookies but not a Cookie header, synthesize one.
+            try:
+                raw_cookies = getattr(ctx, "cookies", None)
+                if raw_cookies:
+                    # raw_cookies may be Mapping-like
+                    try:
+                        cookie_items = dict(raw_cookies).items()
+                    except Exception:
+                        cookie_items = raw_cookies.items()  # type: ignore[attr-defined]
+                    cookie_parts: list[str] = []
+                    for ck, cv in cookie_items:
+                        if cv is None:
+                            continue
+                        cookie_parts.append(f"{ck}={cv}")
+                    if cookie_parts:
+                        h2 = dict(h)
+                        h2.setdefault("cookie", "; ".join(cookie_parts))
+                        return h2
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -128,11 +149,24 @@ def _debug_headers_if_enabled(headers: dict[str, str]) -> None:
     if os.getenv("RCA_AUTH_DEBUG") != "1":
         return
 
-    safe: dict[str, str] = {}
+    safe: dict[str, Any] = {}
     for k, v in headers.items():
         lk = k.lower()
         if lk.startswith("x-") or lk.startswith("cf-") or lk.startswith("forwarded") or lk.startswith("x-forwarded"):
             safe[lk] = v
+
+    # Cookie diagnostics (names only)
+    cookie_header = headers.get("cookie")
+    safe["cookie_present"] = bool(cookie_header)
+    if cookie_header:
+        cookie_keys: list[str] = []
+        for part in cookie_header.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            ck, _ = part.split("=", 1)
+            cookie_keys.append(ck.strip())
+        safe["cookie_keys"] = sorted(set(cookie_keys))
 
     # Print to server logs (Render / Docker logs)
     print("RCA_AUTH_DEBUG headers_seen_by_streamlit:")
@@ -216,7 +250,7 @@ def _try_decode_jwt_email(jwt_token: str) -> str | None:
         return None
 
 
-def _extract_email_from_supabase_cookie(cookie_header: str | None) -> str | None:
+def _extract_email_from_supabase_cookie(cookie_header: str | None, cookie_dict: dict[str, str] | None = None) -> str | None:
     """Extract email from Supabase auth cookies.
 
     Common cookie names:
@@ -229,16 +263,18 @@ def _extract_email_from_supabase_cookie(cookie_header: str | None) -> str | None
       - <JWT>
       - URL-encoded variants of the above
     """
-    if not cookie_header:
-        return None
-
-    # Parse cookie header into key/value pairs
+    # Prefer an explicit cookie dict if provided
     cookies: dict[str, str] = {}
-    for part in cookie_header.split(";"):
-        if "=" not in part:
-            continue
-        k, v = part.split("=", 1)
-        cookies[k.strip()] = v.strip()
+    if cookie_dict:
+        cookies.update({str(k): str(v) for k, v in cookie_dict.items() if v is not None})
+    elif cookie_header:
+        for part in cookie_header.split(";"):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            cookies[k.strip()] = v.strip()
+    else:
+        return None
 
     # Prefer sb-*-auth-token cookies
     auth_cookie_keys = [
@@ -464,8 +500,23 @@ def get_portal_user() -> PortalUser:
     h = _get_request_headers()
     _debug_headers_if_enabled(h)
 
+    # Best-effort cookie dict from Streamlit context (if available)
+    cookie_dict: dict[str, str] | None = None
+    try:
+        ctx = getattr(st, "context", None)
+        if ctx is not None:
+            raw_cookies = getattr(ctx, "cookies", None)
+            if raw_cookies:
+                try:
+                    cookie_dict = dict(raw_cookies)  # type: ignore[arg-type]
+                except Exception:
+                    # mapping-like
+                    cookie_dict = {str(k): str(v) for k, v in raw_cookies.items()}  # type: ignore[attr-defined]
+    except Exception:
+        cookie_dict = None
+
     cookie = h.get("cookie")
-    cookie_email = _extract_email_from_supabase_cookie(cookie)
+    cookie_email = _extract_email_from_supabase_cookie(cookie, cookie_dict=cookie_dict)
     if os.getenv("RCA_AUTH_DEBUG") == "1":
         print("RCA_AUTH_DEBUG cookie_email_extracted:")
         print(json.dumps({"email": cookie_email or ""}, indent=2))
