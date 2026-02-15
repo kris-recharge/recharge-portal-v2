@@ -40,6 +40,9 @@ from rca_v2.export import build_export_xlsx_bytes
 
 EVSE_DISPLAY = get_evse_display()
 
+# Global auth debug flag (used to avoid hard-locking the UI while debugging auth)
+AUTH_DEBUG_ON = str(os.getenv("RCA_AUTH_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+
 #
 # Identify portal user + allowed EVSEs
 # In production (when behind the portal), we enforce deny-by-default:
@@ -47,6 +50,9 @@ EVSE_DISPLAY = get_evse_display()
 # - If the allowlist exists, the app shows ALL allowed EVSEs by default.
 # In local/dev (no portal headers), we fail-open for convenience.
 portal = get_portal_user()  # reads x-portal-user-* headers injected by Next/Caddy
+
+# Reset per-run lockout flag so a prior run can't permanently wedge the UI.
+st.session_state["__portal_no_access"] = False
 
 # Detect whether this request is coming through the portal (i.e., headers are present).
 # We treat "has an email" OR "has a logout_url" OR "has any allowlist field" as portal context.
@@ -157,7 +163,7 @@ if allowed_ids_set is not None:
 #   - Production (debug OFF): portal context + explicit empty allowlist => deny.
 #   - Debug mode: portal context + empty/missing allowlist => warn + fail open.
 if is_portal_context:
-    debug_on = str(os.getenv("RCA_AUTH_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
+    debug_on = AUTH_DEBUG_ON
 
     # Optional: superadmin bypass (comma-separated emails)
     superadmins = {
@@ -231,12 +237,21 @@ with st.sidebar:
             stations, start_utc, end_utc = render_sidebar()
 
 # If portal context determined no access, show banner AFTER sidebar renders.
+# IMPORTANT: when AUTH_DEBUG_ON is enabled, do NOT hard-stop the page.
+# This keeps the sidebar + debug panel visible so we can diagnose why the
+# allowlist isn't being honored.
 if st.session_state.get("__portal_no_access"):
     st.error(
         "Your account does not have access to any EVSEs. "
         "Please contact ReCharge Alaska if you believe this is an error."
     )
-    st.stop()
+    if AUTH_DEBUG_ON:
+        st.warning(
+            "Auth debug is enabled (RCA_AUTH_DEBUG=1), so the app will continue running "
+            "to allow troubleshooting. Set RCA_AUTH_DEBUG=0 to enforce the lockout."
+        )
+    else:
+        st.stop()
 
 
 
@@ -439,8 +454,8 @@ else:
     st.session_state["__v2_all_evse"] = False
 
 # Second line of defense: if a portal allowlist exists, keep selections within it.
-# Optional debug visibility for allowlist decisions
-if str(os.getenv("RCA_AUTH_DEBUG", "")).strip() in ("1", "true", "True"):
+ # Optional debug visibility for allowlist decisions
+if AUTH_DEBUG_ON:
     try:
         st.sidebar.caption("Auth debug (RCA_AUTH_DEBUG=1)")
         st.sidebar.code(
