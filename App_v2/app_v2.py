@@ -90,15 +90,84 @@ except Exception:
     # - local/dev      => fail open
     allowed_ids = set() if is_portal_context else None
 
+def _normalize_allowed_ids(raw):
+    """Normalize a variety of allowlist shapes into a clean set[str].
+
+    Supports:
+    - list/set/tuple of ids
+    - single comma-separated string
+    - JSON-ish string like '["as_..."]'
+    """
+    if raw in (None, ""):
+        return None
+
+    # If it's already an iterable of ids
+    if isinstance(raw, (set, list, tuple)):
+        items = list(raw)
+    else:
+        s = str(raw).strip()
+        if not s:
+            return set()
+
+        # Try JSON list first
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, (list, tuple, set)):
+                    items = list(obj)
+                else:
+                    items = [obj]
+            except Exception:
+                items = [s]
+        else:
+            # Comma-separated fall back
+            items = [p for p in s.split(",") if p.strip()]
+
+    out = set()
+    for x in items:
+        if x is None:
+            continue
+        t = str(x).strip()
+        if not t:
+            continue
+        # strip wrapping quotes
+        if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+            t = t[1:-1].strip()
+        if not t:
+            continue
+        # If someone accidentally passed a JSON-ish string element, split again
+        if "," in t and t.strip().startswith("as_"):
+            for part in t.split(","):
+                part = part.strip().strip('"').strip("'")
+                if part:
+                    out.add(part)
+        else:
+            out.add(t)
+    return out
+
 # Normalize to a set of strings when present.
-allowed_ids_set = None
-if isinstance(allowed_ids, (set, list, tuple)):
-    allowed_ids_set = {str(x) for x in allowed_ids if str(x).strip() != ""}
+allowed_ids_set = _normalize_allowed_ids(allowed_ids)
+if allowed_ids_set is not None:
+    allowed_ids_set = {str(x) for x in allowed_ids_set if str(x).strip() != ""}
 
 # Enforce deny-by-default when behind the portal.
+# NOTE: During debug, we want to avoid locking out legitimate users if the
+# allowlist is momentarily unavailable (e.g., missing headers on the Streamlit request).
 if is_portal_context:
-    # If the user has no allowlist (NULL/empty), they should see nothing.
-    if not allowed_ids_set:
+    debug_on = str(os.getenv("RCA_AUTH_DEBUG", "")).strip() in ("1", "true", "True")
+
+    # If we could not determine an allowlist at all (None), fail-open in debug mode
+    # so we can keep the UI accessible and inspect what's coming through.
+    if allowed_ids_set is None:
+        st.session_state["__portal_no_access"] = False
+        st.session_state["__portal_allowed_station_ids"] = None
+        if debug_on:
+            st.warning(
+                "Auth debug: portal context detected but allowlist was unavailable on this request. "
+                "Failing open for debugging."
+            )
+    # If the user has an explicit empty allowlist, deny-by-default.
+    elif not allowed_ids_set:
         # Defer hard stop until AFTER sidebar renders so we can debug.
         st.session_state["__portal_no_access"] = True
         EVSE_DISPLAY = {}
@@ -106,15 +175,15 @@ if is_portal_context:
     else:
         st.session_state["__portal_no_access"] = False
 
-    # Restrict the global EVSE display map to ONLY the allowed set.
-    EVSE_DISPLAY = {
-        sid: name
-        for sid, name in EVSE_DISPLAY.items()
-        if str(sid) in allowed_ids_set
-    }
+        # Restrict the global EVSE display map to ONLY the allowed set.
+        EVSE_DISPLAY = {
+            sid: name
+            for sid, name in EVSE_DISPLAY.items()
+            if str(sid) in allowed_ids_set
+        }
 
-    # Store allowed station ids in session_state for downstream loaders/filters.
-    st.session_state["__portal_allowed_station_ids"] = allowed_ids_set
+        # Store allowed station ids in session_state for downstream loaders/filters.
+        st.session_state["__portal_allowed_station_ids"] = allowed_ids_set
 else:
     # None means fail-open/local-dev mode (no portal headers)
     st.session_state["__portal_allowed_station_ids"] = None
@@ -341,6 +410,25 @@ else:
     st.session_state["__v2_all_evse"] = False
 
 # Second line of defense: if a portal allowlist exists, keep selections within it.
+# Optional debug visibility for allowlist decisions
+if str(os.getenv("RCA_AUTH_DEBUG", "")).strip() in ("1", "true", "True"):
+    try:
+        st.sidebar.caption("Auth debug (RCA_AUTH_DEBUG=1)")
+        st.sidebar.code(
+            json.dumps(
+                {
+                    "is_portal_context": is_portal_context,
+                    "portal_email": portal_email,
+                    "allowed_ids_count": (len(allowed_ids_set) if isinstance(allowed_ids_set, set) else None),
+                    "allowed_ids_sample": (sorted(list(allowed_ids_set))[:10] if isinstance(allowed_ids_set, set) else None),
+                    "evse_display_count": len(EVSE_DISPLAY),
+                    "evse_display_keys_sample": list(EVSE_DISPLAY.keys())[:10],
+                },
+                indent=2,
+            )
+        )
+    except Exception:
+        pass
 _allowed = st.session_state.get("__portal_allowed_station_ids")
 if isinstance(_allowed, (set, list, tuple)):
     allowed_set = {str(s) for s in _allowed}
