@@ -99,11 +99,12 @@ if isinstance(allowed_ids, (set, list, tuple)):
 if is_portal_context:
     # If the user has no allowlist (NULL/empty), they should see nothing.
     if not allowed_ids_set:
-        st.error(
-            "Your account does not have access to any EVSEs. "
-            "Please contact ReCharge Alaska if you believe this is an error."
-        )
-        st.stop()
+        # Defer hard stop until AFTER sidebar renders so we can debug.
+        st.session_state["__portal_no_access"] = True
+        EVSE_DISPLAY = {}
+        st.session_state["__portal_allowed_station_ids"] = set()
+    else:
+        st.session_state["__portal_no_access"] = False
 
     # Restrict the global EVSE display map to ONLY the allowed set.
     EVSE_DISPLAY = {
@@ -130,6 +131,14 @@ with st.sidebar:
             stations, start_utc, end_utc = render_sidebar(EVSE_DISPLAY)
         except TypeError:
             stations, start_utc, end_utc = render_sidebar()
+
+# If portal context determined no access, show banner AFTER sidebar renders.
+if st.session_state.get("__portal_no_access"):
+    st.error(
+        "Your account does not have access to any EVSEs. "
+        "Please contact ReCharge Alaska if you believe this is an error."
+    )
+    st.stop()
 
 
 
