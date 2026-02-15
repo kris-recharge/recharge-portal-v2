@@ -418,13 +418,54 @@ def _portal_verify_url() -> str:
 
     This MUST be reachable from inside the Streamlit container.
 
-    Default: use the internal Docker service name (`recharge_web`). Override with
-    RCA_PORTAL_VERIFY_URL when running outside Docker or if your service name differs.
-
-    NOTE: `http://web:3000/...` will NOT resolve unless your docker-compose service
-    is literally named `web`.
+    We prefer RCA_PORTAL_VERIFY_URL if provided, but we also defend against
+    common typos (e.g. 'http:/web:3000/...') and try a small set of sensible
+    fallbacks for docker-compose service names.
     """
-    return os.getenv("RCA_PORTAL_VERIFY_URL", "http://recharge_web:3000/api/auth/verify")
+
+    raw = (os.getenv("RCA_PORTAL_VERIFY_URL") or "").strip()
+
+    def _fix_scheme(u: str) -> str:
+        # Common typo: http:/host -> http://host
+        if u.startswith("http:/") and not u.startswith("http://"):
+            return "http://" + u[len("http:/") :]
+        if u.startswith("https:/") and not u.startswith("https://"):
+            return "https://" + u[len("https:/") :]
+        return u
+
+    raw = _fix_scheme(raw)
+
+    # Default candidates (internal docker DNS names)
+    candidates: list[str] = []
+
+    if raw:
+        candidates.append(raw)
+
+        # If user provided host 'web' but container is named recharge_web, try that too.
+        candidates.append(raw.replace("http://web:", "http://recharge_web:") if raw.startswith("http://web:") else raw)
+        candidates.append(raw.replace("https://web:", "https://recharge_web:") if raw.startswith("https://web:") else raw)
+
+    # Common internal defaults
+    candidates.extend(
+        [
+            "http://recharge_web:3000/api/auth/verify",
+            "http://web:3000/api/auth/verify",
+            "http://127.0.0.1:3000/api/auth/verify",
+        ]
+    )
+
+    # Deduplicate while keeping order
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in candidates:
+        c = (c or "").strip()
+        if not c or c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
+
+    # Return the first candidate; _call_portal_verify will iterate through all.
+    return out[0]
 
 
 def _call_portal_verify(cookie_header: str | None) -> tuple[int, dict[str, str], dict[str, Any] | None]:
@@ -433,47 +474,128 @@ def _call_portal_verify(cookie_header: str | None) -> tuple[int, dict[str, str],
     Returns (status_code, response_headers_lower, json_body_or_none).
 
     We forward the browser Cookie header so the portal can authenticate the user.
+
+    NOTE: We do NOT log cookie contents.
     """
-    url = _portal_verify_url()
 
-    req = urllib.request.Request(url, method="GET")
-    req.add_header("Accept", "application/json")
-    if cookie_header:
-        req.add_header("Cookie", cookie_header)
+    def _candidate_urls() -> list[str]:
+        first = _portal_verify_url()
+        # Build candidates similar to _portal_verify_url() but keep all for retries.
+        raw = (os.getenv("RCA_PORTAL_VERIFY_URL") or "").strip()
 
-    try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            status = getattr(resp, "status", 200)
-            headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
-            body_bytes = resp.read() or b""
+        def _fix_scheme(u: str) -> str:
+            if u.startswith("http:/") and not u.startswith("http://"):
+                return "http://" + u[len("http:/") :]
+            if u.startswith("https:/") and not u.startswith("https://"):
+                return "https://" + u[len("https:/") :]
+            return u
 
-        body_json: dict[str, Any] | None = None
-        if body_bytes:
-            try:
-                body_json = json.loads(body_bytes.decode("utf-8", errors="replace"))
-            except Exception:
-                body_json = None
+        raw = _fix_scheme(raw)
 
-        return status, headers, body_json
-
-    except urllib.error.HTTPError as e:
-        headers = {str(k).lower(): str(v) for k, v in getattr(e, "headers", {}).items()}  # type: ignore[arg-type]
-        # Try to parse the error body (often empty)
-        try:
-            raw = e.read()  # type: ignore[attr-defined]
-        except Exception:
-            raw = b""
-        body_json: dict[str, Any] | None = None
+        candidates: list[str] = []
         if raw:
-            try:
-                body_json = json.loads(raw.decode("utf-8", errors="replace"))
-            except Exception:
-                body_json = None
-        return int(getattr(e, "code", 0) or 0), headers, body_json
+            candidates.append(raw)
+            if raw.startswith("http://web:"):
+                candidates.append(raw.replace("http://web:", "http://recharge_web:"))
+            if raw.startswith("https://web:"):
+                candidates.append(raw.replace("https://web:", "https://recharge_web:"))
 
-    except Exception:
-        # Network error / timeout
-        return 0, {}, None
+        candidates.extend(
+            [
+                first,
+                "http://recharge_web:3000/api/auth/verify",
+                "http://web:3000/api/auth/verify",
+                "http://127.0.0.1:3000/api/auth/verify",
+            ]
+        )
+
+        # Deduplicate while preserving order
+        seen: set[str] = set()
+        out: list[str] = []
+        for c in candidates:
+            c = (c or "").strip()
+            if not c or c in seen:
+                continue
+            seen.add(c)
+            out.append(c)
+        return out
+
+    last_status: int = 0
+    last_headers: dict[str, str] = {}
+    last_body: dict[str, Any] | None = None
+
+    for url in _candidate_urls():
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Accept", "application/json")
+        if cookie_header:
+            req.add_header("Cookie", cookie_header)
+
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
+                headers = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+                body_bytes = resp.read() or b""
+
+            body_json: dict[str, Any] | None = None
+            if body_bytes:
+                try:
+                    body_json = json.loads(body_bytes.decode("utf-8", errors="replace"))
+                except Exception:
+                    body_json = None
+
+            if os.getenv("RCA_AUTH_DEBUG") == "1":
+                print("RCA_AUTH_DEBUG portal_verify_attempt:")
+                print(
+                    json.dumps(
+                        {
+                            "url": url,
+                            "status": status,
+                            "has_x_portal_user_email": "x-portal-user-email" in headers,
+                            "has_x_debug_portal_email": "x-debug-portal-email" in headers,
+                            "has_x_portal_allowed_evse_ids": "x-portal-allowed-evse-ids" in headers,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+
+            return status, headers, body_json
+
+        except urllib.error.HTTPError as e:
+            status = int(getattr(e, "code", 0) or 0)
+            headers = {str(k).lower(): str(v) for k, v in getattr(e, "headers", {}).items()}  # type: ignore[arg-type]
+            try:
+                raw = e.read()  # type: ignore[attr-defined]
+            except Exception:
+                raw = b""
+            body_json: dict[str, Any] | None = None
+            if raw:
+                try:
+                    body_json = json.loads(raw.decode("utf-8", errors="replace"))
+                except Exception:
+                    body_json = None
+
+            last_status, last_headers, last_body = status, headers, body_json
+
+            if os.getenv("RCA_AUTH_DEBUG") == "1":
+                print("RCA_AUTH_DEBUG portal_verify_http_error:")
+                print(json.dumps({"url": url, "status": status}, indent=2, sort_keys=True))
+
+            # If unauthorized, stop trying.
+            if status in (401, 403):
+                return status, headers, body_json
+
+            # Otherwise try next candidate.
+            continue
+
+        except Exception as ex:
+            last_status, last_headers, last_body = 0, {}, None
+            if os.getenv("RCA_AUTH_DEBUG") == "1":
+                print("RCA_AUTH_DEBUG portal_verify_network_error:")
+                print(json.dumps({"url": url, "error": str(ex)}, indent=2, sort_keys=True))
+            continue
+
+    return last_status, last_headers, last_body
 
 
 def _portal_user_from_verify_response(headers: dict[str, str], body: dict[str, Any] | None) -> PortalUser:
@@ -570,8 +692,8 @@ def get_portal_user() -> PortalUser:
 
     # Option 1: ask the portal who the user is (cookie-based)
     status, resp_headers, body = _call_portal_verify(cookie)
-    # Extra debug: when verify succeeds, log which identity headers came back.
-    if os.getenv("RCA_AUTH_DEBUG") == "1" and status == 200:
+    # Extra debug: always log verify status and the URL being used.
+    if os.getenv("RCA_AUTH_DEBUG") == "1":
         dbg = {
             "portal_verify_url": _portal_verify_url(),
             "portal_verify_status": status,
