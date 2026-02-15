@@ -8,11 +8,13 @@ from .config import AK_TZ, UTC
 from .constants import EVSE_DISPLAY, display_name, get_all_station_ids
 from .auth import get_portal_user, filter_allowed_evse_ids, user_label
 
+
 def _round_up_to_hour(dt: datetime) -> datetime:
     base = dt.replace(minute=0, second=0, microsecond=0)
     if dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
         return base
     return base + timedelta(hours=1)
+
 
 def _find_logo_path() -> Optional[str]:
     here = os.path.dirname(__file__)
@@ -31,6 +33,7 @@ def _find_logo_path() -> Optional[str]:
         if os.path.exists(p):
             return p
     return None
+
 
 def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_override: Optional[str] = None, logout_url_override: Optional[str] = None):
     # Logo
@@ -148,11 +151,6 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     # ---------- Optional auth debug (set RCA_AUTH_DEBUG=1 in env) ----------
     auth_debug = os.getenv("RCA_AUTH_DEBUG", "").strip().lower() in {"1", "true", "yes", "y", "on"}
     if auth_debug:
-        try:
-            raw_allowed = allowed_from_portal
-        except Exception:
-            raw_allowed = None
-
         allowed_set = set(allowed_evse_ids or [])
         all_set = set(all_keys or [])
         visible_set = set(visible_keys or [])
@@ -187,10 +185,19 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     if not visible_keys:
         st.caption("You don't currently have access to any EVSEs.")
 
-    # Clean visual by default: no chips shown; empty selection means \"all allowed EVSEs\"
-    sel_labels = st.multiselect(" ", options=labels, default=[], label_visibility="collapsed")
-    stations = [friendly_to_key[x] for x in sel_labels] if sel_labels else visible_keys
-    st.caption("No selection = all allowed EVSEs")
+    # Default to all allowed EVSEs selected so users can *de-select* to filter.
+    # If they clear everything, treat it as "all allowed".
+    sel_labels = st.multiselect(
+        "EVSE(s)",
+        options=labels,
+        default=labels,
+        help="Filter which EVSEs appear in the dashboard. Clear all to show all allowed EVSEs.",
+        placeholder="All EVSEs",
+    )
+
+    selected_ids = [friendly_to_key[x] for x in sel_labels if x in friendly_to_key]
+    stations = selected_ids if selected_ids else visible_keys
+    st.caption(f"Showing {len(stations)} of {len(visible_keys)} allowed EVSE(s)")
 
     # ---------- Default rolling 7‑day window (AK local) ----------
     now_ak = datetime.now(AK_TZ)
@@ -215,8 +222,11 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
         )
     with c2:
         start_time: time = st.time_input(
-            " ", value=start_default.time().replace(second=0, microsecond=0),
-            step=60*60, key=ks["st"], label_visibility="collapsed"
+            " ",
+            value=start_default.time().replace(second=0, microsecond=0),
+            step=60 * 60,
+            key=ks["st"],
+            label_visibility="collapsed",
         )
 
     # Row 2: End Date / End Time
@@ -228,19 +238,22 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
         )
     with c4:
         end_time: time = st.time_input(
-            " ", value=end_default.time().replace(second=0, microsecond=0),
-            step=60*60, key=ks["et"], label_visibility="collapsed"
+            " ",
+            value=end_default.time().replace(second=0, microsecond=0),
+            step=60 * 60,
+            key=ks["et"],
+            label_visibility="collapsed",
         )
 
     # Coerce end >= start
     start_dt = datetime.combine(start_date, start_time).replace(tzinfo=AK_TZ)
-    end_dt   = datetime.combine(end_date, end_time).replace(tzinfo=AK_TZ)
+    end_dt = datetime.combine(end_date, end_time).replace(tzinfo=AK_TZ)
     if end_dt < start_dt:
         end_dt = start_dt
 
     # Convert to UTC strings for queries
     start_utc = start_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_utc   = end_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_utc = end_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     st.divider()
     st.caption(f"Query window (UTC): {start_utc} ➜ {end_utc}")
