@@ -17,6 +17,10 @@ When running locally (no portal), these helpers can fall back to a configurable 
 
 from __future__ import annotations
 
+import base64
+import re
+import urllib.parse
+
 import json
 import os
 import urllib.error
@@ -146,12 +150,15 @@ def _parse_allowed_evse(value: str | None) -> list[str] | None:
     IMPORTANT: Returning None means "no restriction".
     Returning [] means "restricted to nothing".
     """
+    # None => caller can interpret as "no restriction" (e.g., admin/dev)
     if value is None:
         return None
 
     s = str(value).strip()
-    if s == "":
-        return []
+
+    # Treat common null-ish strings as None (no restriction)
+    if s == "" or s.lower() in {"null", "none", "undefined"}:
+        return None
 
     # JSON list
     if s.startswith("["):
@@ -163,7 +170,7 @@ def _parse_allowed_evse(value: str | None) -> list[str] | None:
                     if item is None:
                         continue
                     item_s = str(item).strip()
-                    if item_s:
+                    if item_s and item_s.lower() not in {"null", "none", "undefined"}:
                         out.append(item_s)
                 return out
         except Exception:
@@ -172,7 +179,170 @@ def _parse_allowed_evse(value: str | None) -> list[str] | None:
 
     # Comma-separated
     parts = [p.strip() for p in s.split(",")]
-    return [p for p in parts if p]
+    parts = [p for p in parts if p and p.lower() not in {"null", "none", "undefined"}]
+    return parts
+
+
+# -----------------------------
+
+# Cookie -> email (Supabase)
+# -----------------------------
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = '=' * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _try_decode_jwt_email(jwt_token: str) -> str | None:
+    """Best-effort decode of a JWT to find an email claim."""
+    try:
+        parts = jwt_token.split(".")
+        if len(parts) < 2:
+            return None
+        payload = json.loads(_b64url_decode(parts[1]).decode("utf-8", errors="replace"))
+        for k in ("email", "user_email"):
+            v = payload.get(k)
+            if v:
+                return str(v).strip() or None
+        # Supabase commonly nests email in user_metadata
+        um = payload.get("user_metadata")
+        if isinstance(um, dict):
+            v = um.get("email")
+            if v:
+                return str(v).strip() or None
+        return None
+    except Exception:
+        return None
+
+
+def _extract_email_from_supabase_cookie(cookie_header: str | None) -> str | None:
+    """Extract email from Supabase auth cookies.
+
+    Common cookie names:
+      - sb-<project-ref>-auth-token
+      - supabase-auth-token (less common)
+
+    Cookie value formats seen in the wild:
+      - base64-<base64(JSON with access_token)>
+      - <base64(JSON with access_token)>
+      - <JWT>
+      - URL-encoded variants of the above
+    """
+    if not cookie_header:
+        return None
+
+    # Parse cookie header into key/value pairs
+    cookies: dict[str, str] = {}
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        cookies[k.strip()] = v.strip()
+
+    # Prefer sb-*-auth-token cookies
+    auth_cookie_keys = [
+        k for k in cookies.keys()
+        if re.match(r"^sb-[A-Za-z0-9_-]+-auth-token$", k)
+    ]
+    # Fallback key
+    if "supabase-auth-token" in cookies:
+        auth_cookie_keys.append("supabase-auth-token")
+
+    for key in auth_cookie_keys:
+        raw = cookies.get(key)
+        if not raw:
+            continue
+
+        val = urllib.parse.unquote(raw)
+
+        # If it's clearly a JWT, decode directly
+        if val.count(".") >= 2:
+            email = _try_decode_jwt_email(val)
+            if email:
+                return email
+
+        # Handle base64- prefix used by some Supabase clients
+        if val.startswith("base64-"):
+            val = val[len("base64-") :]
+
+        # Try base64 decode -> JSON
+        for candidate in (val, val.replace("-", "+").replace("_", "/")):
+            try:
+                pad = "=" * (-len(candidate) % 4)
+                decoded = base64.b64decode(candidate + pad)
+                data = json.loads(decoded.decode("utf-8", errors="replace"))
+                if isinstance(data, dict):
+                    at = data.get("access_token") or data.get("accessToken")
+                    if isinstance(at, str) and at.count(".") >= 2:
+                        email = _try_decode_jwt_email(at)
+                        if email:
+                            return email
+            except Exception:
+                continue
+
+    return None
+
+
+# -----------------------------
+# Supabase portal_users lookup
+# -----------------------------
+
+
+def _supabase_url() -> str | None:
+    return os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+
+
+def _supabase_service_role_key() -> str | None:
+    # IMPORTANT: must be server-side only
+    return os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+
+def _fetch_allowed_evse_from_supabase(email: str) -> list[str] | None:
+    """Fetch allowed_evse_ids for the given email from Supabase REST.
+
+    Returns:
+      - None if portal_users.allowed_evse_ids is NULL (means 'no restriction')
+      - [] if no row found or explicitly empty
+      - [..] otherwise
+    """
+    base = _supabase_url()
+    key = _supabase_service_role_key()
+    if not base or not key:
+        return None
+
+    # Query portal_users by email
+    url = (
+        f"{base.rstrip('/')}/rest/v1/portal_users"
+        f"?select=allowed_evse_ids,email"
+        f"&email=eq.{urllib.parse.quote(email)}"
+        f"&limit=1"
+    )
+
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Accept", "application/json")
+    req.add_header("apikey", key)
+    req.add_header("Authorization", f"Bearer {key}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read() or b"[]"
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+        if not isinstance(data, list) or len(data) == 0:
+            return []
+        row = data[0]
+        if not isinstance(row, dict):
+            return []
+        allowed_val = row.get("allowed_evse_ids")
+        # NULL means no restriction
+        if allowed_val is None:
+            return None
+        if isinstance(allowed_val, list):
+            return [str(v).strip() for v in allowed_val if str(v).strip()]
+        # string formats
+        return _parse_allowed_evse(str(allowed_val))
+    except Exception:
+        return []
 
 
 # -----------------------------
@@ -295,12 +465,23 @@ def get_portal_user() -> PortalUser:
     _debug_headers_if_enabled(h)
 
     cookie = h.get("cookie")
+    cookie_email = _extract_email_from_supabase_cookie(cookie)
+    if os.getenv("RCA_AUTH_DEBUG") == "1":
+        print("RCA_AUTH_DEBUG cookie_email_extracted:")
+        print(json.dumps({"email": cookie_email or ""}, indent=2))
 
     # Option 1: ask the portal who the user is (cookie-based)
     status, resp_headers, body = _call_portal_verify(cookie)
     if status == 200:
         u = _portal_user_from_verify_response(resp_headers, body)
-        # If portal says ok but provides no identity, treat as unauthenticated
+
+        # If portal verify returns ok:true but does NOT include identity headers/body,
+        # fall back to extracting email from Supabase cookie and fetching allowed EVSEs.
+        if not u.email and cookie_email:
+            allowed_from_db = _fetch_allowed_evse_from_supabase(cookie_email)
+            u = PortalUser(email=cookie_email, user_id=u.user_id, allowed_evse_ids=allowed_from_db)
+
+        # If portal says ok but provides no identity AND we couldn't extract, treat as unauthenticated
         if u.email or u.user_id or (u.allowed_evse_ids is not None):
             if os.getenv("RCA_AUTH_DEBUG") == "1":
                 debug = {
@@ -309,6 +490,8 @@ def get_portal_user() -> PortalUser:
                     "portal_verify_has_body": bool(body),
                     "portal_verify_email": u.email or "",
                     "portal_verify_allowed_count": (len(u.allowed_evse_ids) if isinstance(u.allowed_evse_ids, list) else None),
+                    "portal_verify_cookie_email_used": bool(cookie_email and (u.email == cookie_email)),
+                    "supabase_lookup_enabled": bool(_supabase_url() and _supabase_service_role_key()),
                 }
                 print("RCA_AUTH_DEBUG portal_verify_result:")
                 print(json.dumps(debug, indent=2, sort_keys=True))
@@ -316,6 +499,9 @@ def get_portal_user() -> PortalUser:
 
     # If verify explicitly says unauthorized, lock down.
     if status in (401, 403):
+        if os.getenv("RCA_AUTH_DEBUG") == "1":
+            print("RCA_AUTH_DEBUG portal_verify_unauthorized:")
+            print(json.dumps({"status": status, "url": _portal_verify_url()}, indent=2))
         return PortalUser(email=None, user_id=None, allowed_evse_ids=[])
 
     # Fallback: attempt to use headers visible to Streamlit (best-effort)
@@ -379,22 +565,24 @@ def get_portal_user() -> PortalUser:
 def filter_allowed_evse_ids(all_evse_ids: Iterable[str], allowed_evse_ids: list[str] | None) -> list[str]:
     """Filter a list of EVSE ids by an allowed list.
 
-    Security model (production-safe):
-    - allowed_evse_ids is None => DENY (return [])
-    - allowed_evse_ids is [] => DENY (return [])
+    Security model:
+    - allowed_evse_ids is None => ALLOW ALL (used for admin/dev or when the portal stores NULL for "no restriction")
+    - allowed_evse_ids is [] => DENY (explicitly no access)
     - allowed_evse_ids contains "__ALL__" => allow all
     - otherwise => return intersection
 
-    NOTE:
-    We intentionally treat None as "deny" so that a portal user
-    with no allowed_evse_ids configured cannot see any EVSE data.
-    Local/dev environments should explicitly bypass this at a higher layer
-    (e.g., by not supplying portal headers).
+    IMPORTANT:
+    We treat an empty list as an explicit deny. Use NULL/None or "__ALL__" in the portal
+    to indicate unrestricted access.
     """
     all_list = list(all_evse_ids)
 
-    # Hard deny if nothing configured
-    if not allowed_evse_ids:
+    # None means "no restriction" (allow all) — useful for admin/dev or portal NULL
+    if allowed_evse_ids is None:
+        return all_list
+
+    # Empty list means explicit deny
+    if len(allowed_evse_ids) == 0:
         return []
 
     # Explicit superuser flag
