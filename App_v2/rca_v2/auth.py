@@ -844,7 +844,20 @@ def require_portal_auth(redirect_url: str = "https://dashboard.rechargealaska.ne
     return u
 
 
-def user_label(user: PortalUser) -> str:
+def user_label(user: PortalUser | str | None) -> str:
+    """Best-effort label for the currently authenticated principal.
+
+    Some call sites pass a raw email string instead of a PortalUser.
+    Keep this helper defensive so debug/sidebar rendering can't crash.
+    """
+    if user is None:
+        return ""
+
+    # If a raw email string is passed
+    if isinstance(user, str):
+        return user
+
+    # PortalUser
     if user.email:
         return user.email
     if user.user_id:
