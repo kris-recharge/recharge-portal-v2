@@ -416,8 +416,13 @@ def _fetch_allowed_evse_from_supabase(email: str) -> list[str] | None:
 def _portal_verify_url() -> str:
     """Return the portal verify URL for server-side calls from Streamlit.
 
-    In Docker, Streamlit can reach the Next.js container via the service name.
-    Override with RCA_PORTAL_VERIFY_URL if needed.
+    This MUST be reachable from inside the Streamlit container.
+
+    Default: use the internal Docker service name (`recharge_web`). Override with
+    RCA_PORTAL_VERIFY_URL when running outside Docker or if your service name differs.
+
+    NOTE: `http://web:3000/...` will NOT resolve unless your docker-compose service
+    is literally named `web`.
     """
     return os.getenv("RCA_PORTAL_VERIFY_URL", "http://recharge_web:3000/api/auth/verify")
 
@@ -544,6 +549,14 @@ def get_portal_user() -> PortalUser:
 
     cookie = h.get("cookie")
 
+    # If Streamlit didn't expose a Cookie header but did expose cookies as a dict,
+    # synthesize a Cookie header so the portal verify call can authenticate.
+    if (not cookie) and cookie_dict:
+        try:
+            cookie = "; ".join(f"{k}={v}" for k, v in cookie_dict.items() if v is not None)
+        except Exception:
+            cookie = None
+
     # Prefer a simple portal-issued cookie if available (e.g., set by Next.js after login)
     # This avoids relying on Supabase cookie formats and works reliably with Streamlit.
     cookie_email = _extract_cookie_value(cookie, "rca_email")
@@ -557,6 +570,18 @@ def get_portal_user() -> PortalUser:
 
     # Option 1: ask the portal who the user is (cookie-based)
     status, resp_headers, body = _call_portal_verify(cookie)
+    # Extra debug: when verify succeeds, log which identity headers came back.
+    if os.getenv("RCA_AUTH_DEBUG") == "1" and status == 200:
+        dbg = {
+            "portal_verify_url": _portal_verify_url(),
+            "portal_verify_status": status,
+            "resp_has_x_portal_user_email": "x-portal-user-email" in resp_headers,
+            "resp_has_x_debug_portal_email": "x-debug-portal-email" in resp_headers,
+            "resp_has_x_portal_allowed_evse_ids": "x-portal-allowed-evse-ids" in resp_headers,
+            "resp_header_email": (resp_headers.get("x-portal-user-email") or resp_headers.get("x-debug-portal-email") or ""),
+        }
+        print("RCA_AUTH_DEBUG portal_verify_response_headers:")
+        print(json.dumps(dbg, indent=2, sort_keys=True))
     if status == 200:
         u = _portal_user_from_verify_response(resp_headers, body)
 
