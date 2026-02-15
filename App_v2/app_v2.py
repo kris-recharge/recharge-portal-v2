@@ -151,39 +151,68 @@ if allowed_ids_set is not None:
     allowed_ids_set = {str(x) for x in allowed_ids_set if str(x).strip() != ""}
 
 # Enforce deny-by-default when behind the portal.
-# NOTE: During debug, we want to avoid locking out legitimate users if the
-# allowlist is momentarily unavailable (e.g., missing headers on the Streamlit request).
+# IMPORTANT: While debugging, we should never hard-lock ourselves out due to
+# transient/missing allowlist signals (headers not forwarded to Streamlit, etc.).
+# So:
+#   - Production (debug OFF): portal context + explicit empty allowlist => deny.
+#   - Debug mode: portal context + empty/missing allowlist => warn + fail open.
 if is_portal_context:
-    debug_on = str(os.getenv("RCA_AUTH_DEBUG", "")).strip() in ("1", "true", "True")
+    debug_on = str(os.getenv("RCA_AUTH_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
 
-    # If we could not determine an allowlist at all (None), fail-open in debug mode
-    # so we can keep the UI accessible and inspect what's coming through.
-    if allowed_ids_set is None:
+    # Optional: superadmin bypass (comma-separated emails)
+    superadmins = {
+        e.strip().lower()
+        for e in (os.getenv("RCA_SUPERADMIN_EMAILS", "") or "").split(",")
+        if e.strip()
+    }
+    if portal_email and portal_email.strip().lower() in superadmins:
         st.session_state["__portal_no_access"] = False
-        st.session_state["__portal_allowed_station_ids"] = None
+        st.session_state["__portal_allowed_station_ids"] = None  # None => fail open / all
         if debug_on:
-            st.warning(
-                "Auth debug: portal context detected but allowlist was unavailable on this request. "
-                "Failing open for debugging."
-            )
-    # If the user has an explicit empty allowlist, deny-by-default.
-    elif not allowed_ids_set:
-        # Defer hard stop until AFTER sidebar renders so we can debug.
-        st.session_state["__portal_no_access"] = True
-        EVSE_DISPLAY = {}
-        st.session_state["__portal_allowed_station_ids"] = set()
+            st.sidebar.caption("Auth debug (RCA_AUTH_DEBUG=1)")
+            st.sidebar.info("Superadmin bypass active for this email.")
     else:
-        st.session_state["__portal_no_access"] = False
+        # If we could not determine an allowlist at all (None), fail-open in debug mode
+        # so we can keep the UI accessible and inspect what's coming through.
+        if allowed_ids_set is None:
+            st.session_state["__portal_no_access"] = False
+            st.session_state["__portal_allowed_station_ids"] = None
+            if debug_on:
+                st.warning(
+                    "Auth debug: portal context detected but allowlist was unavailable on this request. "
+                    "Failing open for debugging."
+                )
 
-        # Restrict the global EVSE display map to ONLY the allowed set.
-        EVSE_DISPLAY = {
-            sid: name
-            for sid, name in EVSE_DISPLAY.items()
-            if str(sid) in allowed_ids_set
-        }
+        # If the user has an explicit empty allowlist:
+        # - debug OFF => deny-by-default
+        # - debug ON  => warn + fail open (so we can still use the UI)
+        elif not allowed_ids_set:
+            if debug_on:
+                st.session_state["__portal_no_access"] = False
+                st.session_state["__portal_allowed_station_ids"] = None
+                st.warning(
+                    "Auth debug: portal allowlist resolved to EMPTY for this request. "
+                    "Failing open so you can debug (set RCA_AUTH_DEBUG=0 to enforce deny-by-default)."
+                )
+            else:
+                # Defer hard stop until AFTER sidebar renders so we can debug.
+                st.session_state["__portal_no_access"] = True
+                EVSE_DISPLAY = {}
+                st.session_state["__portal_allowed_station_ids"] = set()
 
-        # Store allowed station ids in session_state for downstream loaders/filters.
-        st.session_state["__portal_allowed_station_ids"] = allowed_ids_set
+        # Normal path: allowlist is present and non-empty
+        else:
+            st.session_state["__portal_no_access"] = False
+
+            # Restrict the global EVSE display map to ONLY the allowed set.
+            EVSE_DISPLAY = {
+                sid: name
+                for sid, name in EVSE_DISPLAY.items()
+                if str(sid) in allowed_ids_set
+            }
+
+            # Store allowed station ids in session_state for downstream loaders/filters.
+            st.session_state["__portal_allowed_station_ids"] = allowed_ids_set
 else:
     # None means fail-open/local-dev mode (no portal headers)
     st.session_state["__portal_allowed_station_ids"] = None
