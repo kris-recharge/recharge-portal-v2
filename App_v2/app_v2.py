@@ -19,6 +19,7 @@ from rca_v2.auth import get_portal_user, filter_allowed_evse_ids
 
 from rca_v2.config import APP_MODE
 from rca_v2.ui import render_sidebar, sessions_table_single_select
+from rca_v2.admintab import render_admin_tab
 from rca_v2.loaders import (
     load_meter_values,
     load_authorize,
@@ -424,9 +425,36 @@ if isinstance(_allowed, (set, list, tuple)):
             )
             st.stop()
 
-# Build tabs (Admin tab removed from the shared web deployment)
+
+# Build tabs
+# Admin tab is ONLY visible to ReCharge Alaska staff accounts.
+# (Portal auth already gates access to /app; this is an additional UI-level restriction.)
+can_admin = False
+try:
+    if portal_email and portal_email.strip().lower().endswith("@rechargealaska.net"):
+        can_admin = True
+except Exception:
+    can_admin = False
+
+# Optional superadmin bypass (comma-separated emails)
+try:
+    _superadmins = {
+        e.strip().lower()
+        for e in (os.getenv("RCA_SUPERADMIN_EMAILS", "") or "").split(",")
+        if e.strip()
+    }
+    if portal_email and portal_email.strip().lower() in _superadmins:
+        can_admin = True
+except Exception:
+    pass
+
 TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Export"]
-t1, t2, t3, t4 = st.tabs(TAB_TITLES)
+if can_admin:
+    TAB_TITLES.append("Admin")
+
+_tabs = st.tabs(TAB_TITLES)
+t1, t2, t3, t4 = _tabs[0], _tabs[1], _tabs[2], _tabs[3]
+t_admin = _tabs[4] if can_admin and len(_tabs) > 4 else None
 
 with t1:
     st.subheader("Charging Sessions")
@@ -1059,5 +1087,15 @@ with t4:
                     "for the selected window and EVSE filter."
                 ),
             )
+
     except Exception as e:
         st.error(f"Export failed: {e}")
+
+
+# Admin tab (staff-only)
+if t_admin is not None:
+    with t_admin:
+        try:
+            render_admin_tab()
+        except Exception as e:
+            st.error(f"Admin tab failed to load: {e}")
