@@ -1,6 +1,7 @@
 import os
 import streamlit as st
 import pandas as pd
+import json
 from datetime import datetime, timedelta, date, time
 from typing import Optional
 from .config import AK_TZ, UTC
@@ -156,19 +157,23 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     if not visible_keys:
         st.caption("You don't currently have access to any EVSEs.")
 
-    # Default to all allowed EVSEs selected so users can *de-select* to filter.
-    # If they clear everything, treat it as "all allowed".
+    # Leave unselected by default for a cleaner UI.
+    # IMPORTANT: empty selection means "all allowed".
     sel_labels = st.multiselect(
         "EVSE(s)",
         options=labels,
-        default=labels,
-        help="Filter which EVSEs appear in the dashboard. Clear all to show all allowed EVSEs.",
-        placeholder="All EVSEs",
+        default=[],
+        help="Select one or more EVSEs to filter. Leave blank to show all allowed EVSEs.",
+        placeholder="All allowed EVSEs",
     )
 
     selected_ids = [friendly_to_key[x] for x in sel_labels if x in friendly_to_key]
     stations = selected_ids if selected_ids else visible_keys
-    st.caption(f"Showing {len(stations)} of {len(visible_keys)} allowed EVSE(s)")
+
+    if selected_ids:
+        st.caption(f"Showing {len(stations)} of {len(visible_keys)} allowed EVSE(s)")
+    else:
+        st.caption(f"Showing all {len(visible_keys)} allowed EVSE(s)")
 
     # ---------- Default rolling 7‑day window (AK local) ----------
     now_ak = datetime.now(AK_TZ)
