@@ -1,7 +1,7 @@
 # App_v2/rca_v2/admintab.py
 from __future__ import annotations
 
-import json, os, stat, subprocess, textwrap
+import json, os, stat
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -185,21 +185,6 @@ def _pricing_payload(
     # remove nulls so we don't overwrite columns with null accidentally
     return {k: v for k, v in row.items() if v is not None}
 
-# ---------- Cron helpers ----------
-def _read_crontab() -> str:
-    try:
-        out = subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)
-        return out.stdout if out.returncode == 0 else ""
-    except Exception:
-        return ""
-
-def _write_crontab(new_body: str) -> bool:
-    try:
-        p = subprocess.run(["crontab", "-"], input=new_body, text=True, capture_output=True, check=False)
-        return p.returncode == 0
-    except Exception:
-        return False
-
 
 # ==========================================================
 # Public Entry
@@ -283,26 +268,6 @@ def render_admin_tab():
             ov["archived_station_ids"] = selection
             _write_json(OVERRIDES_PATH, ov)
             st.success("Archive list updated.")
-
-    st.divider()
-    st.markdown("### Automation (cron)")
-
-    path_hint = str(Path.home() / "LynkWell DataSync" / "nightly_ingest.sh")
-    st.caption(f"Target script: `{path_hint}`")
-    current = _read_crontab()
-    st.text_area("Current crontab (read-only)", value=current, height=140, disabled=True)
-
-    sched = st.text_input("New schedule (cron expression)",
-                          value='7,37 * * * *', help="Example: twice per hour at :07 and :37")
-    line = f'{sched} "$HOME/LynkWell DataSync/nightly_ingest.sh" >> "$HOME/LynkWell DataSync/logs/ingest.log" 2>&1'
-    st.code(line)
-
-    if st.button("Replace crontab lines for nightly_ingest.sh"):
-        # Remove existing ingest lines, append new one
-        body_lines = [ln for ln in current.splitlines() if "nightly_ingest.sh" not in ln]
-        body_lines.append(line)
-        ok = _write_crontab("\n".join(body_lines) + "\n")
-        st.success("Crontab updated.") if ok else st.error("Failed to update crontab. Try running Streamlit from Terminal.")
 
     st.divider()
     st.markdown("### Supabase Users")
