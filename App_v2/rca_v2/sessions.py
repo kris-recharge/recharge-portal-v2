@@ -5,6 +5,10 @@ from .config import AK_TZ
 from .constants import EVSE_LOCATION, CONNECTOR_TYPE
 
 
+def _to_num(x):
+    return pd.to_numeric(x, errors="coerce")
+
+
 def _fmt_ak(dt, fmt: str = "%Y-%m-%d %H:%M") -> str:
     """Format a UTC timestamp into Alaska local time."""
     ts = pd.to_datetime(dt, utc=True, errors="coerce")
@@ -24,6 +28,162 @@ def _first_nonzero(series: pd.Series):
     s = pd.to_numeric(series, errors="coerce").dropna()
     nz = s[s > 0]
     return (nz.iloc[0] if not nz.empty else (s.iloc[0] if not s.empty else None))
+
+
+def _normalize_pricing_df(pricing: pd.DataFrame) -> pd.DataFrame:
+    """Normalize pricing df to a known schema.
+
+    Expected (any reasonable aliases accepted):
+      - station_id
+      - effective_start (timestamptz)
+      - effective_end (timestamptz, nullable)
+      - connection_fee
+      - price_per_kwh
+      - price_per_min
+
+    Optional (if present, will be used when the session df includes idle minutes):
+      - idle_fee_per_min
+      - idle_grace_min
+    """
+    p = pricing.copy()
+
+    # Column aliases
+    colmap = {}
+    for c in p.columns:
+        lc = str(c).strip().lower()
+        if lc in {"station_id", "evse_id", "asset_id"}:
+            colmap[c] = "station_id"
+        elif lc in {"effective_start", "start_ts", "start_time", "pricing_start", "valid_from"}:
+            colmap[c] = "effective_start"
+        elif lc in {"effective_end", "end_ts", "end_time", "pricing_end", "valid_to"}:
+            colmap[c] = "effective_end"
+        elif lc in {"connection_fee", "flat_fee", "start_fee"}:
+            colmap[c] = "connection_fee"
+        elif lc in {"price_per_kwh", "kwh_price", "kwh_rate", "energy_rate"}:
+            colmap[c] = "price_per_kwh"
+        elif lc in {"price_per_min", "minute_price", "min_price", "time_rate"}:
+            colmap[c] = "price_per_min"
+        elif lc in {"idle_fee_per_min", "idle_fee", "idle_price", "idle_rate", "idle_per_min", "idle_min_price"}:
+            colmap[c] = "idle_fee_per_min"
+        elif lc in {"idle_grace_min", "idle_grace_minutes", "grace_minutes", "idle_grace", "idle_free_minutes"}:
+            colmap[c] = "idle_grace_min"
+
+    if colmap:
+        p = p.rename(columns=colmap)
+
+    # Required columns
+    for req in ["station_id", "effective_start"]:
+        if req not in p.columns:
+            return pd.DataFrame(columns=[
+                "station_id",
+                "effective_start",
+                "effective_end",
+                "connection_fee",
+                "price_per_kwh",
+                "price_per_min",
+                "idle_fee_per_min",
+                "idle_grace_min",
+            ])
+
+    if "effective_end" not in p.columns:
+        p["effective_end"] = pd.NaT
+    if "idle_fee_per_min" not in p.columns:
+        p["idle_fee_per_min"] = 0
+    if "idle_grace_min" not in p.columns:
+        p["idle_grace_min"] = 0
+
+    # Parse timestamps
+    p["effective_start"] = pd.to_datetime(p["effective_start"], utc=True, errors="coerce")
+    p["effective_end"] = pd.to_datetime(p["effective_end"], utc=True, errors="coerce")
+
+    # Numeric fields (default 0)
+    for ncol in ["connection_fee", "price_per_kwh", "price_per_min", "idle_fee_per_min", "idle_grace_min"]:
+        if ncol not in p.columns:
+            p[ncol] = 0
+        p[ncol] = _to_num(p[ncol]).fillna(0)
+
+    p["station_id"] = p["station_id"].astype(str)
+    p = p.dropna(subset=["effective_start"])  # must have start
+
+    # Sort so we can pick "latest start" easily
+    p = p.sort_values(["station_id", "effective_start"], kind="mergesort")
+    return p
+
+
+def _estimate_revenue_for_sessions(sess: pd.DataFrame, pricing: pd.DataFrame) -> pd.Series:
+    """Return a float Series of estimated revenue for each session row."""
+    if sess is None or sess.empty or pricing is None or pricing.empty:
+        return pd.Series([np.nan] * (0 if sess is None else len(sess)))
+
+    p = _normalize_pricing_df(pricing)
+    if p.empty:
+        return pd.Series([np.nan] * len(sess), index=sess.index)
+
+    # We rely on internal UTC start timestamps when present.
+    ts = sess.get("_start_ts_utc")
+    if ts is None:
+        return pd.Series([np.nan] * len(sess), index=sess.index)
+
+    ts = pd.to_datetime(ts, utc=True, errors="coerce")
+
+    kwh = _to_num(sess.get("Energy Delivered (kWh)")).fillna(0)
+    mins = _to_num(sess.get("Duration (min)")).fillna(0)
+    sid = sess.get("station_id").astype(str)
+    # Optional idle minutes (only used if session df includes it)
+    idle_cols = [
+        "Idle Duration (min)",
+        "Idle (min)",
+        "Idle Time (min)",
+        "Idle Minutes",
+    ]
+    idle_mins = None
+    for c in idle_cols:
+        if c in sess.columns:
+            idle_mins = _to_num(sess.get(c)).fillna(0)
+            break
+    if idle_mins is None:
+        idle_mins = pd.Series([0.0] * len(sess), index=sess.index)
+
+    out = []
+    for i in sess.index:
+        s_id = sid.loc[i]
+        t0 = ts.loc[i]
+        if pd.isna(t0):
+            out.append(np.nan)
+            continue
+
+        # Find pricing rows for this station where start <= t0 < end (or end is null)
+        p_sid = p[p["station_id"] == s_id]
+        if p_sid.empty:
+            out.append(np.nan)
+            continue
+
+        mask = (p_sid["effective_start"] <= t0) & (
+            p_sid["effective_end"].isna() | (t0 < p_sid["effective_end"])
+        )
+        cand = p_sid.loc[mask]
+        if cand.empty:
+            # If nothing matches the window, fall back to the latest pricing before t0
+            cand = p_sid[p_sid["effective_start"] <= t0]
+
+        if cand.empty:
+            out.append(np.nan)
+            continue
+
+        row = cand.iloc[-1]  # latest effective_start
+        idle_fee_per_min = float(row.get("idle_fee_per_min", 0))
+        idle_grace_min = float(row.get("idle_grace_min", 0))
+        idle_billable = max(0.0, float(idle_mins.loc[i]) - idle_grace_min)
+
+        rev = (
+            float(row.get("connection_fee", 0))
+            + float(kwh.loc[i]) * float(row.get("price_per_kwh", 0))
+            + float(mins.loc[i]) * float(row.get("price_per_min", 0))
+            + idle_billable * idle_fee_per_min
+        )
+        out.append(round(rev, 2))
+
+    return pd.Series(out, index=sess.index)
 
 
 def _is_startlike(row: pd.Series) -> bool:
@@ -46,7 +206,7 @@ def _is_stoplike(row: pd.Series) -> bool:
     return True
 
 
-def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | None):
+def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | None, pricing_df: pd.DataFrame | None = None):
     """Pair Start/StopTransaction fallback rows into sessions.
 
     Works when Start rows have connector_id but no transaction_id and Stop rows have transaction_id but no connector_id.
@@ -184,18 +344,44 @@ def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | No
                     "station_id": str(sid),
                     "transaction_id": tx,
                     "connector_id": conn_int,
+                    "_start_ts_utc": ts_start,
                 }
             )
 
     sess = pd.DataFrame(rows)
+    if pricing_df is not None and not sess.empty:
+        sess["Estimated Revenue ($)"] = _estimate_revenue_for_sessions(sess, pricing_df)
+        # Keep a consistent, human-friendly column order
+        col_order = [
+            "Start Date/Time",
+            "End Date/Time",
+            "EVSE",
+            "Connector #",
+            "Connector Type",
+            "Max Power (kW)",
+            "Energy Delivered (kWh)",
+            "Duration (min)",
+            "Estimated Revenue ($)",
+            "SoC Start",
+            "SoC End",
+            "ID Tag",
+        ]
+        keep = [c for c in col_order if c in sess.columns]
+        rest = [c for c in sess.columns if c not in keep and not c.startswith("_")]
+        sess = sess[keep + rest + [c for c in sess.columns if c.startswith("_")]]
+
     if not sess.empty:
         sess = sess.sort_values(["End Date/Time", "station_id", "transaction_id"], ascending=[False, True, True], kind="mergesort")
 
     heat = pd.DataFrame({"start_ts": starts, "dur_min": durs}) if starts else pd.DataFrame(columns=["start_ts", "dur_min"])
+
+    if "_start_ts_utc" in sess.columns:
+        sess = sess.drop(columns=["_start_ts_utc"])
+
     return sess, heat
 
 
-def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
+def build_sessions(df: pd.DataFrame, auth: pd.DataFrame, pricing: pd.DataFrame | None = None):
     """Build charging sessions and a simple heatmap frame.
 
     Expected df columns:
@@ -289,13 +475,31 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
                 "station_id": sid,
                 "transaction_id": tx,
                 "connector_id": conn_int,
+                "_start_ts_utc": ts_start,
             }
         )
 
     sess = pd.DataFrame(rows)
-    if not sess.empty:
-        # Sort newest-first by end time string (already AK formatted). Keep stable tie-breakers.
-        sess = sess.sort_values(["End Date/Time", "station_id", "transaction_id"], ascending=[False, True, True], kind="mergesort")
+    if pricing is not None and not sess.empty:
+        sess["Estimated Revenue ($)"] = _estimate_revenue_for_sessions(sess, pricing)
+        # Keep a consistent, human-friendly column order
+        col_order = [
+            "Start Date/Time",
+            "End Date/Time",
+            "EVSE",
+            "Connector #",
+            "Connector Type",
+            "Max Power (kW)",
+            "Energy Delivered (kWh)",
+            "Duration (min)",
+            "Estimated Revenue ($)",
+            "SoC Start",
+            "SoC End",
+            "ID Tag",
+        ]
+        keep = [c for c in col_order if c in sess.columns]
+        rest = [c for c in sess.columns if c not in keep and not c.startswith("_")]
+        sess = sess[keep + rest + [c for c in sess.columns if c.startswith("_")]]
 
     heat = pd.DataFrame({"start_ts": starts, "dur_min": durs}) if starts else pd.DataFrame(columns=["start_ts", "dur_min"])
 
@@ -319,9 +523,12 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
         return not (dur_ok.any() or kwh_ok.any())
 
     if sess.empty or (has_start_stop and _is_stop_only_sessions(sess)):
-        sess2, heat2 = _build_sessions_from_start_stop(df, auth_df)
+        sess2, heat2 = _build_sessions_from_start_stop(df, auth_df, pricing_df=pricing)
         # If fallback produced something, return it. Otherwise fall back to tx grouping output.
         if sess2 is not None and not sess2.empty:
             return sess2, heat2
+
+    if sess is not None and not sess.empty and "_start_ts_utc" in sess.columns:
+        sess = sess.drop(columns=["_start_ts_utc"])
 
     return sess, heat

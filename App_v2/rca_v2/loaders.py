@@ -451,6 +451,144 @@ def _parse_start_stop_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return df
 
 # -----------------------------
+# EVSE pricing loader
+# -----------------------------
+
+def load_evse_pricing(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
+    """Load EVSE pricing rules for the given stations and time window.
+
+    Expected Postgres/Supabase table: `evse_pricing`
+      - station_id (text)
+      - effective_start (timestamptz)
+      - effective_end (timestamptz, nullable)
+      - connection_fee (numeric)
+      - price_per_kwh (numeric)
+      - price_per_min (numeric)
+      - idle_fee_per_min (numeric)
+      - idle_grace_min (numeric)
+
+    We return all pricing rows whose effective window overlaps [start_utc, end_utc].
+    """
+
+    if not stations:
+        return pd.DataFrame(
+            columns=[
+                "station_id",
+                "effective_start",
+                "effective_end",
+                "connection_fee",
+                "price_per_kwh",
+                "price_per_min",
+                "idle_fee_per_min",
+                "idle_grace_min",
+            ]
+        )
+
+    stations = _normalize_station_list(stations)
+    start_utc = _normalize_time_param(start_utc)
+    end_utc = _normalize_time_param(end_utc)
+
+    if not stations:
+        return pd.DataFrame(
+            columns=[
+                "station_id",
+                "effective_start",
+                "effective_end",
+                "connection_fee",
+                "price_per_kwh",
+                "price_per_min",
+                "idle_fee_per_min",
+                "idle_grace_min",
+            ]
+        )
+
+    # Supabase/Postgres
+    if using_postgres():
+        placeholders = _make_placeholders(len(stations))
+        ph = param_placeholder()
+
+        # Overlap logic:
+        #   effective_start <= end_utc
+        #   AND (effective_end IS NULL OR effective_end >= start_utc)
+        sql = f"""
+          SELECT station_id,
+                 effective_start,
+                 effective_end,
+                 connection_fee,
+                 price_per_kwh,
+                 price_per_min,
+                 idle_fee_per_min,
+                 idle_grace_min
+          FROM evse_pricing
+          WHERE station_id IN ({placeholders})
+            AND effective_start <= {ph}
+            AND (effective_end IS NULL OR effective_end >= {ph})
+          ORDER BY station_id, effective_start
+        """
+
+        # Params order must match placeholders in SQL
+        params = list(stations) + [end_utc, start_utc]
+        conn = get_conn()
+        try:
+            df = pd.read_sql(sql, conn, params=params)
+        except Exception:
+            logger.exception(
+                "load_evse_pricing failed (stations=%s, window=%s→%s)",
+                stations,
+                start_utc,
+                end_utc,
+            )
+            df = pd.DataFrame()
+        finally:
+            conn.close()
+
+        if df is None or df.empty:
+            return pd.DataFrame(
+                columns=[
+                    "station_id",
+                    "effective_start",
+                    "effective_end",
+                    "connection_fee",
+                    "price_per_kwh",
+                    "price_per_min",
+                    "idle_fee_per_min",
+                    "idle_grace_min",
+                ]
+            )
+
+        # Normalize dtypes
+        for c in ["effective_start", "effective_end"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], utc=True, errors="coerce")
+
+        for c in [
+            "connection_fee",
+            "price_per_kwh",
+            "price_per_min",
+            "idle_fee_per_min",
+            "idle_grace_min",
+        ]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        return df
+
+    # Legacy/SQLite path: pricing table may not exist in local SQLite.
+    # Return an empty frame with the expected columns.
+    return pd.DataFrame(
+        columns=[
+            "station_id",
+            "effective_start",
+            "effective_end",
+            "connection_fee",
+            "price_per_kwh",
+            "price_per_min",
+            "idle_fee_per_min",
+            "idle_grace_min",
+        ]
+    )
+
+# -----------------------------
 # Meter values + Authorize data
 # -----------------------------
 def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
