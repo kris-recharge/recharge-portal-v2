@@ -40,8 +40,6 @@ from rca_v2.export import build_export_xlsx_bytes
 
 EVSE_DISPLAY = get_evse_display()
 
-# Global auth debug flag (used to avoid hard-locking the UI while debugging auth)
-AUTH_DEBUG_ON = str(os.getenv("RCA_AUTH_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
 
 #
 # Identify portal user + allowed EVSEs
@@ -156,59 +154,24 @@ allowed_ids_set = _normalize_allowed_ids(allowed_ids)
 if allowed_ids_set is not None:
     allowed_ids_set = {str(x) for x in allowed_ids_set if str(x).strip() != ""}
 
-# Enforce deny-by-default when behind the portal.
-# IMPORTANT: While debugging, we should never hard-lock ourselves out due to
-# transient/missing allowlist signals (headers not forwarded to Streamlit, etc.).
-# So:
-#   - Production (debug OFF): portal context + explicit empty allowlist => deny.
-#   - Debug mode: portal context + empty/missing allowlist => warn + fail open.
 if is_portal_context:
-    debug_on = AUTH_DEBUG_ON
-
     # Optional: superadmin bypass (comma-separated emails)
     superadmins = {
         e.strip().lower()
         for e in (os.getenv("RCA_SUPERADMIN_EMAILS", "") or "").split(",")
         if e.strip()
     }
+
     if portal_email and portal_email.strip().lower() in superadmins:
+        # Superadmins can see all EVSEs
         st.session_state["__portal_no_access"] = False
-        st.session_state["__portal_allowed_station_ids"] = None  # None => fail open / all
-        if debug_on:
-            st.sidebar.caption("Auth debug (RCA_AUTH_DEBUG=1)")
-            st.sidebar.info("Superadmin bypass active for this email.")
+        st.session_state["__portal_allowed_station_ids"] = None
     else:
-        # If we could not determine an allowlist at all (None), fail-open in debug mode
-        # so we can keep the UI accessible and inspect what's coming through.
-        if allowed_ids_set is None:
-            st.session_state["__portal_no_access"] = False
-            st.session_state["__portal_allowed_station_ids"] = None
-            if debug_on:
-                st.warning(
-                    "Auth debug: portal context detected but allowlist was unavailable on this request. "
-                    "Failing open for debugging."
-                )
-
-        # If the user has an explicit empty allowlist:
-        # - debug OFF => deny-by-default
-        # - debug ON  => warn + fail open (so we can still use the UI)
-        elif not allowed_ids_set:
-            if debug_on:
-                # Debug mode: never lock out and never blank EVSE_DISPLAY.
-                # Keep allowlist as None (fail open) so the sidebar renders and we can inspect auth.
-                st.session_state["__portal_no_access"] = False
-                st.session_state["__portal_allowed_station_ids"] = None
-                st.warning(
-                    "Auth debug: portal allowlist resolved to EMPTY for this request. "
-                    "Failing open so you can debug (set RCA_AUTH_DEBUG=0 to enforce deny-by-default)."
-                )
-            else:
-                # Production: deny-by-default (defer hard stop until AFTER sidebar renders)
-                st.session_state["__portal_no_access"] = True
-                EVSE_DISPLAY = {}
-                st.session_state["__portal_allowed_station_ids"] = set()
-
-        # Normal path: allowlist is present and non-empty
+        # Enforce deny-by-default behind the portal
+        if not allowed_ids_set:
+            st.session_state["__portal_no_access"] = True
+            EVSE_DISPLAY = {}
+            st.session_state["__portal_allowed_station_ids"] = set()
         else:
             st.session_state["__portal_no_access"] = False
 
@@ -239,24 +202,12 @@ with st.sidebar:
             stations, start_utc, end_utc = render_sidebar()
 
 # If portal context determined no access, show banner AFTER sidebar renders.
-# IMPORTANT: when AUTH_DEBUG_ON is enabled, do NOT hard-stop the page.
-# This keeps the sidebar + debug panel visible so we can diagnose why the
-# allowlist isn't being honored.
 if st.session_state.get("__portal_no_access"):
     st.error(
         "Your account does not have access to any EVSEs. "
         "Please contact ReCharge Alaska if you believe this is an error."
     )
-    if AUTH_DEBUG_ON:
-        st.info(
-            "Auth debug is enabled (RCA_AUTH_DEBUG=1). The app will keep rendering so you can "
-            "inspect the sidebar/auth debug output."
-        )
-        # Ensure we don't carry a lockout into later logic.
-        st.session_state["__portal_allowed_station_ids"] = None
-        st.session_state["__portal_no_access"] = False
-    else:
-        st.stop()
+    st.stop()
 
 
 
@@ -459,25 +410,6 @@ else:
     st.session_state["__v2_all_evse"] = False
 
 # Second line of defense: if a portal allowlist exists, keep selections within it.
- # Optional debug visibility for allowlist decisions
-if AUTH_DEBUG_ON:
-    try:
-        st.sidebar.caption("Auth debug (RCA_AUTH_DEBUG=1)")
-        st.sidebar.code(
-            json.dumps(
-                {
-                    "is_portal_context": is_portal_context,
-                    "portal_email": portal_email,
-                    "allowed_ids_count": (len(allowed_ids_set) if isinstance(allowed_ids_set, set) else None),
-                    "allowed_ids_sample": (sorted(list(allowed_ids_set))[:10] if isinstance(allowed_ids_set, set) else None),
-                    "evse_display_count": len(EVSE_DISPLAY),
-                    "evse_display_keys_sample": list(EVSE_DISPLAY.keys())[:10],
-                },
-                indent=2,
-            )
-        )
-    except Exception:
-        pass
 _allowed = st.session_state.get("__portal_allowed_station_ids")
 if isinstance(_allowed, (set, list, tuple)):
     allowed_set = {str(s) for s in _allowed}
@@ -490,14 +422,7 @@ if isinstance(_allowed, (set, list, tuple)):
                 "Your account does not have access to any EVSEs in the current selection. "
                 "Please contact ReCharge Alaska if you believe this is an error."
             )
-            if AUTH_DEBUG_ON:
-                st.warning(
-                    "Auth debug: selection filtered to zero stations. Failing open to keep the UI usable."
-                )
-                stations = list(EVSE_DISPLAY.keys())
-                st.session_state["__portal_allowed_station_ids"] = None
-            else:
-                st.stop()
+            st.stop()
 
 # Build tabs (Admin tab removed from the shared web deployment)
 TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Export"]
