@@ -166,23 +166,21 @@ def _ts_to_iso_z(ts: Optional[pd.Timestamp]) -> Optional[str]:
 
 def _pricing_payload(
     station_id: str,
-    connection_fee_usd: Optional[float],
-    price_per_kwh_usd: Optional[float],
-    price_per_min_usd: Optional[float],
-    idle_fee_per_min_usd: Optional[float],
+    connection_fee: Optional[float],
+    price_per_kwh: Optional[float],
+    price_per_min: Optional[float],
+    idle_fee_per_min: Optional[float],
     effective_start: Optional[pd.Timestamp],
     effective_end: Optional[pd.Timestamp],
-    notes: str,
 ) -> Dict[str, Any]:
     row: Dict[str, Any] = {
         "station_id": station_id,
-        "connection_fee_usd": connection_fee_usd,
-        "price_per_kwh_usd": price_per_kwh_usd,
-        "price_per_min_usd": price_per_min_usd,
-        "idle_fee_per_min_usd": idle_fee_per_min_usd,
+        "connection_fee": connection_fee,
+        "price_per_kwh": price_per_kwh,
+        "price_per_min": price_per_min,
+        "idle_fee_per_min": idle_fee_per_min,
         "effective_start": _ts_to_iso_z(effective_start),
         "effective_end": _ts_to_iso_z(effective_end),
-        "notes": notes.strip() if notes else None,
     }
     # remove nulls so we don't overwrite columns with null accidentally
     return {k: v for k, v in row.items() if v is not None}
@@ -449,20 +447,39 @@ def render_admin_tab():
                 price_min = st.text_input("Price per minute ($/min)", value="")
                 idle_min = st.text_input("Idle fee ($/min)", value="0")
 
+            # Effective date range (AK local UI -> store UTC)
+            AK_TZ = "America/Anchorage"
+
             c3, c4 = st.columns([1, 1])
             with c3:
-                eff_start = st.datetime_input(
-                    "Effective start (UTC)",
-                    value=pd.Timestamp.utcnow().to_pydatetime(),
-                    help="Stored as UTC. If you pick a local time, it will be converted to UTC.",
+                st.caption("Effective start (AK local)")
+                eff_start_date = st.date_input(
+                    "Start date",
+                    value=pd.Timestamp.now(tz=AK_TZ).date(),
+                    key="pricing_eff_start_date",
                 )
+                eff_start_time = st.time_input(
+                    "Start time",
+                    value=pd.Timestamp.now(tz=AK_TZ).replace(second=0, microsecond=0).time(),
+                    key="pricing_eff_start_time",
+                )
+
             with c4:
                 eff_end_enabled = st.checkbox("Set an effective end", value=False)
-                eff_end = None
+                eff_end_date = None
+                eff_end_time = None
                 if eff_end_enabled:
-                    eff_end = st.datetime_input("Effective end (UTC)", value=pd.Timestamp.utcnow().to_pydatetime())
-
-            notes = st.text_area("Notes (optional)", value="")
+                    st.caption("Effective end (AK local)")
+                    eff_end_date = st.date_input(
+                        "End date",
+                        value=pd.Timestamp.now(tz=AK_TZ).date(),
+                        key="pricing_eff_end_date",
+                    )
+                    eff_end_time = st.time_input(
+                        "End time",
+                        value=pd.Timestamp.now(tz=AK_TZ).replace(second=0, microsecond=0).time(),
+                        key="pricing_eff_end_time",
+                    )
 
             if st.button("Create pricing rule"):
                 if not station_id:
@@ -476,20 +493,25 @@ def render_admin_tab():
                     if p_kwh is None and p_min is None:
                         st.error("Provide at least one of: $/kWh or $/min")
                     else:
-                        start_ts = pd.to_datetime(eff_start, utc=True)
-                        end_ts = pd.to_datetime(eff_end, utc=True) if eff_end_enabled and eff_end else None
+                        # Build AK-local timestamps then convert to UTC
+                        start_local = pd.Timestamp.combine(eff_start_date, eff_start_time).tz_localize(AK_TZ)
+                        start_ts = start_local.tz_convert("UTC")
+
+                        end_ts = None
+                        if eff_end_enabled and eff_end_date is not None and eff_end_time is not None:
+                            end_local = pd.Timestamp.combine(eff_end_date, eff_end_time).tz_localize(AK_TZ)
+                            end_ts = end_local.tz_convert("UTC")
                         if end_ts is not None and end_ts <= start_ts:
                             st.error("Effective end must be after effective start.")
                         else:
                             row = _pricing_payload(
                                 station_id=station_id,
-                                connection_fee_usd=c_fee,
-                                price_per_kwh_usd=p_kwh,
-                                price_per_min_usd=p_min,
-                                idle_fee_per_min_usd=i_min,
+                                connection_fee=c_fee,
+                                price_per_kwh=p_kwh,
+                                price_per_min=p_min,
+                                idle_fee_per_min=i_min,
                                 effective_start=start_ts,
                                 effective_end=end_ts,
-                                notes=notes,
                             )
                             try:
                                 out = _sb_insert_pricing(url, key, row)
@@ -509,19 +531,42 @@ def render_admin_tab():
                 price_min_u = st.text_input("Price per minute ($/min) [optional]", value="")
                 idle_min_u = st.text_input("Idle fee ($/min) [optional]", value="")
 
+            AK_TZ = "America/Anchorage"
+
             c3, c4 = st.columns([1, 1])
             with c3:
                 eff_start_u_enabled = st.checkbox("Update effective start", value=False)
-                eff_start_u = None
+                eff_start_u_date = None
+                eff_start_u_time = None
                 if eff_start_u_enabled:
-                    eff_start_u = st.datetime_input("New effective start (UTC)", value=pd.Timestamp.utcnow().to_pydatetime())
+                    st.caption("New effective start (AK local)")
+                    eff_start_u_date = st.date_input(
+                        "New start date",
+                        value=pd.Timestamp.now(tz=AK_TZ).date(),
+                        key="pricing_update_start_date",
+                    )
+                    eff_start_u_time = st.time_input(
+                        "New start time",
+                        value=pd.Timestamp.now(tz=AK_TZ).replace(second=0, microsecond=0).time(),
+                        key="pricing_update_start_time",
+                    )
+
             with c4:
                 eff_end_u_enabled = st.checkbox("Update effective end", value=False)
-                eff_end_u = None
+                eff_end_u_date = None
+                eff_end_u_time = None
                 if eff_end_u_enabled:
-                    eff_end_u = st.datetime_input("New effective end (UTC)", value=pd.Timestamp.utcnow().to_pydatetime())
-
-            notes_u = st.text_area("Notes [optional]", value="")
+                    st.caption("New effective end (AK local)")
+                    eff_end_u_date = st.date_input(
+                        "New end date",
+                        value=pd.Timestamp.now(tz=AK_TZ).date(),
+                        key="pricing_update_end_date",
+                    )
+                    eff_end_u_time = st.time_input(
+                        "New end time",
+                        value=pd.Timestamp.now(tz=AK_TZ).replace(second=0, microsecond=0).time(),
+                        key="pricing_update_end_time",
+                    )
 
             if st.button("Apply pricing update"):
                 if not pricing_id.strip():
@@ -531,28 +576,30 @@ def render_admin_tab():
 
                     c_fee = _coerce_numeric(connection_fee_u)
                     if c_fee is not None:
-                        patch["connection_fee_usd"] = c_fee
+                        patch["connection_fee"] = c_fee
 
                     p_kwh = _coerce_numeric(price_kwh_u)
                     if p_kwh is not None:
-                        patch["price_per_kwh_usd"] = p_kwh
+                        patch["price_per_kwh"] = p_kwh
 
                     p_min = _coerce_numeric(price_min_u)
                     if p_min is not None:
-                        patch["price_per_min_usd"] = p_min
+                        patch["price_per_min"] = p_min
 
                     i_min = _coerce_numeric(idle_min_u)
                     if i_min is not None:
-                        patch["idle_fee_per_min_usd"] = i_min
+                        patch["idle_fee_per_min"] = i_min
 
-                    if eff_start_u_enabled and eff_start_u is not None:
-                        patch["effective_start"] = _ts_to_iso_z(pd.to_datetime(eff_start_u, utc=True))
+                    if eff_start_u_enabled and eff_start_u_date is not None and eff_start_u_time is not None:
+                        start_local = pd.Timestamp.combine(eff_start_u_date, eff_start_u_time).tz_localize(AK_TZ)
+                        patch["effective_start"] = _ts_to_iso_z(start_local.tz_convert("UTC"))
 
                     if eff_end_u_enabled:
-                        patch["effective_end"] = _ts_to_iso_z(pd.to_datetime(eff_end_u, utc=True)) if eff_end_u is not None else None
-
-                    if notes_u.strip():
-                        patch["notes"] = notes_u.strip()
+                        if eff_end_u_date is not None and eff_end_u_time is not None:
+                            end_local = pd.Timestamp.combine(eff_end_u_date, eff_end_u_time).tz_localize(AK_TZ)
+                            patch["effective_end"] = _ts_to_iso_z(end_local.tz_convert("UTC"))
+                        else:
+                            patch["effective_end"] = None
 
                     if not patch:
                         st.warning("No fields provided to update.")
