@@ -713,6 +713,13 @@ def get_portal_user() -> PortalUser:
             allowed_from_db = _fetch_allowed_evse_from_supabase(cookie_email)
             u = PortalUser(email=cookie_email, user_id=u.user_id, allowed_evse_ids=allowed_from_db)
 
+        # If the portal response produced an email but an empty allowlist, re-check Supabase.
+        # This helps when portal allowlists are cached/stale but the DB has been updated.
+        if u.email and (u.allowed_evse_ids == []):
+            allowed_from_db = _fetch_allowed_evse_from_supabase(u.email)
+            if isinstance(allowed_from_db, list) and len(allowed_from_db) > 0:
+                u = PortalUser(email=u.email, user_id=u.user_id, allowed_evse_ids=allowed_from_db)
+
         # If portal says ok but provides no identity AND we couldn't extract, treat as unauthenticated
         if u.email or u.user_id or (u.allowed_evse_ids is not None):
             if os.getenv("RCA_AUTH_DEBUG") == "1":
