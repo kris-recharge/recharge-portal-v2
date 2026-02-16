@@ -149,10 +149,13 @@ def session_detail_figure(mv, sid, tx):
     add_line("V",   "HVB (V)",      axis="y5", hover_fmt="%{y:.0f} V")
 
     fig.update_layout(
-        margin=dict(l=10, r=200, t=30, b=10),
+        # Give the hover box room on the right so it doesn't get clipped by the stacked right axes
+        margin=dict(l=10, r=260, t=30, b=10),
         hovermode="x unified",
+        hoverlabel=dict(align="left"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis=dict(title="Time (AK)"),
+        # Leave some plot-domain space on the right for the stacked axis titles
+        xaxis=dict(title="Time (AK)", domain=[0.0, 0.82]),
         # y (left): Power
         yaxis=dict(title="Power (kW)", autorange=True, fixedrange=False),
         # y2..y5 (right): Amps, SoC, Energy, HVB
@@ -172,7 +175,8 @@ def session_detail_figure(mv, sid, tx):
             side="right",
             anchor="free",
             position=0.98,
-            autorange=True,
+            # Keep SoC consistent across sessions
+            range=[0, 100],
             fixedrange=False,
             title_standoff=6,
         ),

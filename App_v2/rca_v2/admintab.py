@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json, os, stat, subprocess, textwrap
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -13,9 +13,6 @@ from . import constants as C
 
 # ---- Runtime files ----
 OVERRIDES_PATH = Path(__file__).with_name("runtime_overrides.json")
-SECRETS_DIR = Path.home() / ".recharge_admin"
-SECRETS_DIR.mkdir(parents=True, exist_ok=True)
-SUPABASE_SECRETS = SECRETS_DIR / "supabase.json"
 
 
 # ---------- small IO helpers ----------
@@ -49,13 +46,29 @@ def _upsert_override(key: str, payload: Any) -> Dict[str, Any]:
 
 # ---------- Supabase (REST) ----------
 def _load_supabase_creds() -> Dict[str, str]:
-    cfg = _read_json(SUPABASE_SECRETS)
-    url = st.session_state.get("__sb_url") or cfg.get("url") or os.getenv("SUPABASE_URL", "")
-    key = st.session_state.get("__sb_key") or cfg.get("service_key") or os.getenv("SUPABASE_SERVICE_KEY", "")
+    """Load Supabase REST credentials.
+
+    We prefer env vars (from .env / docker-compose env_file):
+      - NEXT_PUBLIC_SUPABASE_URL (or SUPABASE_URL)
+      - SUPABASE_SERVICE_ROLE_KEY (preferred) or SUPABASE_SERVICE_KEY
+
+    You can also temporarily override in the current Streamlit session via
+    st.session_state['__sb_url'] / st.session_state['__sb_key'].
+    """
+    url = (
+        st.session_state.get("__sb_url")
+        or os.getenv("SUPABASE_URL", "")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")
+    )
+
+    key = (
+        st.session_state.get("__sb_key")
+        or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+        or os.getenv("SUPABASE_SERVICE_ROLE", "")
+        or os.getenv("SUPABASE_SERVICE_KEY", "")
+    )
     return {"url": url, "service_key": key}
 
-def _save_supabase_creds(url: str, key: str) -> None:
-    _write_json(SUPABASE_SECRETS, {"url": url, "service_key": key}, chmod_600=True)
 
 def _sb_headers(key: str) -> Dict[str, str]:
     return {
@@ -87,6 +100,92 @@ def _sb_update_user(url: str, key: str, user_id: Any, patch: Dict[str, Any]) -> 
                        headers=_sb_headers(key), data=json.dumps(patch), timeout=20)
     r.raise_for_status()
     return r.json()[0] if r.json() else {}
+
+
+def _sb_get_pricing(url: str, key: str) -> pd.DataFrame:
+    """Fetch EVSE pricing rows from Supabase."""
+    import requests
+    # order by most-recent start first
+    q = "?select=*&order=effective_start.desc.nullslast"
+    r = requests.get(_sb_table_url(url, "evse_pricing") + q, headers=_sb_headers(key), timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return pd.DataFrame(data) if data else pd.DataFrame()
+
+
+def _sb_insert_pricing(url: str, key: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    import requests
+    r = requests.post(_sb_table_url(url, "evse_pricing"), headers=_sb_headers(key), data=json.dumps(row), timeout=20)
+    r.raise_for_status()
+    return r.json()[0] if r.json() else {}
+
+
+def _sb_update_pricing(url: str, key: str, pricing_id: Any, patch: Dict[str, Any]) -> Dict[str, Any]:
+    import requests
+    r = requests.patch(
+        _sb_table_url(url, "evse_pricing") + f"?id=eq.{pricing_id}",
+        headers=_sb_headers(key),
+        data=json.dumps(patch),
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()[0] if r.json() else {}
+
+
+def _coerce_numeric(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip()
+    if s == "":
+        return None
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+def _ts_to_iso_z(ts: Optional[pd.Timestamp]) -> Optional[str]:
+    """Convert a pandas Timestamp (or None) to RFC3339 string with timezone."""
+    if ts is None:
+        return None
+    if not isinstance(ts, pd.Timestamp):
+        try:
+            ts = pd.to_datetime(ts)
+        except Exception:
+            return None
+    if ts.tzinfo is None:
+        # treat naive timestamps as UTC
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    # Supabase likes RFC3339
+    return ts.isoformat()
+
+
+def _pricing_payload(
+    station_id: str,
+    connection_fee_usd: Optional[float],
+    price_per_kwh_usd: Optional[float],
+    price_per_min_usd: Optional[float],
+    idle_fee_per_min_usd: Optional[float],
+    effective_start: Optional[pd.Timestamp],
+    effective_end: Optional[pd.Timestamp],
+    notes: str,
+) -> Dict[str, Any]:
+    row: Dict[str, Any] = {
+        "station_id": station_id,
+        "connection_fee_usd": connection_fee_usd,
+        "price_per_kwh_usd": price_per_kwh_usd,
+        "price_per_min_usd": price_per_min_usd,
+        "idle_fee_per_min_usd": idle_fee_per_min_usd,
+        "effective_start": _ts_to_iso_z(effective_start),
+        "effective_end": _ts_to_iso_z(effective_end),
+        "notes": notes.strip() if notes else None,
+    }
+    # remove nulls so we don't overwrite columns with null accidentally
+    return {k: v for k, v in row.items() if v is not None}
 
 # ---------- Cron helpers ----------
 def _read_crontab() -> str:
@@ -212,15 +311,40 @@ def render_admin_tab():
 
     creds = _load_supabase_creds()
     with st.expander("Supabase connection"):
-        u = st.text_input("Supabase URL", value=creds["url"])
-        k = st.text_input("Service role key", value=creds["service_key"], type="password")
+        st.caption(
+            "Credentials are loaded from environment variables (.env / docker-compose env_file). "
+            "You can temporarily override for this session (not saved to disk)."
+        )
+
+        u = st.text_input("Supabase URL", value=creds["url"], help="From NEXT_PUBLIC_SUPABASE_URL or SUPABASE_URL")
+        k = st.text_input(
+            "Service role key",
+            value=creds["service_key"],
+            type="password",
+            help="From SUPABASE_SERVICE_ROLE_KEY (preferred) or SUPABASE_SERVICE_KEY",
+        )
+
         c1, c2 = st.columns([1, 1])
         with c1:
-            if st.button("Save credentials (local only)"):
-                _save_supabase_creds(u, k)
-                st.success("Saved. Stored at ~/.recharge_admin/supabase.json (chmod 600).")
+            if st.button("Use values for this session"):
+                st.session_state["__sb_url"] = u
+                st.session_state["__sb_key"] = k
+                st.success("Using these Supabase credentials for this session.")
         with c2:
-            st.caption("Service key is stored locally, never in the repo.")
+            if st.button("Clear session override"):
+                st.session_state.pop("__sb_url", None)
+                st.session_state.pop("__sb_key", None)
+                st.success("Cleared session override; back to environment variables.")
+
+        # Simple status hints
+        st.write(
+            {
+                "has_url": bool(u.strip()),
+                "has_service_role_key": bool(k.strip()),
+                "url_source": "env/session",
+                "key_source": "env/session",
+            }
+        )
 
     url, key = _load_supabase_creds().values()
     if url and key:
@@ -272,3 +396,169 @@ def render_admin_tab():
                             st.success(f"Deactivated {out.get('email', user_id)}")
                 except Exception as e:
                     st.error(f"Supabase action failed: {e}")
+
+    st.divider()
+    st.markdown("### Supabase Pricing")
+    st.caption(
+        "Manage EVSE pricing in Supabase (connection fee, $/kWh, $/min, idle $/min, and effective date ranges). "
+        "These rows become the source of truth for estimated revenue and future billing views."
+    )
+
+    if not url or not key:
+        st.info("Enter/Save Supabase URL and service key above to manage pricing.")
+    else:
+
+        # Load pricing table if it exists
+        try:
+            pricing = _sb_get_pricing(url, key)
+        except Exception as e:
+            st.warning(
+                "Could not load `evse_pricing` from Supabase. If the table doesn't exist yet, create it and try again. "
+                f"\n\nDetails: {e}"
+            )
+            pricing = pd.DataFrame()
+
+        if not pricing.empty:
+            # Human friendly view
+            friendly = dict(evse_display)
+            pricing_view = pricing.copy()
+            if "station_id" in pricing_view.columns:
+                pricing_view.insert(
+                    1,
+                    "evse",
+                    pricing_view["station_id"].map(lambda x: friendly.get(x, "")),
+                )
+            st.dataframe(pricing_view, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No pricing rows found (or table not created yet).")
+
+        with st.expander("Add pricing rule"):
+            # Pick EVSE by friendly name, store station_id
+            station_ids = sorted(evse_display.keys())
+            labels = [f"{evse_display.get(sid, sid)}  ({sid})" for sid in station_ids]
+            label_to_sid = {lab: sid for lab, sid in zip(labels, station_ids)}
+
+            chosen = st.selectbox("EVSE", options=labels) if labels else ""
+            station_id = label_to_sid.get(chosen, "")
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                connection_fee = st.text_input("Connection fee ($)", value="0")
+                price_kwh = st.text_input("Price per kWh ($/kWh)", value="")
+            with c2:
+                price_min = st.text_input("Price per minute ($/min)", value="")
+                idle_min = st.text_input("Idle fee ($/min)", value="0")
+
+            c3, c4 = st.columns([1, 1])
+            with c3:
+                eff_start = st.datetime_input(
+                    "Effective start (UTC)",
+                    value=pd.Timestamp.utcnow().to_pydatetime(),
+                    help="Stored as UTC. If you pick a local time, it will be converted to UTC.",
+                )
+            with c4:
+                eff_end_enabled = st.checkbox("Set an effective end", value=False)
+                eff_end = None
+                if eff_end_enabled:
+                    eff_end = st.datetime_input("Effective end (UTC)", value=pd.Timestamp.utcnow().to_pydatetime())
+
+            notes = st.text_area("Notes (optional)", value="")
+
+            if st.button("Create pricing rule"):
+                if not station_id:
+                    st.error("No EVSE selected.")
+                else:
+                    c_fee = _coerce_numeric(connection_fee)
+                    p_kwh = _coerce_numeric(price_kwh)
+                    p_min = _coerce_numeric(price_min)
+                    i_min = _coerce_numeric(idle_min)
+
+                    if p_kwh is None and p_min is None:
+                        st.error("Provide at least one of: $/kWh or $/min")
+                    else:
+                        start_ts = pd.to_datetime(eff_start, utc=True)
+                        end_ts = pd.to_datetime(eff_end, utc=True) if eff_end_enabled and eff_end else None
+                        if end_ts is not None and end_ts <= start_ts:
+                            st.error("Effective end must be after effective start.")
+                        else:
+                            row = _pricing_payload(
+                                station_id=station_id,
+                                connection_fee_usd=c_fee,
+                                price_per_kwh_usd=p_kwh,
+                                price_per_min_usd=p_min,
+                                idle_fee_per_min_usd=i_min,
+                                effective_start=start_ts,
+                                effective_end=end_ts,
+                                notes=notes,
+                            )
+                            try:
+                                out = _sb_insert_pricing(url, key, row)
+                                st.success(f"Created pricing rule id={out.get('id', '')} for {station_id}")
+                            except Exception as e:
+                                st.error(f"Failed to create pricing rule: {e}")
+
+        with st.expander("Update pricing rule (by id)"):
+            pricing_id = st.text_input("Pricing row id")
+            st.caption("Only fields you enter here will be updated.")
+
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                connection_fee_u = st.text_input("Connection fee ($) [optional]", value="")
+                price_kwh_u = st.text_input("Price per kWh ($/kWh) [optional]", value="")
+            with c2:
+                price_min_u = st.text_input("Price per minute ($/min) [optional]", value="")
+                idle_min_u = st.text_input("Idle fee ($/min) [optional]", value="")
+
+            c3, c4 = st.columns([1, 1])
+            with c3:
+                eff_start_u_enabled = st.checkbox("Update effective start", value=False)
+                eff_start_u = None
+                if eff_start_u_enabled:
+                    eff_start_u = st.datetime_input("New effective start (UTC)", value=pd.Timestamp.utcnow().to_pydatetime())
+            with c4:
+                eff_end_u_enabled = st.checkbox("Update effective end", value=False)
+                eff_end_u = None
+                if eff_end_u_enabled:
+                    eff_end_u = st.datetime_input("New effective end (UTC)", value=pd.Timestamp.utcnow().to_pydatetime())
+
+            notes_u = st.text_area("Notes [optional]", value="")
+
+            if st.button("Apply pricing update"):
+                if not pricing_id.strip():
+                    st.error("Pricing row id is required.")
+                else:
+                    patch: Dict[str, Any] = {}
+
+                    c_fee = _coerce_numeric(connection_fee_u)
+                    if c_fee is not None:
+                        patch["connection_fee_usd"] = c_fee
+
+                    p_kwh = _coerce_numeric(price_kwh_u)
+                    if p_kwh is not None:
+                        patch["price_per_kwh_usd"] = p_kwh
+
+                    p_min = _coerce_numeric(price_min_u)
+                    if p_min is not None:
+                        patch["price_per_min_usd"] = p_min
+
+                    i_min = _coerce_numeric(idle_min_u)
+                    if i_min is not None:
+                        patch["idle_fee_per_min_usd"] = i_min
+
+                    if eff_start_u_enabled and eff_start_u is not None:
+                        patch["effective_start"] = _ts_to_iso_z(pd.to_datetime(eff_start_u, utc=True))
+
+                    if eff_end_u_enabled:
+                        patch["effective_end"] = _ts_to_iso_z(pd.to_datetime(eff_end_u, utc=True)) if eff_end_u is not None else None
+
+                    if notes_u.strip():
+                        patch["notes"] = notes_u.strip()
+
+                    if not patch:
+                        st.warning("No fields provided to update.")
+                    else:
+                        try:
+                            out = _sb_update_pricing(url, key, pricing_id.strip(), patch)
+                            st.success(f"Updated pricing rule id={out.get('id', pricing_id.strip())}")
+                        except Exception as e:
+                            st.error(f"Failed to update pricing rule: {e}")
