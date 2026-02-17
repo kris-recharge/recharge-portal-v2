@@ -90,14 +90,23 @@ def _sb_get_users(url: str, key: str) -> pd.DataFrame:
 
 def _sb_insert_user(url: str, key: str, row: Dict[str, Any]) -> Dict[str, Any]:
     import requests
-    r = requests.post(_sb_table_url(url, "portal_users"), headers=_sb_headers(key), data=json.dumps(row), timeout=20)
+    r = requests.post(
+        _sb_table_url(url, "portal_users"),
+        headers=_sb_headers(key),
+        json=row,
+        timeout=20,
+    )
     r.raise_for_status()
     return r.json()[0] if r.json() else {}
 
 def _sb_update_user(url: str, key: str, user_id: Any, patch: Dict[str, Any]) -> Dict[str, Any]:
     import requests
-    r = requests.patch(_sb_table_url(url, "portal_users") + f"?id=eq.{user_id}",
-                       headers=_sb_headers(key), data=json.dumps(patch), timeout=20)
+    r = requests.patch(
+        _sb_table_url(url, "portal_users") + f"?id=eq.{user_id}",
+        headers=_sb_headers(key),
+        json=patch,
+        timeout=20,
+    )
     r.raise_for_status()
     return r.json()[0] if r.json() else {}
 
@@ -115,7 +124,12 @@ def _sb_get_pricing(url: str, key: str) -> pd.DataFrame:
 
 def _sb_insert_pricing(url: str, key: str, row: Dict[str, Any]) -> Dict[str, Any]:
     import requests
-    r = requests.post(_sb_table_url(url, "evse_pricing"), headers=_sb_headers(key), data=json.dumps(row), timeout=20)
+    r = requests.post(
+        _sb_table_url(url, "evse_pricing"),
+        headers=_sb_headers(key),
+        json=row,
+        timeout=20,
+    )
     r.raise_for_status()
     return r.json()[0] if r.json() else {}
 
@@ -125,7 +139,7 @@ def _sb_update_pricing(url: str, key: str, pricing_id: Any, patch: Dict[str, Any
     r = requests.patch(
         _sb_table_url(url, "evse_pricing") + f"?id=eq.{pricing_id}",
         headers=_sb_headers(key),
-        data=json.dumps(patch),
+        json=patch,
         timeout=20,
     )
     r.raise_for_status()
@@ -341,6 +355,7 @@ def render_admin_tab():
                                "allowed_evse_ids": allowed, "active": is_active}
                         out = _sb_insert_user(url, key, row)
                         st.success(f"Created {out.get('email', '')}")
+                        st.rerun()
                     elif mode.startswith("Update"):
                         if not user_id:
                             st.error("user id required for update")
@@ -351,12 +366,14 @@ def render_admin_tab():
                             patch = {k: v for k, v in patch.items() if v is not None}
                             out = _sb_update_user(url, key, user_id, patch)
                             st.success(f"Updated {out.get('email', user_id)}")
+                            st.rerun()
                     else:
                         if not user_id:
                             st.error("user id required")
                         else:
                             out = _sb_update_user(url, key, user_id, {"active": False})
                             st.success(f"Deactivated {out.get('email', user_id)}")
+                            st.rerun()
                 except Exception as e:
                     st.error(f"Supabase action failed: {e}")
 
@@ -481,8 +498,18 @@ def render_admin_tab():
                             try:
                                 out = _sb_insert_pricing(url, key, row)
                                 st.success(f"Created pricing rule id={out.get('id', '')} for {station_id}")
+                                # Refresh the page so the new row shows up immediately
+                                st.rerun()
                             except Exception as e:
-                                st.error(f"Failed to create pricing rule: {e}")
+                                # Try to surface HTTP status/body for PostgREST errors
+                                status = getattr(getattr(e, "response", None), "status_code", None)
+                                body = getattr(getattr(e, "response", None), "text", None)
+                                if status is not None:
+                                    st.error(f"Failed to create pricing rule (HTTP {status}).")
+                                    if body:
+                                        st.code(body[:2000])
+                                else:
+                                    st.error(f"Failed to create pricing rule: {e}")
 
         with st.expander("Update pricing rule (by id)"):
             pricing_id = st.text_input("Pricing row id")
@@ -572,5 +599,13 @@ def render_admin_tab():
                         try:
                             out = _sb_update_pricing(url, key, pricing_id.strip(), patch)
                             st.success(f"Updated pricing rule id={out.get('id', pricing_id.strip())}")
+                            st.rerun()
                         except Exception as e:
-                            st.error(f"Failed to update pricing rule: {e}")
+                            status = getattr(getattr(e, "response", None), "status_code", None)
+                            body = getattr(getattr(e, "response", None), "text", None)
+                            if status is not None:
+                                st.error(f"Failed to update pricing rule (HTTP {status}).")
+                                if body:
+                                    st.code(body[:2000])
+                            else:
+                                st.error(f"Failed to update pricing rule: {e}")
