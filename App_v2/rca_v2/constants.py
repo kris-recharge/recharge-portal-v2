@@ -3,7 +3,7 @@ EVSE_DISPLAY = {
     "as_cnIGqQ0DoWdFCo7zSrN01": "ARG - Left",
     "as_oXoa7HXphUu5riXsSW253": "Delta - Right",
     "as_xTUHfTKoOvKSfYZhhdlhT": "Delta - Left",
-    "as_LYHe6mZTRKiFfziSNJFvJ": "Autel Maxi",
+    "as_LYHe6mZTRKiFfziSNJFvJ": "Glennallen",
 }
 
 EVSE_LOCATION = {
@@ -122,16 +122,16 @@ def connector_type_for(
 # Map station_id → Tritium platform (used for vendor error code enrichment).
 # Leave non‑Tritium units as "" so they won't join to the Tritium codes table.
 PLATFORM_MAP = {
-    # Delta Junction (Tritium)
-    "as_oXoa7HXphUu5riXsSW253": "RT50",  # Delta — Right
-    "as_xTUHfTKoOvKSfYZhhdlhT": "RT50",  # Delta — Left
+    # Delta Junction (Autel)
+    "as_oXoa7HXphUu5riXsSW253": "MaxiCharger",  # Delta — Right
+    "as_xTUHfTKoOvKSfYZhhdlhT": "MaxiCharger",  # Delta — Left
 
     # Anchorage (ARG — Tritium RTM)
     "as_c8rCuPHDd7sV1ynHBVBiq": "RTM",  # ARG — Right
     "as_cnIGqQ0DoWdFCo7zSrN01": "RTM",  # ARG — Left
 
     # Non‑Tritium (no enrichment)
-    "as_LYHe6mZTRKiFfziSNJFvJ": "",
+    "as_LYHe6mZTRKiFfziSNJFvJ": "MaxiCharger",
 }
 
 # --- add near the bottom of constants.py ---
