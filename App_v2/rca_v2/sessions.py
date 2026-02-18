@@ -276,7 +276,7 @@ def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | No
                     "SoC Start": None,
                     "SoC End": None,
                     "ID Tag": id_tag,
-        "Estimated Revenue ($)": _estimate_revenue_usd(_pick_pricing_row(pricing_df, station_id, start_ts), energy_kwh, dur_min),
+                    "Estimated Revenue ($)": _estimate_revenue_usd(_pick_pricing_row(pricing_df, station_id, start_ts), energy_kwh, dur_min),
                     "station_id": str(sid),
                     "transaction_id": tx,
                     "connector_id": conn_int,
