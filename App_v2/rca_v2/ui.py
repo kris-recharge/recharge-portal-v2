@@ -8,13 +8,11 @@ from .config import AK_TZ, UTC
 from .constants import EVSE_DISPLAY, display_name, get_all_station_ids
 from .auth import get_portal_user, filter_allowed_evse_ids, user_label
 
-
 def _round_up_to_hour(dt: datetime) -> datetime:
     base = dt.replace(minute=0, second=0, microsecond=0)
     if dt.minute == 0 and dt.second == 0 and dt.microsecond == 0:
         return base
     return base + timedelta(hours=1)
-
 
 def _find_logo_path() -> Optional[str]:
     here = os.path.dirname(__file__)
@@ -33,7 +31,6 @@ def _find_logo_path() -> Optional[str]:
         if os.path.exists(p):
             return p
     return None
-
 
 def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_override: Optional[str] = None, logout_url_override: Optional[str] = None):
     # Logo
@@ -58,59 +55,36 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     email = (user_email_override or (_pget("email", "") or "")).strip()
     logout_url = (logout_url_override or (_pget("logout_url", "") or "")).strip()
 
-    def _normalize_id_list(value) -> list[str]:
-        """Normalize various allow-list representations into list[str]."""
-        if value is None:
-            return []
-        # Already a list/tuple/set-like
-        if isinstance(value, (list, tuple, set)):
-            out: list[str] = []
-            for x in value:
-                s = str(x).strip()
-                if s:
-                    out.append(s)
-            return out
-        # Strings: JSON list, Postgres array, comma-separated, or single token
-        if isinstance(value, str):
-            s = value.strip()
-            if not s:
-                return []
-            parsed: list[str] = []
-            # JSON list (preferred)
-            if s.startswith("["):
-                try:
-                    v = json.loads(s)
-                    if isinstance(v, list):
-                        parsed = [str(x).strip() for x in v if str(x).strip()]
-                        return parsed
-                except Exception:
-                    pass
-            # Postgres text array like {"a","b"} or {a,b}
-            if s.startswith("{") and s.endswith("}"):
-                inner = s[1:-1].strip()
-                if inner:
-                    parts = inner.split(",")
-                    for p in parts:
-                        p = p.strip().strip('"').strip("'")
-                        if p:
-                            parsed.append(p)
-                    return parsed
-            # Comma-separated
-            if "," in s:
-                return [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
-            # Single token
-            return [s]
-        # Anything else: stringify
-        s = str(value).strip()
-        return [s] if s else []
-
     # Allowed EVSEs: prefer explicit arg, else portal header, else (if we know the user) deny-by-default
-    allowed_from_portal = _normalize_id_list(_pget("allowed_evse_ids", []))
+    allowed_from_portal = _pget("allowed_evse_ids", []) or []
 
-    # Normalize explicit arg too (we have seen cases where this arrives as a string)
-    allowed_evse_ids = _normalize_id_list(allowed_evse_ids)
+    # If allowed_from_portal is a JSON/text blob, normalize to list[str]
+    if isinstance(allowed_from_portal, str):
+        s = allowed_from_portal.strip()
+        parsed: list[str] = []
+        # JSON list (preferred)
+        if s.startswith("["):
+            try:
+                v = json.loads(s)
+                if isinstance(v, list):
+                    parsed = [str(x).strip() for x in v if str(x).strip()]
+            except Exception:
+                parsed = []
+        # Postgres text array like {"a","b"} or {a,b}
+        elif s.startswith("{") and s.endswith("}"):
+            inner = s[1:-1].strip()
+            if inner:
+                parts = inner.split(",")
+                for p in parts:
+                    p = p.strip().strip('"').strip("'")
+                    if p:
+                        parsed.append(p)
+        # Fallback: comma-separated
+        elif "," in s:
+            parsed = [p.strip().strip('"').strip("'") for p in s.split(",") if p.strip()]
 
-    if not allowed_evse_ids:
+        allowed_from_portal = parsed
+    if allowed_evse_ids is None:
         if allowed_from_portal:
             allowed_evse_ids = list(allowed_from_portal)
         elif email:
@@ -142,11 +116,31 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     # All known EVSE station_ids from the DB
     all_keys = get_all_station_ids()
 
-    # Ensure we have a list[str] for downstream set ops / filtering
-    all_keys = [str(k).strip() for k in (all_keys or []) if str(k).strip()]
-
     # Filter EVSEs by allow-list when provided.
     visible_keys = filter_allowed_evse_ids(all_keys, allowed_evse_ids)
+
+    # ---------- Optional auth debug (set RCA_AUTH_DEBUG=1 in env) ----------
+    auth_debug = os.getenv("RCA_AUTH_DEBUG", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if auth_debug:
+        try:
+            raw_allowed = allowed_from_portal
+        except Exception:
+            raw_allowed = None
+
+        debug_payload = {
+            "portal_type": type(portal).__name__ if portal is not None else None,
+            "email": email,
+            "logout_url": logout_url,
+            "allowed_evse_ids_arg": allowed_evse_ids,
+            "allowed_from_portal_normalized": raw_allowed,
+            "all_station_ids_count": len(all_keys) if all_keys else 0,
+            "all_station_ids_sample": list(all_keys)[:10] if all_keys else [],
+            "visible_station_ids_count": len(visible_keys) if visible_keys else 0,
+            "visible_station_ids": list(visible_keys) if visible_keys else [],
+        }
+        st.divider()
+        st.caption("Auth debug (RCA_AUTH_DEBUG=1)")
+        st.code(json.dumps(debug_payload, indent=2), language="json")
 
     # Build label → station_id mapping from the visible keys
     pairs = sorted([(display_name(k), k) for k in visible_keys], key=lambda x: x[0])
@@ -157,23 +151,10 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
     if not visible_keys:
         st.caption("You don't currently have access to any EVSEs.")
 
-    # Leave unselected by default for a cleaner UI.
-    # IMPORTANT: empty selection means "all allowed".
-    sel_labels = st.multiselect(
-        "EVSE(s)",
-        options=labels,
-        default=[],
-        help="Select one or more EVSEs to filter. Leave blank to show all allowed EVSEs.",
-        placeholder="All allowed EVSEs",
-    )
-
-    selected_ids = [friendly_to_key[x] for x in sel_labels if x in friendly_to_key]
-    stations = selected_ids if selected_ids else visible_keys
-
-    if selected_ids:
-        st.caption(f"Showing {len(stations)} of {len(visible_keys)} allowed EVSE(s)")
-    else:
-        st.caption(f"Showing all {len(visible_keys)} allowed EVSE(s)")
+    # Clean visual by default: no chips shown; empty selection means \"all allowed EVSEs\"
+    sel_labels = st.multiselect(" ", options=labels, default=[], label_visibility="collapsed")
+    stations = [friendly_to_key[x] for x in sel_labels] if sel_labels else visible_keys
+    st.caption("No selection = all allowed EVSEs")
 
     # ---------- Default rolling 7‑day window (AK local) ----------
     now_ak = datetime.now(AK_TZ)
@@ -198,11 +179,8 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
         )
     with c2:
         start_time: time = st.time_input(
-            " ",
-            value=start_default.time().replace(second=0, microsecond=0),
-            step=60 * 60,
-            key=ks["st"],
-            label_visibility="collapsed",
+            " ", value=start_default.time().replace(second=0, microsecond=0),
+            step=60*60, key=ks["st"], label_visibility="collapsed"
         )
 
     # Row 2: End Date / End Time
@@ -214,24 +192,22 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
         )
     with c4:
         end_time: time = st.time_input(
-            " ",
-            value=end_default.time().replace(second=0, microsecond=0),
-            step=60 * 60,
-            key=ks["et"],
-            label_visibility="collapsed",
+            " ", value=end_default.time().replace(second=0, microsecond=0),
+            step=60*60, key=ks["et"], label_visibility="collapsed"
         )
 
     # Coerce end >= start
     start_dt = datetime.combine(start_date, start_time).replace(tzinfo=AK_TZ)
-    end_dt = datetime.combine(end_date, end_time).replace(tzinfo=AK_TZ)
+    end_dt   = datetime.combine(end_date, end_time).replace(tzinfo=AK_TZ)
     if end_dt < start_dt:
         end_dt = start_dt
 
     # Convert to UTC strings for queries
     start_utc = start_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_utc = end_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_utc   = end_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     st.divider()
+    st.caption(f"Query window (UTC): {start_utc} ➜ {end_utc}")
     return stations, start_utc, end_utc
 
 
@@ -265,7 +241,7 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
         "SoC Start",
         "SoC End",
         "ID Tag",
-        "Estimated Revenue ($)",
+        "Estimated Revenue",
     ]
     show_cols = [c for c in show_cols if c in df.columns]
 
@@ -296,7 +272,7 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
             "Duration (min)": st.column_config.NumberColumn("Duration (min)", format="%.2f"),
             "SoC Start": st.column_config.NumberColumn("SoC Start", format="%d"),
             "SoC End": st.column_config.NumberColumn("SoC End", format="%d"),
-            "Estimated Revenue": st.column_config.NumberColumn("Estimated Revenue", format="$%.2f"),
+            "Estimated Revenue": st.column_config.NumberColumn("Estimated Revenue", format="%.2f"),
         },
         disabled=[c for c in show_cols],
         height=480,
