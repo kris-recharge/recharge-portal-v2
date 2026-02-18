@@ -265,6 +265,7 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
         "SoC Start",
         "SoC End",
         "ID Tag",
+        "Estimated Revenue ($)",
     ]
     show_cols = [c for c in show_cols if c in df.columns]
 
@@ -295,6 +296,7 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
             "Duration (min)": st.column_config.NumberColumn("Duration (min)", format="%.2f"),
             "SoC Start": st.column_config.NumberColumn("SoC Start", format="%d"),
             "SoC End": st.column_config.NumberColumn("SoC End", format="%d"),
+            "Estimated Revenue": st.column_config.NumberColumn("Estimated Revenue", format="$%.2f"),
         },
         disabled=[c for c in show_cols],
         height=480,
