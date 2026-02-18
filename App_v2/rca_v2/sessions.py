@@ -1,9 +1,104 @@
 import numpy as np
 import pandas as pd
+import os
 
 from .config import AK_TZ
 from .constants import EVSE_LOCATION, CONNECTOR_TYPE
 
+
+
+def _load_evse_pricing_from_db() -> pd.DataFrame:
+    """Best-effort loader for public.evse_pricing from Postgres.
+
+    Used by build_sessions() when the caller does not provide pricing_df.
+    If DATABASE_URL is missing or DB libs are unavailable, returns empty.
+    """
+    try:
+        db_url = os.environ.get('DATABASE_URL')
+        if not db_url:
+            return pd.DataFrame()
+        q = """
+        select
+          station_id,
+          connection_fee,
+          price_per_kwh,
+          price_per_minute,
+          idle_fee,
+          start_ts,
+          end_ts
+        from public.evse_pricing
+        """
+        df = pd.read_sql(q, db_url)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        for c in ('start_ts', 'end_ts'):
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors='coerce', utc=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _pick_pricing_row(pricing: pd.DataFrame, station_id: str, session_start_utc) -> dict | None:
+    """Pick the most recent pricing row active at session_start_utc for station_id."""
+    if pricing is None or pricing.empty or not station_id:
+        return None
+    if 'station_id' not in pricing.columns:
+        return None
+
+    p = pricing[pricing['station_id'].astype(str) == str(station_id)].copy()
+    if p.empty:
+        return None
+
+    t = pd.to_datetime(session_start_utc, errors='coerce', utc=True)
+    if pd.isna(t):
+        return None
+
+    if 'start_ts' in p.columns:
+        p = p[p['start_ts'].notna()]
+        p = p[p['start_ts'] <= t]
+    if p.empty:
+        return None
+
+    if 'end_ts' in p.columns:
+        p = p[(p['end_ts'].isna()) | (p['end_ts'] > t)]
+    if p.empty:
+        return None
+
+    if 'start_ts' in p.columns:
+        p = p.sort_values('start_ts', ascending=False)
+
+    return p.iloc[0].to_dict()
+
+
+def _estimate_revenue_usd(pricing_row: dict | None, energy_kwh: float | None, dur_min: float | None) -> float | None:
+    """Compute estimated revenue in USD.
+
+    Simple model:
+      revenue = connection_fee + (kWh * price_per_kwh) + (minutes * price_per_minute)
+
+    idle_fee is not applied here (needs idle minutes).
+    """
+    if not pricing_row:
+        return None
+
+    def fnum(x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    conn_fee = fnum(pricing_row.get('connection_fee', 0.0))
+    p_kwh = fnum(pricing_row.get('price_per_kwh', 0.0))
+    p_min = fnum(pricing_row.get('price_per_minute', 0.0))
+
+    e = fnum(energy_kwh) if energy_kwh is not None else 0.0
+    m = fnum(dur_min) if dur_min is not None else 0.0
+
+    rev = conn_fee + (e * p_kwh) + (m * p_min)
+    if rev < 0:
+        return None
+    return round(rev, 2)
 
 def _fmt_ak(dt, fmt: str = "%Y-%m-%d %H:%M") -> str:
     """Format a UTC timestamp into Alaska local time."""
@@ -172,9 +267,6 @@ def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | No
                 {
                     "Start Date/Time": _fmt_ak(ts_start),
                     "End Date/Time": _fmt_ak(ts_end),
-                    # Keep raw timestamps too (UTC) so downstream logic (pricing, joins) can be exact.
-                    "start_time_utc": ts_start,
-                    "end_time_utc": ts_end,
                     "EVSE": EVSE_LOCATION.get(str(sid), ""),
                     "Connector #": conn_int,
                     "Connector Type": CONNECTOR_TYPE.get((str(sid), conn_int), ""),
@@ -184,6 +276,7 @@ def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | No
                     "SoC Start": None,
                     "SoC End": None,
                     "ID Tag": id_tag,
+        "Estimated Revenue ($)": _estimate_revenue_usd(_pick_pricing_row(pricing_df, station_id, start_ts), energy_kwh, dur_min),
                     "station_id": str(sid),
                     "transaction_id": tx,
                     "connector_id": conn_int,
