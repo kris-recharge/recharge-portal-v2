@@ -19,6 +19,7 @@ from rca_v2.auth import get_portal_user, filter_allowed_evse_ids
 
 from rca_v2.config import APP_MODE
 from rca_v2.ui import render_sidebar, sessions_table_single_select
+from rca_v2.admintab import render_admin_tab
 from rca_v2.loaders import (
     load_meter_values,
     load_authorize,
@@ -40,6 +41,7 @@ from rca_v2.export import build_export_xlsx_bytes
 
 EVSE_DISPLAY = get_evse_display()
 
+
 #
 # Identify portal user + allowed EVSEs
 # In production (when behind the portal), we enforce deny-by-default:
@@ -47,6 +49,9 @@ EVSE_DISPLAY = get_evse_display()
 # - If the allowlist exists, the app shows ALL allowed EVSEs by default.
 # In local/dev (no portal headers), we fail-open for convenience.
 portal = get_portal_user()  # reads x-portal-user-* headers injected by Next/Caddy
+
+# Reset per-run lockout flag so a prior run can't permanently wedge the UI.
+st.session_state["__portal_no_access"] = False
 
 # Detect whether this request is coming through the portal (i.e., headers are present).
 # We treat "has an email" OR "has a logout_url" OR "has any allowlist field" as portal context.
@@ -90,30 +95,102 @@ except Exception:
     # - local/dev      => fail open
     allowed_ids = set() if is_portal_context else None
 
+def _normalize_allowed_ids(raw):
+    """Normalize a variety of allowlist shapes into a clean set[str].
+
+    Supports:
+    - list/set/tuple of ids
+    - single comma-separated string
+    - JSON-ish string like '["as_..."]'
+    """
+    if raw in (None, ""):
+        return None
+
+    # If it's already an iterable of ids
+    if isinstance(raw, (set, list, tuple)):
+        items = list(raw)
+    else:
+        s = str(raw).strip()
+        if not s:
+            return set()
+
+        # Try JSON list first
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("{") and s.endswith("}")):
+            try:
+                obj = json.loads(s)
+                if isinstance(obj, (list, tuple, set)):
+                    items = list(obj)
+                else:
+                    items = [obj]
+            except Exception:
+                items = [s]
+        else:
+            # Comma-separated fall back
+            items = [p for p in s.split(",") if p.strip()]
+
+    out = set()
+    for x in items:
+        if x is None:
+            continue
+        t = str(x).strip()
+        if not t:
+            continue
+        # strip wrapping quotes
+        if (t.startswith('"') and t.endswith('"')) or (t.startswith("'") and t.endswith("'")):
+            t = t[1:-1].strip()
+        if not t:
+            continue
+        # If someone accidentally passed a JSON-ish string element, split again
+        if "," in t and t.strip().startswith("as_"):
+            for part in t.split(","):
+                part = part.strip().strip('"').strip("'")
+                if part:
+                    out.add(part)
+        else:
+            out.add(t)
+    return out
+
 # Normalize to a set of strings when present.
-allowed_ids_set = None
-if isinstance(allowed_ids, (set, list, tuple)):
-    allowed_ids_set = {str(x) for x in allowed_ids if str(x).strip() != ""}
+allowed_ids_set = _normalize_allowed_ids(allowed_ids)
 
-# Enforce deny-by-default when behind the portal.
+# If the auth helper returned None but we *do* have a raw allowlist value from the portal,
+# normalize the raw value as a fallback (prevents accidental deny when parsing changes).
+if allowed_ids_set is None and _portal_allowed_raw not in (None, ""):
+    allowed_ids_set = _normalize_allowed_ids(_portal_allowed_raw)
+
+if allowed_ids_set is not None:
+    allowed_ids_set = {str(x) for x in allowed_ids_set if str(x).strip() != ""}
+
 if is_portal_context:
-    # If the user has no allowlist (NULL/empty), they should see nothing.
-    if not allowed_ids_set:
-        st.error(
-            "Your account does not have access to any EVSEs. "
-            "Please contact ReCharge Alaska if you believe this is an error."
-        )
-        st.stop()
-
-    # Restrict the global EVSE display map to ONLY the allowed set.
-    EVSE_DISPLAY = {
-        sid: name
-        for sid, name in EVSE_DISPLAY.items()
-        if str(sid) in allowed_ids_set
+    # Optional: superadmin bypass (comma-separated emails)
+    superadmins = {
+        e.strip().lower()
+        for e in (os.getenv("RCA_SUPERADMIN_EMAILS", "") or "").split(",")
+        if e.strip()
     }
 
-    # Store allowed station ids in session_state for downstream loaders/filters.
-    st.session_state["__portal_allowed_station_ids"] = allowed_ids_set
+    if portal_email and portal_email.strip().lower() in superadmins:
+        # Superadmins can see all EVSEs
+        st.session_state["__portal_no_access"] = False
+        st.session_state["__portal_allowed_station_ids"] = None
+    else:
+        # Enforce deny-by-default behind the portal
+        if not allowed_ids_set:
+            st.session_state["__portal_no_access"] = True
+            EVSE_DISPLAY = {}
+            st.session_state["__portal_allowed_station_ids"] = set()
+        else:
+            st.session_state["__portal_no_access"] = False
+
+            # Restrict the global EVSE display map to ONLY the allowed set.
+            EVSE_DISPLAY = {
+                sid: name
+                for sid, name in EVSE_DISPLAY.items()
+                if str(sid) in allowed_ids_set
+            }
+
+            # Store allowed station ids in session_state for downstream loaders/filters.
+            st.session_state["__portal_allowed_station_ids"] = allowed_ids_set
 else:
     # None means fail-open/local-dev mode (no portal headers)
     st.session_state["__portal_allowed_station_ids"] = None
@@ -130,6 +207,14 @@ with st.sidebar:
             stations, start_utc, end_utc = render_sidebar(EVSE_DISPLAY)
         except TypeError:
             stations, start_utc, end_utc = render_sidebar()
+
+# If portal context determined no access, show banner AFTER sidebar renders.
+if st.session_state.get("__portal_no_access"):
+    st.error(
+        "Your account does not have access to any EVSEs. "
+        "Please contact ReCharge Alaska if you believe this is an error."
+    )
+    st.stop()
 
 
 
@@ -346,9 +431,36 @@ if isinstance(_allowed, (set, list, tuple)):
             )
             st.stop()
 
-# Build tabs (Admin tab removed from the shared web deployment)
+
+# Build tabs
+# Admin tab is ONLY visible to ReCharge Alaska staff accounts.
+# (Portal auth already gates access to /app; this is an additional UI-level restriction.)
+can_admin = False
+try:
+    if portal_email and portal_email.strip().lower().endswith("@rechargealaska.net"):
+        can_admin = True
+except Exception:
+    can_admin = False
+
+# Optional superadmin bypass (comma-separated emails)
+try:
+    _superadmins = {
+        e.strip().lower()
+        for e in (os.getenv("RCA_SUPERADMIN_EMAILS", "") or "").split(",")
+        if e.strip()
+    }
+    if portal_email and portal_email.strip().lower() in _superadmins:
+        can_admin = True
+except Exception:
+    pass
+
 TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Export"]
-t1, t2, t3, t4 = st.tabs(TAB_TITLES)
+if can_admin:
+    TAB_TITLES.append("Admin")
+
+_tabs = st.tabs(TAB_TITLES)
+t1, t2, t3, t4 = _tabs[0], _tabs[1], _tabs[2], _tabs[3]
+t_admin = _tabs[4] if can_admin and len(_tabs) > 4 else None
 
 with t1:
     st.subheader("Charging Sessions")
@@ -551,6 +663,7 @@ with t1:
         "SoC Start",
         "SoC End",
         "ID Tag",
+        "Estimated Revenue ($)",
     ]
     cols = [c for c in cols if c in sess.columns]
     # Render the sessions table and capture the selected (station_id, transaction_id)
@@ -689,11 +802,6 @@ with t1:
     # Heatmaps — stacked full width (to match v1 layout)
     st.plotly_chart(
         heatmap_count(heat, "Session Start Density (by Day & Hour)"),
-        use_container_width=True,
-        config={"displaylogo": False},
-    )
-    st.plotly_chart(
-        heatmap_duration(heat, "Average Session Duration (min)"),
         use_container_width=True,
         config={"displaylogo": False},
     )
@@ -981,5 +1089,15 @@ with t4:
                     "for the selected window and EVSE filter."
                 ),
             )
+
     except Exception as e:
         st.error(f"Export failed: {e}")
+
+
+# Admin tab (staff-only)
+if t_admin is not None:
+    with t_admin:
+        try:
+            render_admin_tab()
+        except Exception as e:
+            st.error(f"Admin tab failed to load: {e}")
