@@ -350,7 +350,7 @@ def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | No
 
     sess = pd.DataFrame(rows)
     if pricing_df is not None and not sess.empty:
-        sess["Estimated Revenue ($)"] = _estimate_revenue_for_sessions(sess, pricing_df)
+        sess["Estimated Revenue"] = _estimate_revenue_for_sessions(sess, pricing_df)
         # Keep a consistent, human-friendly column order
         col_order = [
             "Start Date/Time",
@@ -361,10 +361,10 @@ def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | No
             "Max Power (kW)",
             "Energy Delivered (kWh)",
             "Duration (min)",
-            "Estimated Revenue ($)",
             "SoC Start",
             "SoC End",
             "ID Tag",
+            "Estimated Revenue ($)",
         ]
         keep = [c for c in col_order if c in sess.columns]
         rest = [c for c in sess.columns if c not in keep and not c.startswith("_")]
@@ -481,7 +481,7 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame, pricing: pd.DataFrame |
 
     sess = pd.DataFrame(rows)
     if pricing is not None and not sess.empty:
-        sess["Estimated Revenue ($)"] = _estimate_revenue_for_sessions(sess, pricing)
+        sess["Estimated Revenue"] = _estimate_revenue_for_sessions(sess, pricing)
         # Keep a consistent, human-friendly column order
         col_order = [
             "Start Date/Time",
@@ -492,10 +492,10 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame, pricing: pd.DataFrame |
             "Max Power (kW)",
             "Energy Delivered (kWh)",
             "Duration (min)",
-            "Estimated Revenue ($)",
             "SoC Start",
             "SoC End",
             "ID Tag",
+            "Estimated Revenue ($)",
         ]
         keep = [c for c in col_order if c in sess.columns]
         rest = [c for c in sess.columns if c not in keep and not c.startswith("_")]
