@@ -60,20 +60,37 @@ def session_detail_figure(mv, sid, tx):
     # -------------------------
     # Column discovery (prefer local wide schema names first)
     # -------------------------
-    if all(c in f.columns for c in ["power_w", "amperage_offered", "soc", "energy_wh", "voltage_v"]):
+    if all(c in f.columns for c in ["power_w", "soc", "energy_wh", "voltage_v"]) and (
+        ("amperage_offered" in f.columns) or ("current_offered_a" in f.columns)
+    ):
         power_col  = "power_w"
-        amps_col   = "amperage_offered"
+        amps_col   = "amperage_offered" if "amperage_offered" in f.columns else "current_offered_a"
         soc_col    = "soc"
         energy_col = "energy_wh"
         hvb_col    = "voltage_v"
     else:
         power_col  = _first_col(f, ["power_kw", "Power (kW)", "kW", "active_power_kw", "power_w", "Power (W)"])
         amps_col   = _first_col(f, [
-            "current_offered_a",  # Autel
-            "amps_offered", "Amps Offered",
+            # Autel / parsed wide schema
+            "current_offered_a",
+            "current_offered",   # sometimes stored without _a
             "offered_current_a",
+            "offered_current",
             "amperage_offered",
-            "current_import_a", "amperage_import", "import_current_a",
+            "amps_offered",
+            "Amps Offered",
+
+            # OCPP measurand-style / camelCase variants that sometimes leak through
+            "Current.Offered",
+            "Current Offered",
+            "currentOfferedA",
+            "offeredCurrentA",
+            "offeredCurrent",
+
+            # Fallbacks (still useful when offered current isn't present)
+            "current_import_a",
+            "amperage_import",
+            "import_current_a",
             "current_a",
         ])
         soc_col    = _first_col(f, ["soc_pct", "SoC (%)", "soc", "soc_percent"]) 
