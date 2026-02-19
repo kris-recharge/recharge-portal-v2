@@ -11,7 +11,7 @@ def _first_col(df, names):
 
 def session_detail_figure(mv, sid, tx):
     """
-    Build the Charge Session Details figure from raw MeterValues without fabricating data.
+    Build the Charge Session Details figure from raw MeterValues (with a best-effort derived-voltage fallback when voltage is missing).
     - Filters by EVSE (station) and transaction id when present
     - Parses UTC timestamps and converts to Alaska time
     - Aligns by timestamp index to avoid any accidental reindexing
@@ -68,7 +68,14 @@ def session_detail_figure(mv, sid, tx):
         hvb_col    = "voltage_v"
     else:
         power_col  = _first_col(f, ["power_kw", "Power (kW)", "kW", "active_power_kw", "power_w", "Power (W)"])
-        amps_col   = _first_col(f, ["amps_offered", "Amps Offered", "current_a", "offered_current_a", "amperage_offered"]) 
+        amps_col   = _first_col(f, [
+            "current_offered_a",  # Autel
+            "amps_offered", "Amps Offered",
+            "offered_current_a",
+            "amperage_offered",
+            "current_import_a", "amperage_import", "import_current_a",
+            "current_a",
+        ])
         soc_col    = _first_col(f, ["soc_pct", "SoC (%)", "soc", "soc_percent"]) 
         hvb_col    = _first_col(f, ["hvb_volts", "HVB (V)", "voltage_v", "pack_volts", "Voltage (V)"]) 
         energy_col = _first_col(f, [
@@ -92,6 +99,21 @@ def session_detail_figure(mv, sid, tx):
     A   = col_to_numeric(amps_col)
     SOC = col_to_numeric(soc_col)
     V   = col_to_numeric(hvb_col)
+
+    # Best-effort derived voltage (V = P(W) / I(A)) when voltage_v is missing.
+    # This is useful for Tritium sessions where voltage_v may not be populated in all rows.
+    # We only fill gaps (NaNs) and never overwrite a real voltage reading.
+    try:
+        V_real = V.copy()
+        # P is already in kW here; convert to W for the calculation
+        P_w = P * 1000.0
+        A_safe = A.where(A.abs() > 0.1)  # avoid divide-by-zero / tiny currents
+        V_calc = (P_w / A_safe).abs()
+        # Clamp to a sane DC pack-voltage range so we don't show junk spikes
+        V_calc = V_calc.where((V_calc >= 50) & (V_calc <= 1200))
+        V = V_real.fillna(V_calc)
+    except Exception:
+        pass
 
     # Energy: convert to kWh if expressed in Wh; baseline to session start
     E = col_to_numeric(energy_col)
