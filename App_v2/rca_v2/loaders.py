@@ -608,6 +608,48 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     if using_postgres():
         placeholders = _make_placeholders(len(stations))
         between = _between_placeholders()
+        # First attempt (preferred): use parsed wide table when available.
+        # This table includes Autel `current_offered_a` and is ideal for charting.
+        sql_parsed = f"""
+          SELECT
+            station_id,
+            connector_id,
+            transaction_id,
+            ts AS timestamp,
+            power_w,
+            energy_wh,
+            soc,
+            current_offered_a,
+            current_import_a,
+            voltage_v
+          FROM public.meter_values_parsed
+          WHERE station_id IN ({placeholders})
+            AND ts BETWEEN {between}
+          ORDER BY station_id, connector_id, transaction_id, ts
+        """
+        params_parsed = list(stations) + [start_utc, end_utc]
+        conn_parsed = get_conn()
+        try:
+            parsed = pd.read_sql(sql_parsed, conn_parsed, params=params_parsed)
+        except Exception:
+            parsed = pd.DataFrame()
+        finally:
+            conn_parsed.close()
+
+        if parsed is not None and not parsed.empty:
+            parsed["timestamp"] = pd.to_datetime(parsed["timestamp"], utc=True, errors="coerce")
+            for c in ["power_w", "energy_wh", "soc", "current_offered_a", "current_import_a", "voltage_v"]:
+                if c in parsed.columns:
+                    parsed[c] = pd.to_numeric(parsed[c], errors="coerce")
+
+            # Provide the legacy column names the rest of the app expects
+            if "amperage_offered" not in parsed.columns:
+                parsed["amperage_offered"] = parsed.get("current_offered_a")
+            if "amperage_import" not in parsed.columns:
+                parsed["amperage_import"] = parsed.get("current_import_a")
+
+            return parsed
+
         station_expr = "COALESCE(asset_id, action_payload->'data'->'asset'->>'id')"
         sql = f"""
           SELECT {station_expr} AS station_id,
