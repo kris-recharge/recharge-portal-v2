@@ -272,6 +272,11 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
             "Duration (min)": st.column_config.NumberColumn("Duration (min)", format="%.2f"),
             "SoC Start": st.column_config.NumberColumn("SoC Start", format="%d"),
             "SoC End": st.column_config.NumberColumn("SoC End", format="%d"),
+            "Estimated Revenue ($)": st.column_config.NumberColumn(
+                "Estimated Revenue ($)",
+                format="$ %.2f",
+                help="Calculated as: Connection Fee + (kWh * Price/kWh) + (Min * Price/Min)",
+            ),
         },
         disabled=[c for c in show_cols],
         height=480,

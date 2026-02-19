@@ -20,20 +20,21 @@ def _load_evse_pricing_from_db() -> pd.DataFrame:
         q = """
         select
           station_id,
+          effective_start,
+          effective_end,
           connection_fee,
           price_per_kwh,
-          price_per_minute,
-          idle_fee,
-          start_ts,
-          end_ts
+          price_per_min,
+          idle_fee_per_min,
+          idle_grace_min
         from public.evse_pricing
         """
         df = pd.read_sql(q, db_url)
         if df is None or df.empty:
             return pd.DataFrame()
-        for c in ('start_ts', 'end_ts'):
+        for c in ("effective_start", "effective_end"):
             if c in df.columns:
-                df[c] = pd.to_datetime(df[c], errors='coerce', utc=True)
+                df[c] = pd.to_datetime(df[c], errors="coerce", utc=True)
         return df
     except Exception:
         return pd.DataFrame()
@@ -54,19 +55,23 @@ def _pick_pricing_row(pricing: pd.DataFrame, station_id: str, session_start_utc)
     if pd.isna(t):
         return None
 
-    if 'start_ts' in p.columns:
-        p = p[p['start_ts'].notna()]
-        p = p[p['start_ts'] <= t]
+    # Prefer effective_start/effective_end (Supabase schema), but support legacy start_ts/end_ts
+    start_col = "effective_start" if "effective_start" in p.columns else ("start_ts" if "start_ts" in p.columns else None)
+    end_col = "effective_end" if "effective_end" in p.columns else ("end_ts" if "end_ts" in p.columns else None)
+
+    if start_col is not None:
+        p = p[p[start_col].notna()]
+        p = p[p[start_col] <= t]
     if p.empty:
         return None
 
-    if 'end_ts' in p.columns:
-        p = p[(p['end_ts'].isna()) | (p['end_ts'] > t)]
+    if end_col is not None:
+        p = p[(p[end_col].isna()) | (p[end_col] > t)]
     if p.empty:
         return None
 
-    if 'start_ts' in p.columns:
-        p = p.sort_values('start_ts', ascending=False)
+    if start_col is not None:
+        p = p.sort_values(start_col, ascending=False)
 
     return p.iloc[0].to_dict()
 
@@ -75,7 +80,7 @@ def _estimate_revenue_usd(pricing_row: dict | None, energy_kwh: float | None, du
     """Compute estimated revenue in USD.
 
     Simple model:
-      revenue = connection_fee + (kWh * price_per_kwh) + (minutes * price_per_minute)
+      revenue = connection_fee + (kWh * price_per_kwh) + (minutes * price_per_min)
 
     idle_fee is not applied here (needs idle minutes).
     """
@@ -90,7 +95,8 @@ def _estimate_revenue_usd(pricing_row: dict | None, energy_kwh: float | None, du
 
     conn_fee = fnum(pricing_row.get('connection_fee', 0.0))
     p_kwh = fnum(pricing_row.get('price_per_kwh', 0.0))
-    p_min = fnum(pricing_row.get('price_per_minute', 0.0))
+    # Supabase schema uses price_per_min; keep backward-compat with price_per_minute
+    p_min = fnum(pricing_row.get("price_per_min", pricing_row.get("price_per_minute", 0.0)))
 
     e = fnum(energy_kwh) if energy_kwh is not None else 0.0
     m = fnum(dur_min) if dur_min is not None else 0.0
@@ -141,7 +147,7 @@ def _is_stoplike(row: pd.Series) -> bool:
     return True
 
 
-def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | None):
+def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | None, pricing_df: pd.DataFrame | None):
     """Pair Start/StopTransaction fallback rows into sessions.
 
     Works when Start rows have connector_id but no transaction_id and Stop rows have transaction_id but no connector_id.
@@ -276,7 +282,11 @@ def _build_sessions_from_start_stop(df: pd.DataFrame, auth_df: pd.DataFrame | No
                     "SoC Start": None,
                     "SoC End": None,
                     "ID Tag": id_tag,
-                    "Estimated Revenue ($)": _estimate_revenue_usd(_pick_pricing_row(pricing_df, station_id, start_ts), energy_kwh, dur_min),
+                    "Estimated Revenue ($)": _estimate_revenue_usd(
+                        _pick_pricing_row(pricing_df, str(sid), ts_start),
+                        e_kwh if pd.notna(e_kwh) else None,
+                        dur_min if pd.notna(dur_min) else None,
+                    ),
                     "station_id": str(sid),
                     "transaction_id": tx,
                     "connector_id": conn_int,
@@ -321,6 +331,9 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
         auth_df = auth.copy()
         auth_df["timestamp"] = pd.to_datetime(auth_df["timestamp"], utc=True, errors="coerce")
         auth_df = auth_df.dropna(subset=["timestamp"]).sort_values(["station_id", "timestamp"], kind="mergesort")
+
+    # Load EVSE pricing once per build (best-effort). Empty df means revenue will be None.
+    pricing_df = _load_evse_pricing_from_db()
 
     groups = df.groupby(["station_id", "connector_id", "transaction_id"], dropna=False, sort=False)
 
@@ -382,6 +395,11 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
                 "SoC Start": int(round(soc_start)) if pd.notna(soc_start) else None,
                 "SoC End": int(round(soc_end)) if soc_end is not None else None,
                 "ID Tag": id_tag,
+                "Estimated Revenue ($)": _estimate_revenue_usd(
+                    _pick_pricing_row(pricing_df, str(sid), ts_start),
+                    e_kwh if pd.notna(e_kwh) else None,
+                    dur_min if pd.notna(dur_min) else None,
+                ),
                 "station_id": sid,
                 "transaction_id": tx,
                 "connector_id": conn_int,
@@ -415,7 +433,7 @@ def build_sessions(df: pd.DataFrame, auth: pd.DataFrame):
         return not (dur_ok.any() or kwh_ok.any())
 
     if sess.empty or (has_start_stop and _is_stop_only_sessions(sess)):
-        sess2, heat2 = _build_sessions_from_start_stop(df, auth_df)
+        sess2, heat2 = _build_sessions_from_start_stop(df, auth_df, pricing_df)
         # If fallback produced something, return it. Otherwise fall back to tx grouping output.
         if sess2 is not None and not sess2.empty:
             return sess2, heat2
