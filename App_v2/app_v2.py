@@ -819,7 +819,7 @@ with t2:
     with c1:
         st.caption("sorted newest first")
     with c2:
-        show_only_vendor = st.checkbox("Show only vendor_error_code", value=False)
+        show_fault_status = st.checkbox("Show Fault Status", value=False)
 
     stations_key = _make_station_key(stations)
     status_df = cached_status_history(stations_key, start_utc, end_utc)
@@ -855,24 +855,17 @@ with t2:
         # Tritium enrichment (best‑effort; no‑op if lookup isn’t wired yet)
         df = _enrich_status_with_tritium(df)
 
-        # Optional: only rows that actually have a vendor_error_code
-        # Apply this after Tritium enrichment so we filter on the final column.
-        if show_only_vendor and "vendor_error_code" in df.columns:
-            v_raw = df["vendor_error_code"]
-            v = v_raw.astype(str).str.strip()
-
-            keep = (
-                ~v_raw.isna()
-                & (v != "")
-                & (~v.str.lower().isin(["none", "nan"]))
-                & (~v.isin(["0", "0000", "0.0"]))
-            )
-
-            df = df[keep]
+        # Optional: only rows in a Faulted status (to spotlight active faults/vendor issues)
+        if show_fault_status:
+            # Normalize status text and keep anything that looks like FAULT
+            s = df.get("status")
+            if s is not None:
+                s_norm = s.astype(str).str.strip().str.upper()
+                df = df[s_norm.str.contains("FAULT", na=False)]
 
             if df.empty:
                 st.info(
-                    "No status rows with vendor_error_code in this window for the selected EVSE."
+                    "No Faulted status rows in this window for the selected EVSE."
                 )
                 st.stop()
 
