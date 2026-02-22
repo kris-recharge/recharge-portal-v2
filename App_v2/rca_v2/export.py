@@ -266,20 +266,16 @@ def prep_sessions_sheet(
 
     # Ensure a stable raw authorize column.
     if "ID Tag" in out.columns and "Authorize (raw)" not in out.columns:
-        out["Authorize (raw)"] = out["ID Tag"].astype(str)
+        out["Authorize (raw)"] = out["ID Tag"].where(out["ID Tag"].notna(), pd.NA)
 
     # If the upstream already provided a method, normalize its label.
     if "authorization_method" in out.columns and "Auth Method (guess)" not in out.columns:
-        out["Auth Method (guess)"] = out["authorization_method"].astype(str)
+        out["Auth Method (guess)"] = out["authorization_method"]
 
     # Otherwise, try to look it up from an authorize_methods dataframe if provided.
     # Prefer matching by (station_id, transaction_id) when possible (most reliable),
     # otherwise fall back to matching by ID Tag.
-    if (
-        "Auth Method (guess)" not in out.columns
-        and authorize_methods_df is not None
-        and not authorize_methods_df.empty
-    ):
+    if authorize_methods_df is not None and not authorize_methods_df.empty:
         try:
             am = authorize_methods_df.copy()
 
@@ -362,11 +358,19 @@ def prep_sessions_sheet(
                     )
 
                 if "authorization_method" in out_id.columns:
-                    out_id["Auth Method (guess)"] = out_id["authorization_method"].astype(str)
+                    # Prefer the table's method (passthrough). If the column already exists,
+                    # only fill missing values from the table (don't overwrite real values).
+                    if "Auth Method (guess)" not in out_id.columns:
+                        out_id["Auth Method (guess)"] = out_id["authorization_method"]
+                    else:
+                        out_id["Auth Method (guess)"] = out_id["Auth Method (guess)"].where(
+                            out_id["Auth Method (guess)"].notna(),
+                            out_id["authorization_method"],
+                        )
 
                 # Keep confidence if present (useful in exports)
                 if "confidence" in out_id.columns and "Auth Method Confidence" not in out_id.columns:
-                    out_id["Auth Method Confidence"] = out_id["confidence"].astype(str)
+                    out_id["Auth Method Confidence"] = out_id["confidence"]
 
                 # Drop extra join columns
                 drop_extra = [c for c in ["station_id_am", "confidence", "authorization_method", tag_col] if c in out_id.columns]
@@ -374,8 +378,14 @@ def prep_sessions_sheet(
         except Exception:
             pass
 
-    # Final fallback heuristic if we still don't have a guess
-    if "Auth Method (guess)" not in out.columns:
+
+    # Normalize placeholder strings that can appear after merges
+    for c in ["Auth Method (guess)", "Auth Method Confidence"]:
+        if c in out.columns:
+            out[c] = out[c].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
+
+    # Final fallback heuristic: fill anything still missing
+    if "Auth Method (guess)" not in out.columns or out["Auth Method (guess)"].isna().any():
         def _guess_auth_method(x: Any) -> str:
             try:
                 s = str(x)
@@ -397,7 +407,11 @@ def prep_sessions_sheet(
             return "Unknown"
 
         if "ID Tag" in out.columns:
-            out["Auth Method (guess)"] = out["ID Tag"].apply(_guess_auth_method)
+            guessed = out["ID Tag"].apply(_guess_auth_method)
+            if "Auth Method (guess)" not in out.columns:
+                out["Auth Method (guess)"] = guessed
+            else:
+                out["Auth Method (guess)"] = out["Auth Method (guess)"].fillna(guessed)
 
     def _soc_to_fraction(val: Any) -> Any:
         try:
