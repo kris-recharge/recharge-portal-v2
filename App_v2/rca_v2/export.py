@@ -279,9 +279,11 @@ def prep_sessions_sheet(
         try:
             am = authorize_methods_df.copy()
 
-            # Choose the best tag column from authorize_methods (id_tag_effective preferred).
+            # Choose the best tag column from authorize_methods.
+            # Prefer id_tag_effective (true token). If sessions only carries VID tokens,
+            # we can also match against id_tag_vid.
             tag_col = None
-            for c in ["id_tag_effective", "id_tag"]:
+            for c in ["id_tag_effective", "id_tag", "id_tag_vid"]:
                 if c in am.columns:
                     tag_col = c
                     break
@@ -346,16 +348,55 @@ def prep_sessions_sheet(
                         right_on=["station_id", "transaction_id"],
                         suffixes=("", "_am"),
                     )
-                # 2) Fallback merge by ID Tag
-                elif "ID Tag" in out_id.columns and tag_col is not None and tag_col in am.columns:
+                # 2) Enhanced fallback merge by ID Tag, supporting both effective/raw tags and VID mapping
+                elif "ID Tag" in out_id.columns:
                     out_id["ID Tag"] = out_id["ID Tag"].astype(str)
-                    out_id = out_id.merge(
-                        am[[tag_col, "authorization_method", "confidence"]].drop_duplicates(),
-                        how="left",
-                        left_on="ID Tag",
-                        right_on=tag_col,
-                        suffixes=("", "_am"),
-                    )
+
+                    # First try matching against the primary tag_col (id_tag_effective/id_tag/id_tag_vid)
+                    if tag_col is not None and tag_col in am.columns:
+                        out_id = out_id.merge(
+                            am[[tag_col, "authorization_method", "confidence"]].drop_duplicates(),
+                            how="left",
+                            left_on="ID Tag",
+                            right_on=tag_col,
+                            suffixes=("", "_am"),
+                        )
+
+                    # If Sessions carries VID tokens, authorize_methods may store the actual token
+                    # in id_tag_effective and the VID mapping in id_tag_vid. Try id_tag_vid as a
+                    # second pass to fill anything still missing.
+                    if "id_tag_vid" in am.columns:
+                        need_fill = (
+                            "authorization_method" not in out_id.columns
+                            or out_id["authorization_method"].isna().any()
+                        )
+                        if need_fill:
+                            out2 = out_id.merge(
+                                am[["id_tag_vid", "authorization_method", "confidence"]].drop_duplicates(),
+                                how="left",
+                                left_on="ID Tag",
+                                right_on="id_tag_vid",
+                                suffixes=("", "_am2"),
+                            )
+
+                            # Coalesce from the 2nd pass only where missing
+                            if "authorization_method" in out_id.columns and "authorization_method_am2" in out2.columns:
+                                out2["authorization_method"] = out_id["authorization_method"].where(
+                                    out_id["authorization_method"].notna(),
+                                    out2["authorization_method_am2"],
+                                )
+                            elif "authorization_method_am2" in out2.columns and "authorization_method" not in out2.columns:
+                                out2["authorization_method"] = out2["authorization_method_am2"]
+
+                            if "confidence" in out_id.columns and "confidence_am2" in out2.columns:
+                                out2["confidence"] = out_id["confidence"].where(
+                                    out_id["confidence"].notna(),
+                                    out2["confidence_am2"],
+                                )
+                            elif "confidence_am2" in out2.columns and "confidence" not in out2.columns:
+                                out2["confidence"] = out2["confidence_am2"]
+
+                            out_id = out2.drop(columns=[c for c in ["authorization_method_am2", "confidence_am2"] if c in out2.columns], errors="ignore")
 
                 if "authorization_method" in out_id.columns:
                     # Prefer the table's method (passthrough). If the column already exists,
@@ -373,7 +414,7 @@ def prep_sessions_sheet(
                     out_id["Auth Method Confidence"] = out_id["confidence"]
 
                 # Drop extra join columns
-                drop_extra = [c for c in ["station_id_am", "confidence", "authorization_method", tag_col] if c in out_id.columns]
+                drop_extra = [c for c in ["station_id_am", "confidence", "authorization_method", tag_col, "id_tag_vid"] if c in out_id.columns]
                 out = out_id.drop(columns=drop_extra, errors="ignore")
         except Exception:
             pass
