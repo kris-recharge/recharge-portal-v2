@@ -604,186 +604,99 @@ def load_meter_values(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     if not stations:
         return pd.DataFrame()
 
-    # Supabase/Postgres: pull from ocpp_events and parse MeterValues payload JSON
+    # Supabase/Postgres: pull ONLY from public.meter_values_parsed (authoritative)
     if using_postgres():
         placeholders = _make_placeholders(len(stations))
         between = _between_placeholders()
-        # First attempt (preferred): use parsed wide table when available.
-        # This table includes Autel `current_offered_a` and is ideal for charting.
+
+        # Authoritative parsed table: one wide row per meter-value timestamp.
+        # We alias columns to match legacy names used elsewhere in the app.
         sql_parsed = f"""
           SELECT
             station_id,
             connector_id,
-            transaction_id,
+            transaction_id::text AS transaction_id,
             ts AS timestamp,
+            received_at,
             power_w,
+            power_offered_w,
             energy_wh,
             soc,
             current_offered_a,
             current_import_a,
-            voltage_v
+            voltage_v,
+            created_at
           FROM public.meter_values_parsed
           WHERE station_id IN ({placeholders})
             AND ts BETWEEN {between}
           ORDER BY station_id, connector_id, transaction_id, ts
         """
+
         params_parsed = list(stations) + [start_utc, end_utc]
-        conn_parsed = get_conn()
-        try:
-            parsed = pd.read_sql(sql_parsed, conn_parsed, params=params_parsed)
-        except Exception:
-            parsed = pd.DataFrame()
-        finally:
-            conn_parsed.close()
-
-        if parsed is not None and not parsed.empty:
-            parsed["timestamp"] = pd.to_datetime(parsed["timestamp"], utc=True, errors="coerce")
-            for c in ["power_w", "energy_wh", "soc", "current_offered_a", "current_import_a", "voltage_v"]:
-                if c in parsed.columns:
-                    parsed[c] = pd.to_numeric(parsed[c], errors="coerce")
-
-            # Provide the legacy column names the rest of the app expects
-            if "amperage_offered" not in parsed.columns:
-                parsed["amperage_offered"] = parsed.get("current_offered_a")
-            if "amperage_import" not in parsed.columns:
-                parsed["amperage_import"] = parsed.get("current_import_a")
-
-            return parsed
-
-        station_expr = "COALESCE(asset_id, action_payload->'data'->'asset'->>'id')"
-        sql = f"""
-          SELECT {station_expr} AS station_id,
-                 connector_id,
-                 transaction_id,
-                 {_ts_col()} AS timestamp,
-                 action_payload
-          FROM ocpp_events
-          WHERE {station_expr} IN ({placeholders})
-            AND (
-                  action = 'MeterValues'
-                  OR (action IS NULL AND action_payload->'data'->'log'->>'action' = 'MeterValues')
-                )
-            AND {_ts_col()} BETWEEN {between}
-          ORDER BY {station_expr}, connector_id, transaction_id, {_ts_col()}
-        """
-        params = list(stations) + [start_utc, end_utc]
         conn = get_conn()
         try:
-            raw = pd.read_sql(sql, conn, params=params)
+            df = pd.read_sql(sql_parsed, conn, params=params_parsed)
+        except Exception:
+            logger.exception(
+                "load_meter_values failed reading meter_values_parsed (stations=%s window=%s→%s)",
+                stations,
+                start_utc,
+                end_utc,
+            )
+            df = pd.DataFrame()
         finally:
             conn.close()
 
-        if raw is None or raw.empty:
-            # Second attempt: MeterValues are often only present in the raw webhook table.
-            # The webhook wrapper looks like:
-            #   {"data":{"log":{"action":"MeterValues","payload":"{...OCPP...}"},"asset":{"id":"as_..."},"timestamp":"..."},"createdAt":"..."}
-            # We select the full wrapper JSON as action_payload so `_parse_meter_values_rows` can unwrap `data.log.payload`.
-            placeholders_mv = _make_placeholders(len(stations))
-            between_mv = _between_placeholders()
-            mv_station_expr = "(t.payload->'data'->'asset'->>'id')"
-            mv_ts_expr = "COALESCE((t.payload->>'createdAt')::timestamptz, (t.payload->'data'->>'timestamp')::timestamptz, t.received_at)"
-
-            sql_mv = f"""
-              SELECT {mv_station_expr} AS station_id,
-                     NULL::int AS connector_id,
-                     NULL::text AS transaction_id,
-                     {mv_ts_expr} AS timestamp,
-                     t.payload AS action_payload
-              FROM lynkwell_webhook_raw t
-              WHERE (t.payload->'data'->'log'->>'action') = 'MeterValues'
-                AND {mv_station_expr} IN ({placeholders_mv})
-                AND {mv_ts_expr} BETWEEN {between_mv}
-              ORDER BY {mv_station_expr}, {mv_ts_expr}
-            """
-            params_mv = list(stations) + [start_utc, end_utc]
-            conn_mv = get_conn()
-            try:
-                raw_mv = pd.read_sql(sql_mv, conn_mv, params=params_mv)
-            finally:
-                conn_mv.close()
-
-            if raw_mv is not None and not raw_mv.empty:
-                rows_mv = raw_mv.to_dict(orient="records")
-                df_mv = _parse_meter_values_rows(rows_mv)
-                if not df_mv.empty and "action" not in df_mv.columns:
-                    df_mv["action"] = "MeterValues"
-                if not df_mv.empty:
-                    df_mv["timestamp"] = pd.to_datetime(df_mv["timestamp"], utc=True, errors="coerce")
-                    for c in [
-                        "power_w",
-                        "energy_wh",
-                        "soc",
-                        "amperage_offered",
-                        "amperage_import",
-                        "power_offered_w",
-                        "voltage_v",
-                    ]:
-                        if c in df_mv.columns:
-                            df_mv[c] = pd.to_numeric(df_mv[c], errors="coerce")
-                # Return MeterValues from webhook_raw; do NOT fall through to Start/Stop fallback.
-                return df_mv
-
-            # Fallback: some platforms do not emit MeterValues but do emit Start/StopTransaction.
-            # Build a minimal dataframe from those events so sessions can still be produced.
-            placeholders2 = _make_placeholders(len(stations))
-            between2 = _between_placeholders()
-            sql2 = f"""
-              SELECT asset_id AS station_id,
-                     connector_id,
-                     COALESCE(transaction_id::text, action_payload->>'transactionId', action_payload->>'transaction_id') AS transaction_id,
-                     {_ts_col()} AS timestamp,
-                     action,
-                     action_payload
-              FROM ocpp_events
-              WHERE asset_id IN ({placeholders2})
-                AND action IN ('StartTransaction','StopTransaction')
-                AND {_ts_col()} BETWEEN {between2}
-              ORDER BY asset_id, {_ts_col()}
-            """
-            params2 = list(stations) + [start_utc, end_utc]
-            conn2 = get_conn()
-            try:
-                raw2 = pd.read_sql(sql2, conn2, params=params2)
-            finally:
-                conn2.close()
-
-            if raw2 is None or raw2.empty:
-                return pd.DataFrame()
-
-            df2 = _parse_start_stop_rows(raw2.to_dict(orient='records'))
-            if not df2.empty:
-                for c in [
+        if df is None or df.empty:
+            # Return an empty frame with the columns downstream expects
+            return pd.DataFrame(
+                columns=[
+                    "station_id",
+                    "connector_id",
+                    "transaction_id",
+                    "timestamp",
                     "power_w",
                     "energy_wh",
                     "soc",
+                    "voltage_v",
                     "amperage_offered",
                     "amperage_import",
                     "power_offered_w",
-                    "voltage_v",
-                ]:
-                    if c in df2.columns:
-                        df2[c] = pd.to_numeric(df2[c], errors="coerce")
-            return df2
+                    "received_at",
+                    "current_offered_a",
+                    "current_import_a",
+                    "created_at",
+                ]
+            )
 
-        rows = raw.to_dict(orient="records")
-        df = _parse_meter_values_rows(rows)
+        # Normalize dtypes
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        for c in [
+            "power_w",
+            "power_offered_w",
+            "energy_wh",
+            "soc",
+            "current_offered_a",
+            "current_import_a",
+            "voltage_v",
+        ]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
 
-        if not df.empty and "action" not in df.columns:
-            df["action"] = "MeterValues"
+        # Provide legacy column names the rest of the app expects
+        df["amperage_offered"] = df.get("current_offered_a")
+        df["amperage_import"] = df.get("current_import_a")
 
-        if not df.empty:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-            for c in [
-                "power_w",
-                "energy_wh",
-                "soc",
-                "amperage_offered",
-                "amperage_import",
-                "power_offered_w",
-                "voltage_v",
-            ]:
-                if c in df.columns:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
+        # Tolerant SoC normalization:
+        # - Some vendors report fraction (0–1); others report percent (0–100).
+        # - Convert fractions to percent; leave percent as-is.
+        try:
+            max_soc = pd.to_numeric(df["soc"], errors="coerce").max()
+            if pd.notna(max_soc) and max_soc <= 1.5:
+                df["soc"] = df["soc"] * 100.0
+        except Exception:
+            pass
+
         return df
 
     # Legacy/SQLite fallback
