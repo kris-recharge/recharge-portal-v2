@@ -288,9 +288,18 @@ def prep_sessions_sheet(
                     tag_col = c
                     break
 
+            # Column holding the *effective* token (preferred for showing as Authorize (raw))
+            eff_col = None
+            for c in ["id_tag_effective", "id_tag"]:
+                if c in am.columns:
+                    eff_col = c
+                    break
+
             needed = [c for c in ["station_id", "asset_id", "transaction_id", "authorization_method", "confidence", "authorize_received_at"] if c in am.columns]
-            if tag_col is not None:
+            if tag_col is not None and tag_col not in needed:
                 needed.append(tag_col)
+            if eff_col is not None and eff_col in am.columns and eff_col not in needed:
+                needed.append(eff_col)
             # Always keep VID mapping if available (Sessions often carries VID: tokens)
             if "id_tag_vid" in am.columns and "id_tag_vid" not in needed:
                 needed.append("id_tag_vid")
@@ -324,7 +333,7 @@ def prep_sessions_sheet(
                         am2["transaction_id"] = am2["transaction_id"].astype(str)
                     am2["authorize_received_at"] = pd.to_datetime(am2["authorize_received_at"], errors="coerce")
                     am2 = am2.sort_values("authorize_received_at")
-                    cols_keep = [c for c in ["station_id", "transaction_id", tag_col, "id_tag_vid", "authorization_method", "confidence"] if c in am2.columns]
+                    cols_keep = [c for c in ["station_id", "transaction_id", tag_col, eff_col, "id_tag_vid", "authorization_method", "confidence"] if c in am2.columns]
                     am = am2[cols_keep].dropna(subset=["authorization_method"], how="any")
 
                 am = am.drop_duplicates()
@@ -377,8 +386,11 @@ def prep_sessions_sheet(
 
                     # First pass: match against primary tag_col (id_tag_effective/id_tag/id_tag_vid)
                     if tag_col is not None and tag_col in am.columns:
+                        cols = [tag_col, "authorization_method", "confidence"]
+                        if eff_col is not None and eff_col in am.columns and eff_col not in cols:
+                            cols.append(eff_col)
                         out_id = out_id.merge(
-                            am[[tag_col, "authorization_method", "confidence"]].drop_duplicates(),
+                            am[cols].drop_duplicates(),
                             how="left",
                             left_on="ID Tag",
                             right_on=tag_col,
@@ -392,8 +404,11 @@ def prep_sessions_sheet(
                             or out_id["authorization_method"].isna().any()
                         )
                         if need_fill:
+                            cols2 = ["id_tag_vid", "authorization_method", "confidence"]
+                            if eff_col is not None and eff_col in am.columns and eff_col not in cols2:
+                                cols2.append(eff_col)
                             out2 = out_id.merge(
-                                am[["id_tag_vid", "authorization_method", "confidence"]].drop_duplicates(),
+                                am[cols2].drop_duplicates(),
                                 how="left",
                                 left_on="ID Tag",
                                 right_on="id_tag_vid",
@@ -432,12 +447,42 @@ def prep_sessions_sheet(
                             out_id["authorization_method"],
                         )
 
+                # Prefer showing the *effective* token from authorize_methods in Authorize (raw)
+                # (e.g., CC/App token), while keeping Sessions `ID Tag` as-is (often VID:*).
+                if "Authorize (raw)" in out_id.columns and eff_col is not None:
+                    # eff_col may appear from the merges without suffixes (first pass)
+                    # or with suffixes (second pass). Coalesce in priority order.
+                    eff_candidates = []
+                    if eff_col in out_id.columns:
+                        eff_candidates.append(out_id[eff_col])
+                    if f"{eff_col}_am" in out_id.columns:
+                        eff_candidates.append(out_id[f"{eff_col}_am"])
+                    if f"{eff_col}_am2" in out_id.columns:
+                        eff_candidates.append(out_id[f"{eff_col}_am2"])
+
+                    if eff_candidates:
+                        eff_series = eff_candidates[0]
+                        for s in eff_candidates[1:]:
+                            eff_series = eff_series.where(eff_series.notna(), s)
+
+                        # Only overwrite Authorize (raw) when it is missing OR when it is a VID token
+                        # (so exports show the true token when available).
+                        try:
+                            is_vid = out_id["Authorize (raw)"].astype(str).str.startswith("VID:")
+                        except Exception:
+                            is_vid = False
+
+                        out_id["Authorize (raw)"] = out_id["Authorize (raw)"].where(
+                            out_id["Authorize (raw)"].notna() & (~is_vid),
+                            eff_series,
+                        )
+
                 # Keep confidence if present (useful in exports)
                 if "confidence" in out_id.columns and "Auth Method Confidence" not in out_id.columns:
                     out_id["Auth Method Confidence"] = out_id["confidence"]
 
                 # Drop extra join columns
-                drop_extra = [c for c in ["station_id_am", "confidence", "authorization_method", tag_col, "id_tag_vid", "authorize_received_at"] if c in out_id.columns]
+                drop_extra = [c for c in ["station_id_am", "confidence", "authorization_method", tag_col, eff_col, f"{eff_col}_am", f"{eff_col}_am2", "id_tag_vid", "authorize_received_at"] if c in out_id.columns]
                 out = out_id.drop(columns=drop_extra, errors="ignore")
         except Exception:
             pass
