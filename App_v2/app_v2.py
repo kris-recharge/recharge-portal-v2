@@ -283,27 +283,57 @@ def _enrich_status_with_tritium(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 
-# Helper to load data per-EVSE and concatenate, to avoid SQLite IN () quirks.
+# Helper to load data for selected EVSEs, preferring a single bulk call (for Supabase/Postgres),
+# with per-EVSE fallback for SQLite/quirky loaders.
 def _load_per_evse(loader_fn, ids, start_iso, end_iso):
+    """Load data for the selected EVSEs.
+
+    Preferred path (Supabase/Postgres): one bulk call using IN (...).
+    Fallback path (SQLite quirks / legacy signatures): per‑EVSE calls.
     """
-    Helper to load data per‑EVSE and concatenate, to avoid SQLite IN () quirks.
-    """
+    # Normalize ids
     if not ids:
-        # No filter means all EVSEs; let the loader decide by passing None or []
+        ids_list = None  # loader interprets None/[] as "all"
+    elif isinstance(ids, (set, tuple)):
+        ids_list = list(ids)
+    elif isinstance(ids, list):
+        ids_list = ids
+    else:
+        ids_list = [ids]
+
+    # 1) Preferred: single bulk call (fast on Postgres)
+    try:
+        out = loader_fn(ids_list, start_iso, end_iso)
+        if isinstance(out, pd.DataFrame):
+            return out
+    except TypeError:
+        # Some older/local loaders may not accept None
         try:
-            return loader_fn(None, start_iso, end_iso)
-        except TypeError:
-            return loader_fn([], start_iso, end_iso)
-    if isinstance(ids, (set, tuple)):
-        ids = list(ids)
+            out = loader_fn([] if ids_list is None else ids_list, start_iso, end_iso)
+            if isinstance(out, pd.DataFrame):
+                return out
+        except Exception:
+            pass
+    except Exception:
+        # Bulk call failed (often SQLite parameter quirks). Fall back per EVSE.
+        pass
+
+    # 2) Fallback: per‑EVSE load and concat
+    if not ids_list:
+        return pd.DataFrame()
+
     frames = []
-    for sid in ids:
+    for sid in ids_list:
         try:
             df = loader_fn([sid], start_iso, end_iso)
         except TypeError:
             df = loader_fn(sid, start_iso, end_iso)
+        except Exception:
+            df = pd.DataFrame()
+
         if isinstance(df, pd.DataFrame) and not df.empty:
             frames.append(df)
+
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
