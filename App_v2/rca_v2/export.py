@@ -273,22 +273,104 @@ def prep_sessions_sheet(
         out["Auth Method (guess)"] = out["authorization_method"].astype(str)
 
     # Otherwise, try to look it up from an authorize_methods dataframe if provided.
-    if "Auth Method (guess)" not in out.columns and authorize_methods_df is not None and not authorize_methods_df.empty:
+    # Prefer matching by (station_id, transaction_id) when possible (most reliable),
+    # otherwise fall back to matching by ID Tag.
+    if (
+        "Auth Method (guess)" not in out.columns
+        and authorize_methods_df is not None
+        and not authorize_methods_df.empty
+    ):
         try:
             am = authorize_methods_df.copy()
-            # expected columns: id_tag, authorization_method
-            if "id_tag" in am.columns and "authorization_method" in am.columns:
-                am = am[["id_tag", "authorization_method"]].dropna().drop_duplicates()
-                am["id_tag"] = am["id_tag"].astype(str)
+
+            # Choose the best tag column from authorize_methods (id_tag_effective preferred).
+            tag_col = None
+            for c in ["id_tag_effective", "id_tag"]:
+                if c in am.columns:
+                    tag_col = c
+                    break
+
+            needed = [c for c in ["station_id", "asset_id", "transaction_id", "authorization_method", "confidence"] if c in am.columns]
+            if tag_col is not None:
+                needed.append(tag_col)
+
+            if "authorization_method" in am.columns and needed:
+                am = am[needed].dropna(subset=["authorization_method"], how="any")
+
+                # Normalize station id column name to station_id
+                if "station_id" not in am.columns and "asset_id" in am.columns:
+                    am = am.rename(columns={"asset_id": "station_id"})
+
+                # Normalize types
+                if "station_id" in am.columns:
+                    am["station_id"] = am["station_id"].astype(str)
+                if "transaction_id" in am.columns:
+                    am["transaction_id"] = am["transaction_id"].astype(str)
+                if tag_col is not None:
+                    am[tag_col] = am[tag_col].astype(str)
+
+                # De-dupe: keep the most recent classification per key
+                # (authorize_received_at may exist; if so, use it to sort)
+                if "authorize_received_at" in authorize_methods_df.columns:
+                    am2 = authorize_methods_df.copy()
+                    if "asset_id" in am2.columns and "station_id" not in am2.columns:
+                        am2 = am2.rename(columns={"asset_id": "station_id"})
+                    if tag_col and tag_col in am2.columns:
+                        am2[tag_col] = am2[tag_col].astype(str)
+                    if "station_id" in am2.columns:
+                        am2["station_id"] = am2["station_id"].astype(str)
+                    if "transaction_id" in am2.columns:
+                        am2["transaction_id"] = am2["transaction_id"].astype(str)
+                    am2["authorize_received_at"] = pd.to_datetime(am2["authorize_received_at"], errors="coerce")
+                    am2 = am2.sort_values("authorize_received_at")
+                    cols_keep = [c for c in ["station_id", "transaction_id", tag_col, "authorization_method", "confidence"] if c in am2.columns]
+                    am = am2[cols_keep].dropna(subset=["authorization_method"], how="any")
+
+                am = am.drop_duplicates()
+
                 out_id = out.copy()
-                # Prefer ID Tag for join if present; else try id_tag
-                join_col = "ID Tag" if "ID Tag" in out_id.columns else ("id_tag" if "id_tag" in out_id.columns else None)
-                if join_col:
-                    out_id[join_col] = out_id[join_col].astype(str)
-                    out_id = out_id.merge(am, how="left", left_on=join_col, right_on="id_tag")
-                    if "authorization_method" in out_id.columns:
-                        out_id["Auth Method (guess)"] = out_id["authorization_method"].astype(str)
-                        out = out_id.drop(columns=[c for c in ["id_tag"] if c in out_id.columns], errors="ignore")
+
+                # Determine station id column present in sessions df
+                sess_station_col = station_col if station_col in out_id.columns else (
+                    "station_id" if "station_id" in out_id.columns else ("asset_id" if "asset_id" in out_id.columns else None)
+                )
+
+                # Normalize types in sessions df
+                if sess_station_col:
+                    out_id[sess_station_col] = out_id[sess_station_col].astype(str)
+                if "transaction_id" in out_id.columns:
+                    out_id["transaction_id"] = out_id["transaction_id"].astype(str)
+
+                # 1) Preferred merge by (station_id, transaction_id)
+                if sess_station_col and "transaction_id" in out_id.columns and "station_id" in am.columns and "transaction_id" in am.columns:
+                    out_id = out_id.merge(
+                        am,
+                        how="left",
+                        left_on=[sess_station_col, "transaction_id"],
+                        right_on=["station_id", "transaction_id"],
+                        suffixes=("", "_am"),
+                    )
+                # 2) Fallback merge by ID Tag
+                elif "ID Tag" in out_id.columns and tag_col is not None and tag_col in am.columns:
+                    out_id["ID Tag"] = out_id["ID Tag"].astype(str)
+                    out_id = out_id.merge(
+                        am[[tag_col, "authorization_method", "confidence"]].drop_duplicates(),
+                        how="left",
+                        left_on="ID Tag",
+                        right_on=tag_col,
+                        suffixes=("", "_am"),
+                    )
+
+                if "authorization_method" in out_id.columns:
+                    out_id["Auth Method (guess)"] = out_id["authorization_method"].astype(str)
+
+                # Keep confidence if present (useful in exports)
+                if "confidence" in out_id.columns and "Auth Method Confidence" not in out_id.columns:
+                    out_id["Auth Method Confidence"] = out_id["confidence"].astype(str)
+
+                # Drop extra join columns
+                drop_extra = [c for c in ["station_id_am", "confidence", "authorization_method", tag_col] if c in out_id.columns]
+                out = out_id.drop(columns=drop_extra, errors="ignore")
         except Exception:
             pass
 
@@ -303,10 +385,15 @@ def prep_sessions_sheet(
                 return "Unknown"
             if s.startswith("VID:"):
                 return "AutoCharge"
-            # common RFID hex tokens
+            # 14-char hex tokens match CC reader in LynkWell-confirmed data
+            if re.fullmatch(r"[0-9A-Fa-f]{14}", s):
+                return "CC"
+            # 20-char opaque A–Z0–9 tokens match App authorization
+            if re.fullmatch(r"[A-Z0-9]{20}", s):
+                return "App"
+            # other common RFID-like hex tokens
             if re.fullmatch(r"[0-9A-Fa-f]{8,32}", s):
                 return "RFID"
-            # opaque tokens could be app / cc / unknown; default Unknown
             return "Unknown"
 
         if "ID Tag" in out.columns:
@@ -377,6 +464,7 @@ def prep_sessions_sheet(
         "ID Tag",
         "Authorize (raw)",
         "Auth Method (guess)",
+        "Auth Method Confidence",
         "Estimated Revenue ($)",
         "transaction_id",
         "connector_id",
