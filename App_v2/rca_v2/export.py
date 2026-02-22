@@ -288,9 +288,12 @@ def prep_sessions_sheet(
                     tag_col = c
                     break
 
-            needed = [c for c in ["station_id", "asset_id", "transaction_id", "authorization_method", "confidence"] if c in am.columns]
+            needed = [c for c in ["station_id", "asset_id", "transaction_id", "authorization_method", "confidence", "authorize_received_at"] if c in am.columns]
             if tag_col is not None:
                 needed.append(tag_col)
+            # Always keep VID mapping if available (Sessions often carries VID: tokens)
+            if "id_tag_vid" in am.columns and "id_tag_vid" not in needed:
+                needed.append("id_tag_vid")
 
             if "authorization_method" in am.columns and needed:
                 am = am[needed].dropna(subset=["authorization_method"], how="any")
@@ -321,7 +324,7 @@ def prep_sessions_sheet(
                         am2["transaction_id"] = am2["transaction_id"].astype(str)
                     am2["authorize_received_at"] = pd.to_datetime(am2["authorize_received_at"], errors="coerce")
                     am2 = am2.sort_values("authorize_received_at")
-                    cols_keep = [c for c in ["station_id", "transaction_id", tag_col, "authorization_method", "confidence"] if c in am2.columns]
+                    cols_keep = [c for c in ["station_id", "transaction_id", tag_col, "id_tag_vid", "authorization_method", "confidence"] if c in am2.columns]
                     am = am2[cols_keep].dropna(subset=["authorization_method"], how="any")
 
                 am = am.drop_duplicates()
@@ -339,8 +342,27 @@ def prep_sessions_sheet(
                 if "transaction_id" in out_id.columns:
                     out_id["transaction_id"] = out_id["transaction_id"].astype(str)
 
-                # 1) Preferred merge by (station_id, transaction_id)
-                if sess_station_col and "transaction_id" in out_id.columns and "station_id" in am.columns and "transaction_id" in am.columns:
+                # Decide whether a transaction_id join is actually possible.
+                # In Supabase, authorize_methods.transaction_id may be NULL; in that case
+                # joining by (station_id, transaction_id) will never match and we must
+                # fall back to joining by tag/VID.
+                txn_join_ok = (
+                    sess_station_col
+                    and "transaction_id" in out_id.columns
+                    and "station_id" in am.columns
+                    and "transaction_id" in am.columns
+                )
+                if txn_join_ok:
+                    try:
+                        sess_tx = pd.to_numeric(out_id["transaction_id"], errors="coerce")
+                        am_tx = pd.to_numeric(am["transaction_id"], errors="coerce")
+                        if sess_tx.isna().all() or am_tx.isna().all():
+                            txn_join_ok = False
+                    except Exception:
+                        pass
+
+                # 1) Preferred merge by (station_id, transaction_id) ONLY if txn ids exist
+                if txn_join_ok:
                     out_id = out_id.merge(
                         am,
                         how="left",
@@ -348,11 +370,12 @@ def prep_sessions_sheet(
                         right_on=["station_id", "transaction_id"],
                         suffixes=("", "_am"),
                     )
-                # 2) Enhanced fallback merge by ID Tag, supporting both effective/raw tags and VID mapping
-                elif "ID Tag" in out_id.columns:
+
+                # 2) Fallback merge by ID Tag / VID mapping
+                if "ID Tag" in out_id.columns:
                     out_id["ID Tag"] = out_id["ID Tag"].astype(str)
 
-                    # First try matching against the primary tag_col (id_tag_effective/id_tag/id_tag_vid)
+                    # First pass: match against primary tag_col (id_tag_effective/id_tag/id_tag_vid)
                     if tag_col is not None and tag_col in am.columns:
                         out_id = out_id.merge(
                             am[[tag_col, "authorization_method", "confidence"]].drop_duplicates(),
@@ -362,9 +385,7 @@ def prep_sessions_sheet(
                             suffixes=("", "_am"),
                         )
 
-                    # If Sessions carries VID tokens, authorize_methods may store the actual token
-                    # in id_tag_effective and the VID mapping in id_tag_vid. Try id_tag_vid as a
-                    # second pass to fill anything still missing.
+                    # Second pass: if still missing, try id_tag_vid specifically
                     if "id_tag_vid" in am.columns:
                         need_fill = (
                             "authorization_method" not in out_id.columns
@@ -379,7 +400,6 @@ def prep_sessions_sheet(
                                 suffixes=("", "_am2"),
                             )
 
-                            # Coalesce from the 2nd pass only where missing
                             if "authorization_method" in out_id.columns and "authorization_method_am2" in out2.columns:
                                 out2["authorization_method"] = out_id["authorization_method"].where(
                                     out_id["authorization_method"].notna(),
@@ -396,7 +416,10 @@ def prep_sessions_sheet(
                             elif "confidence_am2" in out2.columns and "confidence" not in out2.columns:
                                 out2["confidence"] = out2["confidence_am2"]
 
-                            out_id = out2.drop(columns=[c for c in ["authorization_method_am2", "confidence_am2"] if c in out2.columns], errors="ignore")
+                            out_id = out2.drop(
+                                columns=[c for c in ["authorization_method_am2", "confidence_am2"] if c in out2.columns],
+                                errors="ignore",
+                            )
 
                 if "authorization_method" in out_id.columns:
                     # Prefer the table's method (passthrough). If the column already exists,
@@ -414,7 +437,7 @@ def prep_sessions_sheet(
                     out_id["Auth Method Confidence"] = out_id["confidence"]
 
                 # Drop extra join columns
-                drop_extra = [c for c in ["station_id_am", "confidence", "authorization_method", tag_col, "id_tag_vid"] if c in out_id.columns]
+                drop_extra = [c for c in ["station_id_am", "confidence", "authorization_method", tag_col, "id_tag_vid", "authorize_received_at"] if c in out_id.columns]
                 out = out_id.drop(columns=drop_extra, errors="ignore")
         except Exception:
             pass
