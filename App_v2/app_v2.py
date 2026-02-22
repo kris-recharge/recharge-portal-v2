@@ -35,6 +35,7 @@ from rca_v2.charts import (
 )
 from rca_v2.constants import get_evse_display, connector_type_for
 from rca_v2.export import build_export_xlsx_bytes
+from rca_v2.db import using_postgres, get_conn
 
 
 
@@ -375,6 +376,61 @@ def _excel_safe_datetimes(df: pd.DataFrame, local_tz: str = "America/Anchorage")
                     pass
 
     return out
+
+
+def _load_authorize_methods_for_export(stations, start_iso: str, end_iso: str) -> pd.DataFrame:
+    """Load authorization_method mappings for the export window.
+
+    Used ONLY for Excel export enrichment (not shown in the UI yet).
+    Reads from public.authorize_methods on Supabase/Postgres.
+    """
+    if not using_postgres():
+        return pd.DataFrame()
+
+    # Normalize station list
+    if not stations:
+        station_list = list(EVSE_DISPLAY.keys())
+    elif isinstance(stations, (set, tuple)):
+        station_list = list(stations)
+    elif isinstance(stations, list):
+        station_list = stations
+    else:
+        station_list = [stations]
+
+    station_list = [str(s) for s in station_list if str(s).strip()]
+    if not station_list:
+        return pd.DataFrame()
+
+    placeholders = ",".join(["%s"] * len(station_list))
+
+    sql = f"""
+      SELECT
+        asset_id AS station_id,
+        connector_id,
+        transaction_id::text AS transaction_id,
+        authorize_received_at,
+        id_tag,
+        authorization_method,
+        confidence
+      FROM public.authorize_methods
+      WHERE asset_id IN ({placeholders})
+        AND authorize_received_at BETWEEN %s AND %s
+      ORDER BY authorize_received_at
+    """
+
+    params = list(station_list) + [start_iso, end_iso]
+
+    conn = get_conn()
+    try:
+        df = pd.read_sql(sql, conn, params=params)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 
@@ -1077,12 +1133,20 @@ with t4:
         status_export = _load_per_evse(load_status_history, export_stations, export_start_iso, export_end_iso)
         conn_export = _load_per_evse(load_connectivity, export_stations, export_start_iso, export_end_iso)
 
+        authorize_methods_export = _load_authorize_methods_for_export(
+            export_stations,
+            export_start_iso,
+            export_end_iso,
+        )
+        authorize_methods_export = _excel_safe_datetimes(authorize_methods_export)
+
         # Make them Excel-safe too.
         status_export = _excel_safe_datetimes(status_export)
         conn_export = _excel_safe_datetimes(conn_export)
     except Exception:
         status_export = pd.DataFrame()
         conn_export = pd.DataFrame()
+        authorize_methods_export = pd.DataFrame()
 
     if sess_last.empty and mv_last.empty:
         st.info("No data available to export from this view. Visit the Charging Sessions tab first.")
@@ -1094,6 +1158,7 @@ with t4:
             meter_values_df=mv_last,
             status_df=status_export,
             connectivity_df=conn_export,
+            authorize_methods_df=authorize_methods_export,
             start_utc=export_start_utc_naive,
             end_utc=export_end_utc_naive,
             evse_display=EVSE_DISPLAY,

@@ -34,6 +34,8 @@ from datetime import datetime
 from io import BytesIO
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+import re
+
 import pandas as pd
 
 try:
@@ -62,6 +64,7 @@ def build_export_xlsx_bytes(
     start_utc: datetime | None = None,
     end_utc: datetime | None = None,
     filename_prefix: str = "recharge_export",
+    authorize_methods_df: pd.DataFrame | None = None,
     **kwargs: Any,
 ) -> bytes:
     """Build an .xlsx export (bytes).
@@ -100,7 +103,12 @@ def build_export_xlsx_bytes(
 
     # --- Sessions ---
     if sessions_df is not None and not sessions_df.empty:
-        sessions_sheet = prep_sessions_sheet(sessions_df, evse_display, tz_name=tz_name)
+        sessions_sheet = prep_sessions_sheet(
+            sessions_df,
+            evse_display,
+            tz_name=tz_name,
+            authorize_methods_df=authorize_methods_df,
+        )
         sheets["Sessions"] = sessions_sheet
     else:
         sheets["Sessions"] = pd.DataFrame()
@@ -152,6 +160,7 @@ def build_export_xlsx(
     start_utc: datetime | None = None,
     end_utc: datetime | None = None,
     filename_prefix: str = "recharge_export",
+    authorize_methods_df: pd.DataFrame | None = None,
     **kwargs: Any,
 ) -> bytes:
     return build_export_xlsx_bytes(
@@ -166,6 +175,7 @@ def build_export_xlsx(
         start_utc=start_utc,
         end_utc=end_utc,
         filename_prefix=filename_prefix,
+        authorize_methods_df=authorize_methods_df,
         **kwargs,
     )
 
@@ -175,7 +185,13 @@ def build_export_xlsx(
 # ----------------------------
 
 
-def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name: str) -> pd.DataFrame:
+def prep_sessions_sheet(
+    df: pd.DataFrame,
+    evse_display: Dict[str, str],
+    *,
+    tz_name: str,
+    authorize_methods_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """Prepare Sessions sheet.
 
     Requirements from Kris:
@@ -242,6 +258,60 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
         rename_map["id_tag"] = "ID Tag"
 
     out = out.rename(columns=rename_map)
+
+    # --- Authorization columns (raw + guessed method) ---
+    # Kris wants both:
+    #  - the raw authorize string (ID Tag)
+    #  - a best-guess method/category (RFID / CC / AutoCharge / App / Unknown)
+
+    # Ensure a stable raw authorize column.
+    if "ID Tag" in out.columns and "Authorize (raw)" not in out.columns:
+        out["Authorize (raw)"] = out["ID Tag"].astype(str)
+
+    # If the upstream already provided a method, normalize its label.
+    if "authorization_method" in out.columns and "Auth Method (guess)" not in out.columns:
+        out["Auth Method (guess)"] = out["authorization_method"].astype(str)
+
+    # Otherwise, try to look it up from an authorize_methods dataframe if provided.
+    if "Auth Method (guess)" not in out.columns and authorize_methods_df is not None and not authorize_methods_df.empty:
+        try:
+            am = authorize_methods_df.copy()
+            # expected columns: id_tag, authorization_method
+            if "id_tag" in am.columns and "authorization_method" in am.columns:
+                am = am[["id_tag", "authorization_method"]].dropna().drop_duplicates()
+                am["id_tag"] = am["id_tag"].astype(str)
+                out_id = out.copy()
+                # Prefer ID Tag for join if present; else try id_tag
+                join_col = "ID Tag" if "ID Tag" in out_id.columns else ("id_tag" if "id_tag" in out_id.columns else None)
+                if join_col:
+                    out_id[join_col] = out_id[join_col].astype(str)
+                    out_id = out_id.merge(am, how="left", left_on=join_col, right_on="id_tag")
+                    if "authorization_method" in out_id.columns:
+                        out_id["Auth Method (guess)"] = out_id["authorization_method"].astype(str)
+                        out = out_id.drop(columns=[c for c in ["id_tag"] if c in out_id.columns], errors="ignore")
+        except Exception:
+            pass
+
+    # Final fallback heuristic if we still don't have a guess
+    if "Auth Method (guess)" not in out.columns:
+        def _guess_auth_method(x: Any) -> str:
+            try:
+                s = str(x)
+            except Exception:
+                return "Unknown"
+            if not s or s.lower() == "nan":
+                return "Unknown"
+            if s.startswith("VID:"):
+                return "AutoCharge"
+            # common RFID hex tokens
+            if re.fullmatch(r"[0-9A-Fa-f]{8,32}", s):
+                return "RFID"
+            # opaque tokens could be app / cc / unknown; default Unknown
+            return "Unknown"
+
+        if "ID Tag" in out.columns:
+            out["Auth Method (guess)"] = out["ID Tag"].apply(_guess_auth_method)
+
     def _soc_to_fraction(val: Any) -> Any:
         try:
             x = float(val)
@@ -305,6 +375,9 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
         "SoC Start",
         "SoC End",
         "ID Tag",
+        "Authorize (raw)",
+        "Auth Method (guess)",
+        "Estimated Revenue ($)",
         "transaction_id",
         "connector_id",
         # Add the new flag at the end of preferred columns
@@ -328,21 +401,13 @@ def prep_sessions_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_na
 
     out = _order_cols(out, preferred)
 
-    # If connector_id exists, place it immediately after transaction_id (Column L goal).
+    # If connector_id exists, place it immediately after transaction_id if both exist.
     cols = list(out.columns)
     if "connector_id" in cols:
-        # Move connector_id right after transaction_id if both exist.
         if "transaction_id" in cols:
             cols.remove("connector_id")
             cols.insert(cols.index("transaction_id") + 1, "connector_id")
             out = out[cols]
-
-    # Put EVSE early if present (already handled by preferred order, but keep for compatibility)
-    # cols = list(out.columns)
-    # if "EVSE" in cols:
-    #     cols = [c for c in cols if c != "EVSE"]
-    #     cols.insert(2, "EVSE")
-    #     out = out[cols]
 
     return out
 
