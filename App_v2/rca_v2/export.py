@@ -99,6 +99,33 @@ def build_export_xlsx_bytes(
     kwargs.pop("stations", None)
     kwargs.pop("connectivity_df", None)
 
+    # ----------------------------
+    # Backwards-compatible aliases for authorize methods
+    # ----------------------------
+    # Older call-sites may pass the authorize table under slightly different names.
+    # Make this a *passthrough* so updates in Supabase flow into exports without
+    # having to patch app_v2.py each time.
+    if authorize_methods_df is None:
+        for k in [
+            "authorize_methods",
+            "authorize_df",
+            "authorize_methods",
+            "auth_methods_df",
+            "authorization_df",
+        ]:
+            if k in kwargs and isinstance(kwargs.get(k), pd.DataFrame):
+                authorize_methods_df = kwargs.get(k)
+                break
+
+    # Don't forward these legacy keys further.
+    for k in [
+        "authorize_methods",
+        "authorize_df",
+        "auth_methods_df",
+        "authorization_df",
+    ]:
+        kwargs.pop(k, None)
+
     sheets: Dict[str, pd.DataFrame] = {}
 
     # --- Sessions ---
@@ -437,13 +464,14 @@ def prep_sessions_sheet(
                             )
 
                 if "authorization_method" in out_id.columns:
-                    # Prefer the table's method (passthrough). If the column already exists,
-                    # only fill missing values from the table (don't overwrite real values).
+                    # Prefer the table's method (passthrough).
                     if "Auth Method (guess)" not in out_id.columns:
                         out_id["Auth Method (guess)"] = out_id["authorization_method"]
                     else:
-                        out_id["Auth Method (guess)"] = out_id["Auth Method (guess)"].where(
-                            out_id["Auth Method (guess)"].notna(),
+                        # Treat placeholder strings like 'nan' as missing.
+                        existing = out_id["Auth Method (guess)"].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
+                        out_id["Auth Method (guess)"] = existing.where(
+                            existing.notna(),
                             out_id["authorization_method"],
                         )
 
@@ -493,8 +521,14 @@ def prep_sessions_sheet(
         if c in out.columns:
             out[c] = out[c].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
 
-    # Final fallback heuristic: fill anything still missing
-    if "Auth Method (guess)" not in out.columns or out["Auth Method (guess)"].isna().any():
+    # Final fallback heuristic: fill anything still missing.
+    # IMPORTANT: If authorize_methods_df was provided and produced values,
+    # we do NOT overwrite those with heuristics.
+    if (
+        "Auth Method (guess)" not in out.columns
+        or out["Auth Method (guess)"].isna().any()
+        or (out["Auth Method (guess)"].astype(str).str.lower() == "nan").any()
+    ):
         def _guess_auth_method(x: Any) -> str:
             try:
                 s = str(x)
