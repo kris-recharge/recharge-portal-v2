@@ -971,7 +971,19 @@ with t2:
         ]
         final = [c for c in wanted if c in display.columns]
         display = display.sort_values("_ts", ascending=False, kind="mergesort")
-        st.dataframe(display[final], use_container_width=True, hide_index=True)
+        column_config = {}
+        for col in final:
+            if col == "description":
+                column_config[col] = st.column_config.TextColumn(col, width="large")
+            else:
+                column_config[col] = st.column_config.TextColumn(col, width="small")
+
+        st.dataframe(
+            display[final],
+            use_container_width=True,
+            hide_index=True,
+            column_config=column_config,
+        )
 
 with t3:
     st.subheader("Connectivity")
