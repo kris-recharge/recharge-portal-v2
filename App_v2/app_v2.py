@@ -89,7 +89,7 @@ is_portal_context = bool(portal_email or portal_logout_url or _portal_allowed_ra
 # IMPORTANT: when we're in portal context and allowlist is missing/empty -> deny-by-default.
 allowed_ids = None
 try:
-    allowed_ids = filter_allowed_evse_ids(portal, _portal_allowed_raw)
+    allowed_ids = filter_allowed_evse_ids(EVSE_DISPLAY.keys(), _portal_allowed_raw)
 except Exception:
     # If auth filtering blows up for any reason:
     # - portal context => deny by default
