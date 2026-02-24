@@ -33,7 +33,7 @@ from rca_v2.charts import (
     heatmap_duration,
     daily_session_counts_and_energy_figures,
 )
-from rca_v2.constants import get_evse_display, connector_type_for
+from rca_v2.constants import get_evse_display, connector_type_for, get_platform_map
 from rca_v2.export import build_export_xlsx_bytes
 from rca_v2.db import using_postgres, get_conn
 
@@ -990,22 +990,23 @@ with t3:
     stations_key = _make_station_key(stations)
     conn_df = cached_connectivity(stations_key, start_utc, end_utc)
     if conn_df.empty:
-        st.info("No websocket CONNECT/DISCONNECT events in this window.")
+        st.info("No connectivity events in this window.")
     else:
         df = conn_df.copy()
 
         # Timestamp (AK local) for sorting and duration math
-        if "AKDT_dt" in df.columns:
-            ts_ak = pd.to_datetime(df["AKDT_dt"], errors="coerce")
-        elif "AKDT" in df.columns:
-            ts_ak = pd.to_datetime(df["AKDT"], errors="coerce")
-        else:
-            # Fallback: if only UTC exists, convert to AK
-            ts_utc = pd.to_datetime(df.get("timestamp"), errors="coerce", utc=True)
+        if "timestamp" in df.columns:
+            ts_utc = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
             try:
                 ts_ak = ts_utc.dt.tz_convert("America/Anchorage")
             except Exception:
                 ts_ak = ts_utc
+        elif "AKDT_dt" in df.columns:
+            ts_ak = pd.to_datetime(df["AKDT_dt"], errors="coerce")
+        elif "AKDT" in df.columns:
+            ts_ak = pd.to_datetime(df["AKDT"], errors="coerce")
+        else:
+            ts_ak = pd.to_datetime(df.get("timestamp"), errors="coerce", utc=True)
         df["_ts"] = ts_ak
 
         # Friendly EVSE names
@@ -1014,45 +1015,101 @@ with t3:
         else:
             df["EVSE"] = df.get("Location")
 
-        # Normalize event label to a single column
-        if "Connectivity" in df.columns:
-            df["Connectivity"] = df["Connectivity"].astype(str)
-        elif "event" in df.columns:
-            df["Connectivity"] = df["event"].astype(str)
+        # If we have OCPP events, compute outage durations (BootNotification vs Heartbeat/MeterValues)
+        if "event" in df.columns and df["event"].astype(str).str.upper().str.contains("BOOTNOTIFICATION|HEARTBEAT|METERVALUES").any():
+            platform_map = get_platform_map()
+            df["platform"] = df.get("station_id").map(platform_map).fillna("")
+            df["event_norm"] = df["event"].astype(str).str.strip().str.upper()
+
+            # Sort ASC within station for duration calc
+            sort_cols = ["station_id", "_ts"] if "station_id" in df.columns else ["EVSE", "_ts"]
+            df = df.sort_values(sort_cols, kind="mergesort")
+
+            rows = []
+            for sid, g in df.groupby("station_id", sort=False):
+                platform = (g["platform"].iloc[0] if "platform" in g.columns else "") or ""
+                heartbeat_types = {"METERVALUES"} if platform == "RTM" else {"HEARTBEAT"}
+
+                last_hb_ts = None
+                last_hb_type = ""
+                for _, r in g.iterrows():
+                    ev = r.get("event_norm") or ""
+                    if ev in heartbeat_types:
+                        last_hb_ts = r["_ts"]
+                        last_hb_type = ev
+                        continue
+                    if ev == "BOOTNOTIFICATION":
+                        duration_min = None
+                        if last_hb_ts is not None and pd.notna(last_hb_ts):
+                            duration_min = (r["_ts"] - last_hb_ts).total_seconds() / 60.0
+                        rows.append(
+                            {
+                                "Date/Time (AK Local)": r["_ts"].strftime("%Y-%m-%d %H:%M:%S") if pd.notna(r["_ts"]) else "",
+                                "EVSE": r.get("EVSE"),
+                                "Outage Duration (min)": round(duration_min, 2) if duration_min is not None else np.nan,
+                                "Last Heartbeat (AK Local)": last_hb_ts.strftime("%Y-%m-%d %H:%M:%S") if last_hb_ts is not None and pd.notna(last_hb_ts) else "",
+                                "Heartbeat Source": last_hb_type.title() if last_hb_type else ("MeterValues" if platform == "RTM" else "Heartbeat"),
+                            }
+                        )
+
+            if not rows:
+                st.info("No BootNotification events in this window for the selected EVSE.")
+            else:
+                outages = pd.DataFrame(rows)
+                st.dataframe(outages, use_container_width=True, hide_index=True)
+
+                # Outage frequency summary
+                freq = outages.groupby("EVSE", dropna=False)["Outage Duration (min)"].agg(
+                    Outage_Count="count",
+                    Avg_Duration_Min="mean",
+                    Max_Duration_Min="max",
+                ).reset_index()
+                freq["Avg_Duration_Min"] = freq["Avg_Duration_Min"].round(2)
+                freq["Max_Duration_Min"] = freq["Max_Duration_Min"].round(2)
+
+                st.subheader("Outage Frequency")
+                st.dataframe(freq, use_container_width=True, hide_index=True)
+
         else:
-            df["Connectivity"] = ""
+            # Legacy websocket CONNECT/DISCONNECT view
+            if "Connectivity" in df.columns:
+                df["Connectivity"] = df["Connectivity"].astype(str)
+            elif "event" in df.columns:
+                df["Connectivity"] = df["event"].astype(str)
+            else:
+                df["Connectivity"] = ""
 
-        # Sort ASC within station for duration calc
-        sort_cols = ["station_id", "_ts"] if "station_id" in df.columns else ["EVSE", "_ts"]
-        df = df.sort_values(sort_cols, kind="mergesort")
+            # Sort ASC within station for duration calc
+            sort_cols = ["station_id", "_ts"] if "station_id" in df.columns else ["EVSE", "_ts"]
+            df = df.sort_values(sort_cols, kind="mergesort")
 
-        # Duration (min) between previous DISCONNECT and this CONNECT per station
-        evt = df["Connectivity"].str.upper()
-        prev_evt = evt.shift(1)
-        prev_ts = df["_ts"].shift(1)
-        same_station = (
-            df["station_id"].eq(df["station_id"].shift(1))
-            if "station_id" in df.columns else
-            df["EVSE"].eq(df["EVSE"].shift(1))
-        )
+            # Duration (min) between previous DISCONNECT and this CONNECT per station
+            evt = df["Connectivity"].str.upper()
+            prev_evt = evt.shift(1)
+            prev_ts = df["_ts"].shift(1)
+            same_station = (
+                df["station_id"].eq(df["station_id"].shift(1))
+                if "station_id" in df.columns else
+                df["EVSE"].eq(df["EVSE"].shift(1))
+            )
 
-        mask = same_station & evt.str.contains("CONNECT") & prev_evt.str.contains("DISCONNECT")
-        df["Duration (min)"] = np.where(
-            mask,
-            (df["_ts"] - prev_ts).dt.total_seconds() / 60.0,
-            np.nan,
-        )
+            mask = same_station & evt.str.contains("CONNECT") & prev_evt.str.contains("DISCONNECT")
+            df["Duration (min)"] = np.where(
+                mask,
+                (df["_ts"] - prev_ts).dt.total_seconds() / 60.0,
+                np.nan,
+            )
 
-        # Build display (newest first)
-        display = pd.DataFrame({
-            "Date/Time (AK Local)": df["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "EVSE": df["EVSE"],
-            "Connectivity": df["Connectivity"],
-            "Duration (min)": pd.to_numeric(df["Duration (min)"], errors="coerce").round(2),
-        })
-        display = display.assign(__ts=df["_ts"]).sort_values("__ts", ascending=False, kind="mergesort").drop(columns="__ts")
+            # Build display (newest first)
+            display = pd.DataFrame({
+                "Date/Time (AK Local)": df["_ts"].dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "EVSE": df["EVSE"],
+                "Connectivity": df["Connectivity"],
+                "Duration (min)": pd.to_numeric(df["Duration (min)"], errors="coerce").round(2),
+            })
+            display = display.assign(__ts=df["_ts"]).sort_values("__ts", ascending=False, kind="mergesort").drop(columns="__ts")
 
-        st.dataframe(display, use_container_width=True, hide_index=True)
+            st.dataframe(display, use_container_width=True, hide_index=True)
 
 with t4:
     st.subheader("Data Export")

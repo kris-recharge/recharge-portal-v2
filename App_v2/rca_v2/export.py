@@ -38,6 +38,8 @@ import re
 
 import pandas as pd
 
+from .constants import get_platform_map
+
 try:
     # Python 3.9+
     from zoneinfo import ZoneInfo
@@ -760,6 +762,55 @@ def prep_connectivity_data_sheet(df: pd.DataFrame, evse_display: Dict[str, str],
 
     # Standardize event names
     src[ev_col] = src[ev_col].astype(str).str.upper()
+
+    # OCPP-based connectivity (BootNotification vs Heartbeat/MeterValues)
+    if src[ev_col].str.contains("BOOTNOTIFICATION|HEARTBEAT|METERVALUES").any():
+        platform_map = get_platform_map()
+        rows = []
+        for sid, g in src.groupby(station_col, sort=False):
+            g = g.sort_values(ts_col)
+            platform = platform_map.get(str(sid), "")
+            heartbeat_types = {"METERVALUES"} if platform == "RTM" else {"HEARTBEAT"}
+
+            last_hb_ts = None
+            last_hb_type = ""
+            for _, r in g.iterrows():
+                ev = r[ev_col]
+                t = r[ts_col]
+                if pd.isna(t):
+                    continue
+                if ev in heartbeat_types:
+                    last_hb_ts = t
+                    last_hb_type = ev
+                    continue
+                if ev == "BOOTNOTIFICATION":
+                    duration = (t - last_hb_ts).total_seconds() / 60.0 if last_hb_ts is not None else None
+                    rows.append(
+                        {
+                            "station_id": sid,
+                            "EVSE": evse_display.get(str(sid), str(sid)),
+                            "Start (UTC)": last_hb_ts,
+                            "End (UTC)": t,
+                            "Duration (min)": duration,
+                            "Type": "BOOTNOTIFICATION",
+                            "Heartbeat Source": last_hb_type.title() if last_hb_type else ("MeterValues" if platform == "RTM" else "Heartbeat"),
+                        }
+                    )
+
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out
+
+        out["Start (local)"] = _to_local(out["Start (UTC)"], tz_name)
+        out["End (local)"] = _to_local(out["End (UTC)"], tz_name)
+        out = out.drop(columns=["Start (UTC)", "End (UTC)"])
+        out = _order_cols(
+            out,
+            ["Start (local)", "End (local)", "Duration (min)", "Type", "Heartbeat Source", "EVSE", "station_id"],
+        )
+        if "End (local)" in out.columns:
+            out = out.sort_values("End (local)", ascending=False)
+        return out
 
     # Sort per EVSE
     src = src.sort_values([station_col, ts_col])

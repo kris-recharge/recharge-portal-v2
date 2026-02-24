@@ -1201,16 +1201,48 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
 
 def load_connectivity(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
     """
-    Load realtime_websocket CONNECT/DISCONNECT events; newest first; AKDT strings + friendly names.
+    Load connectivity-related events; newest first; AKDT strings + friendly names.
     """
     stations = _normalize_station_list(stations)
     start_utc = _normalize_time_param(start_utc)
     end_utc = _normalize_time_param(end_utc)
     if using_postgres():
-        # Supabase/Postgres: websocket CONNECT/DISCONNECT is not yet normalized.
-        # Return an empty frame with expected columns for now.
-        return pd.DataFrame(
-            columns=["AKDT", "Location", "station_id", "connection_id", "Connectivity"]
+        # Supabase/Postgres: derive connectivity from OCPP events.
+        # Autel: Heartbeat + BootNotification
+        # Tritium: MeterValues + BootNotification (treat MeterValues as heartbeat)
+        placeholders = _make_placeholders(len(stations)) if stations else ""
+        between = _between_placeholders()
+
+        station_expr = "COALESCE(asset_id, action_payload->'data'->'asset'->>'id')"
+        action_expr = "COALESCE(action, action_payload->'data'->'log'->>'action')"
+        is_relevant = f"{action_expr} IN ('BootNotification','Heartbeat','MeterValues')"
+
+        sql = f"""
+          SELECT {station_expr} AS station_id,
+                 {action_expr} AS event,
+                 {_ts_col()} AS timestamp
+          FROM ocpp_events
+          WHERE { (f"{station_expr} IN ({placeholders}) AND " if stations else "") } {is_relevant}
+            AND {_ts_col()} BETWEEN {between}
+          ORDER BY {_ts_col()} DESC
+        """
+        params = (list(stations) if stations else []) + [start_utc, end_utc]
+
+        conn = get_conn()
+        try:
+            df = pd.read_sql(sql, conn, params=params)
+        finally:
+            conn.close()
+
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["AKDT", "Location", "station_id", "event", "timestamp"])
+
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df["AKDT"] = df["timestamp"].dt.tz_convert(AK_TZ).dt.strftime("%Y-%m-%d %H:%M:%S")
+        df["Location"] = df["station_id"].map(EVSE_DISPLAY).fillna(df["station_id"])
+        cols = ["AKDT", "Location", "station_id", "event", "timestamp"]
+        return df[[c for c in cols if c in df.columns]].sort_values(
+            "AKDT", ascending=False, kind="mergesort"
         )
     where_in, params = _in_clause_and_params(stations, start_utc, end_utc)
     between = _between_placeholders()
