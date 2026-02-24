@@ -81,6 +81,41 @@ def _sb_headers(key: str) -> Dict[str, str]:
 def _sb_table_url(base_url: str, table: str) -> str:
     return f"{base_url.rstrip('/')}/rest/v1/{table}"
 
+def _sb_auth_admin_url(base_url: str) -> str:
+    return f"{base_url.rstrip('/')}/auth/v1/admin/users"
+
+def _sb_auth_get_user_by_email(base_url: str, key: str, email: str) -> Optional[Dict[str, Any]]:
+    """Fetch a Supabase Auth user by email (admin API)."""
+    import requests
+    if not email:
+        return None
+    # Supabase admin API supports search; we filter client-side for exact match
+    q = f"?search={email}"
+    r = requests.get(_sb_auth_admin_url(base_url) + q, headers=_sb_headers(key), timeout=20)
+    r.raise_for_status()
+    data = r.json() or {}
+    users = data.get("users") or data.get("data") or []
+    if isinstance(users, list):
+        for u in users:
+            if str(u.get("email", "")).strip().lower() == email.strip().lower():
+                return u
+    return None
+
+def _sb_auth_create_user(base_url: str, key: str, email: str) -> Dict[str, Any]:
+    """Create a Supabase Auth user (admin API) so OTP can be used."""
+    import requests
+    payload = {"email": email, "email_confirm": True}
+    r = requests.post(_sb_auth_admin_url(base_url), headers=_sb_headers(key), json=payload, timeout=20)
+    # If user already exists, Supabase returns 400/409; caller can ignore if it exists.
+    r.raise_for_status()
+    return r.json()
+
+def _sb_auth_delete_user(base_url: str, key: str, user_id: str) -> None:
+    """Delete a Supabase Auth user by id (admin API)."""
+    import requests
+    r = requests.delete(_sb_auth_admin_url(base_url) + f"/{user_id}", headers=_sb_headers(key), timeout=20)
+    r.raise_for_status()
+
 def _sb_get_users(url: str, key: str) -> pd.DataFrame:
     import requests
     r = requests.get(_sb_table_url(url, "portal_users") + "?select=*", headers=_sb_headers(key), timeout=20)
@@ -342,6 +377,7 @@ def render_admin_tab():
         name = st.text_input("Name").strip()
         allowed = st.multiselect("Allowed EVSEs", options=sorted(evse_display.keys()))
         is_active = st.checkbox("Active", value=True)
+        sync_auth = st.checkbox("Sync Supabase Auth (create/delete login user)", value=True)
         mode = st.radio("Action", ["Create", "Update (by id)", "Deactivate (by id)"], horizontal=True)
         user_id = st.text_input("Existing user id (for update/deactivate)")
 
@@ -351,9 +387,19 @@ def render_admin_tab():
             else:
                 try:
                     if mode == "Create":
+                        if not email:
+                            st.error("Email is required.")
+                            st.stop()
                         row = {"email": email, "name": name,
                                "allowed_evse_ids": allowed, "active": is_active}
                         out = _sb_insert_user(url, key, row)
+                        if sync_auth and email:
+                            try:
+                                existing = _sb_auth_get_user_by_email(url, key, email)
+                                if not existing:
+                                    _sb_auth_create_user(url, key, email)
+                            except Exception as e:
+                                st.warning(f"Portal user created, but Auth sync failed: {e}")
                         st.success(f"Created {out.get('email', '')}")
                         st.rerun()
                     elif mode.startswith("Update"):
@@ -365,6 +411,13 @@ def render_admin_tab():
                             # remove Nones so we don't overwrite with null unintentionally
                             patch = {k: v for k, v in patch.items() if v is not None}
                             out = _sb_update_user(url, key, user_id, patch)
+                            if sync_auth and email:
+                                try:
+                                    existing = _sb_auth_get_user_by_email(url, key, email)
+                                    if not existing:
+                                        _sb_auth_create_user(url, key, email)
+                                except Exception as e:
+                                    st.warning(f"Updated portal user, but Auth sync failed: {e}")
                             st.success(f"Updated {out.get('email', user_id)}")
                             st.rerun()
                     else:
@@ -372,6 +425,13 @@ def render_admin_tab():
                             st.error("user id required")
                         else:
                             out = _sb_update_user(url, key, user_id, {"active": False})
+                            if sync_auth and email:
+                                try:
+                                    existing = _sb_auth_get_user_by_email(url, key, email)
+                                    if existing and existing.get("id"):
+                                        _sb_auth_delete_user(url, key, existing["id"])
+                                except Exception as e:
+                                    st.warning(f"Deactivated portal user, but Auth delete failed: {e}")
                             st.success(f"Deactivated {out.get('email', user_id)}")
                             st.rerun()
                 except Exception as e:
