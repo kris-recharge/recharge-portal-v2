@@ -697,6 +697,17 @@ def prep_status_sheet(df: pd.DataFrame, evse_display: Dict[str, str], *, tz_name
     elif "vendor_error_description" in out.columns:
         out = out.rename(columns={"vendor_error_description": "description"})
 
+    # Autel often encodes human-readable fault text in error_code.
+    # If description is missing/empty, fall back to error_code.
+    if "error_code" in out.columns:
+        if "description" not in out.columns:
+            out["description"] = out["error_code"]
+        else:
+            desc = out["description"]
+            # Treat None/empty/"None" as missing
+            missing = desc.isna() | desc.astype(str).str.strip().isin(["", "None", "nan"])
+            out.loc[missing, "description"] = out.loc[missing, "error_code"]
+
     preferred = [
         "Timestamp (AKST)",
         "EVSE",
