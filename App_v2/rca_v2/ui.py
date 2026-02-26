@@ -252,11 +252,8 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     prev_selected_key = st.session_state.get("v2_selected_session_key", "")
     df["__sel__"] = df["__session_key__"].eq(prev_selected_key)
 
-    # Build a widget key that depends on the previously selected session.
-    # This forces Streamlit to instantiate a fresh data_editor when the selection changes,
-    # so only our computed "__sel__" row remains checked after rerun.
-    safe_suffix = (prev_selected_key or "none").replace("|", "_").replace(" ", "_")
-    editor_key = f"v2_sessions_editor_{safe_suffix}"
+    # Use a stable widget key so selection changes apply immediately on first click.
+    editor_key = "v2_sessions_editor"
 
     edited = st.data_editor(
         df[["__sel__"] + show_cols],
@@ -283,12 +280,19 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
         key=editor_key,
     )
 
-    # Enforce single-select: take the last True row if multiple are checked
-    sel_idx = edited.index[edited["__sel__"] == True].tolist()
-    if sel_idx:
-        chosen_idx = sel_idx[-1]
+    # Enforce single-select:
+    # Prefer newly checked rows, otherwise fall back to the last checked or first row.
+    edited_sel = edited["__sel__"] == True
+    prev_sel = df["__sel__"] == True
+    new_sel_idx = edited.index[edited_sel & ~prev_sel].tolist()
+    if new_sel_idx:
+        chosen_idx = new_sel_idx[-1]
     else:
-        chosen_idx = edited.index[0]
+        sel_idx = edited.index[edited_sel].tolist()
+        if sel_idx:
+            chosen_idx = sel_idx[-1]
+        else:
+            chosen_idx = edited.index[0]
 
     chosen_key = df.loc[chosen_idx, "__session_key__"]
     st.session_state["v2_selected_session_key"] = chosen_key
