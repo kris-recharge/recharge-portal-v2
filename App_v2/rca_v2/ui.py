@@ -248,60 +248,32 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     # Stable key to track selection across reruns
     df["__session_key__"] = df["station_id"].astype(str) + "|" + df["transaction_id"].astype(str)
 
-    # Use a session-scoped key so we can control which row is selected on each rerun
+    # Single-select using Streamlit's native row selection (no checkbox state drift).
     prev_selected_key = st.session_state.get("v2_selected_session_key", "")
-    df["__sel__"] = df["__session_key__"].eq(prev_selected_key)
+    selected_idx = df.index[df["__session_key__"].eq(prev_selected_key)].tolist()
+    selection_kwargs = {"rows": selected_idx[:1]} if selected_idx else {}
 
-    # Use a stable widget key so selection changes apply immediately on first click.
-    editor_key = "v2_sessions_editor"
-
-    # Apply any prior edits from the data_editor state to determine the effective selection.
-    editor_state = st.session_state.get(editor_key, {}) or {}
-    edited_rows = dict(editor_state.get("edited_rows", {}) or {})
-    effective_sel = df["__sel__"].copy()
-    for idx, change in edited_rows.items():
-        if "__sel__" in change and 0 <= int(idx) < len(effective_sel):
-            effective_sel.iloc[int(idx)] = bool(change["__sel__"])
-
-    # Enforce single-select based on effective selection
-    sel_idx = effective_sel[effective_sel == True].index.tolist()
-    chosen_idx = sel_idx[-1] if sel_idx else df.index[0]
-
-    # Normalize editor state so only chosen_idx is checked.
-    normalized_rows = {}
-    for idx in sel_idx:
-        if idx == chosen_idx:
-            normalized_rows[idx] = {"__sel__": True}
-        else:
-            normalized_rows[idx] = {"__sel__": False}
-
-    if normalized_rows != edited_rows:
-        st.session_state[editor_key] = {**editor_state, "edited_rows": normalized_rows}
-
-    edited = st.data_editor(
-        df[["__sel__"] + show_cols],
+    selection = st.dataframe(
+        df[show_cols],
         hide_index=True,
         use_container_width=True,
-        column_config={
-            "__sel__": st.column_config.CheckboxColumn(
-                " ", help="Select a session to show details below", default=False
-            ),
-            "connector_id": st.column_config.NumberColumn("Connector #", help="Connector on EVSE", format="%d"),
-            "Max Power (kW)": st.column_config.NumberColumn("Max Power (kW)", format="%.2f"),
-            "Energy Delivered (kWh)": st.column_config.NumberColumn("Energy Delivered (kWh)", format="%.2f"),
-            "Duration (min)": st.column_config.NumberColumn("Duration (min)", format="%.2f"),
-            "SoC Start": st.column_config.NumberColumn("SoC Start", format="%d"),
-            "SoC End": st.column_config.NumberColumn("SoC End", format="%d"),
-            "Estimated Revenue ($)": st.column_config.NumberColumn(
-                "Estimated Revenue ($)",
-                format="$ %.2f",
-                help="Calculated as: Connection Fee + (kWh * Price/kWh) + (Min * Price/Min)",
-            ),
-        },
-        disabled=[c for c in show_cols],
         height=480,
-        key=editor_key,
+        selection_mode="single-row",
+        on_select="rerun",
+        key="v2_sessions_table",
+        **selection_kwargs,
     )
+
+    chosen_idx = None
+    try:
+        chosen_rows = selection.selection.rows  # type: ignore[attr-defined]
+        if chosen_rows:
+            chosen_idx = chosen_rows[0]
+    except Exception:
+        chosen_idx = None
+
+    if chosen_idx is None:
+        chosen_idx = df.index[0]
 
     chosen_key = df.loc[chosen_idx, "__session_key__"]
     st.session_state["v2_selected_session_key"] = chosen_key
