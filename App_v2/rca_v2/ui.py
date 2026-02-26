@@ -248,7 +248,8 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     # Stable key to track selection across reruns
     df["__session_key__"] = df["station_id"].astype(str) + "|" + df["transaction_id"].astype(str)
 
-    # Display the table (read-only) and use a single-select dropdown for details.
+    # Display the table (read-only). Selection happens via the dropdown below
+    # because this Streamlit version doesn't support row-click selection.
     st.dataframe(
         df[show_cols],
         hide_index=True,
@@ -256,6 +257,7 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
         height=480,
         key="v2_sessions_table",
     )
+    st.caption("Use the selector below to view details for a specific session.")
 
     # Build a compact label list for single-select
     labels = []
