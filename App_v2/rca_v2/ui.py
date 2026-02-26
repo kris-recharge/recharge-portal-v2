@@ -248,34 +248,41 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     # Stable key to track selection across reruns
     df["__session_key__"] = df["station_id"].astype(str) + "|" + df["transaction_id"].astype(str)
 
-    # Single-select using Streamlit's native row selection (no checkbox state drift).
-    prev_selected_key = st.session_state.get("v2_selected_session_key", "")
-    selected_idx = df.index[df["__session_key__"].eq(prev_selected_key)].tolist()
-    selection_kwargs = {"rows": selected_idx[:1]} if selected_idx else {}
-
-    selection = st.dataframe(
+    # Display the table (read-only) and use a single-select dropdown for details.
+    st.dataframe(
         df[show_cols],
         hide_index=True,
         use_container_width=True,
         height=480,
-        selection_mode="single-row",
-        on_select="rerun",
         key="v2_sessions_table",
-        **selection_kwargs,
     )
 
-    chosen_idx = None
-    try:
-        chosen_rows = selection.selection.rows  # type: ignore[attr-defined]
-        if chosen_rows:
-            chosen_idx = chosen_rows[0]
-    except Exception:
-        chosen_idx = None
+    # Build a compact label list for single-select
+    labels = []
+    for _, row in df.iterrows():
+        label = f"{row.get('Start Date/Time','')} | {row.get('EVSE','')} | Tx {row.get('transaction_id','')}"
+        labels.append(label)
 
-    if chosen_idx is None:
-        chosen_idx = df.index[0]
+    # Map labels -> session key
+    label_to_key = dict(zip(labels, df["__session_key__"].tolist()))
+    prev_selected_key = st.session_state.get("v2_selected_session_key", "")
+    default_label = None
+    if prev_selected_key:
+        for label, key in label_to_key.items():
+            if key == prev_selected_key:
+                default_label = label
+                break
+    if default_label is None and labels:
+        default_label = labels[0]
 
-    chosen_key = df.loc[chosen_idx, "__session_key__"]
+    selected_label = st.selectbox(
+        "Select a session for details",
+        options=labels,
+        index=labels.index(default_label) if default_label in labels else 0,
+        key="v2_sessions_select",
+    )
+
+    chosen_key = label_to_key.get(selected_label) if selected_label else df.loc[df.index[0], "__session_key__"]
     st.session_state["v2_selected_session_key"] = chosen_key
 
     sid, tx = chosen_key.split("|", 1)
