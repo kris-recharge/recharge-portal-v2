@@ -255,6 +255,29 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     # Use a stable widget key so selection changes apply immediately on first click.
     editor_key = "v2_sessions_editor"
 
+    # Apply any prior edits from the data_editor state to determine the effective selection.
+    editor_state = st.session_state.get(editor_key, {}) or {}
+    edited_rows = dict(editor_state.get("edited_rows", {}) or {})
+    effective_sel = df["__sel__"].copy()
+    for idx, change in edited_rows.items():
+        if "__sel__" in change and 0 <= int(idx) < len(effective_sel):
+            effective_sel.iloc[int(idx)] = bool(change["__sel__"])
+
+    # Enforce single-select based on effective selection
+    sel_idx = effective_sel[effective_sel == True].index.tolist()
+    chosen_idx = sel_idx[-1] if sel_idx else df.index[0]
+
+    # Normalize editor state so only chosen_idx is checked.
+    normalized_rows = {}
+    for idx in sel_idx:
+        if idx == chosen_idx:
+            normalized_rows[idx] = {"__sel__": True}
+        else:
+            normalized_rows[idx] = {"__sel__": False}
+
+    if normalized_rows != edited_rows:
+        st.session_state[editor_key] = {**editor_state, "edited_rows": normalized_rows}
+
     edited = st.data_editor(
         df[["__sel__"] + show_cols],
         hide_index=True,
@@ -280,46 +303,8 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
         key=editor_key,
     )
 
-    # Enforce single-select:
-    # Prefer newly checked rows, otherwise fall back to the last checked or first row.
-    edited_sel = edited["__sel__"] == True
-    prev_sel = df["__sel__"] == True
-    new_sel_idx = edited.index[edited_sel & ~prev_sel].tolist()
-    if new_sel_idx:
-        chosen_idx = new_sel_idx[-1]
-    else:
-        sel_idx = edited.index[edited_sel].tolist()
-        if sel_idx:
-            chosen_idx = sel_idx[-1]
-        else:
-            chosen_idx = edited.index[0]
-
     chosen_key = df.loc[chosen_idx, "__session_key__"]
     st.session_state["v2_selected_session_key"] = chosen_key
-
-    # If multiple boxes are checked (or selection changed), normalize editor state
-    # so only the chosen row remains checked on the next render.
-    editor_state = st.session_state.get(editor_key, {})
-    edited_rows = dict(editor_state.get("edited_rows", {}) or {})
-    # Build a minimal edited_rows that forces only chosen_idx to True
-    normalized_rows = {}
-    for idx in edited.index:
-        if idx == chosen_idx:
-            normalized_rows[idx] = {"__sel__": True}
-        elif edited.loc[idx, "__sel__"]:
-            normalized_rows[idx] = {"__sel__": False}
-
-    should_rerun = False
-    if normalized_rows != edited_rows:
-        st.session_state[editor_key] = {**editor_state, "edited_rows": normalized_rows}
-        should_rerun = True
-
-    # Also rerun if the selected key changed so details update immediately
-    if st.session_state.get("v2_selected_session_key") != prev_selected_key:
-        should_rerun = True
-
-    if should_rerun:
-        st.rerun()
 
     sid, tx = chosen_key.split("|", 1)
     return sid, tx
