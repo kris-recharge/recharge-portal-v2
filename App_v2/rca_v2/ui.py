@@ -248,43 +248,43 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     # Stable key to track selection across reruns
     df["__session_key__"] = df["station_id"].astype(str) + "|" + df["transaction_id"].astype(str)
 
-    # Display the table (read-only). Selection happens via the dropdown below
-    # because this Streamlit version doesn't support row-click selection.
-    st.dataframe(
-        df[show_cols],
+    # Use a session-scoped key so we can control which row is selected on each rerun
+    prev_selected_key = st.session_state.get("v2_selected_session_key", "")
+    df["__sel__"] = df["__session_key__"].eq(prev_selected_key)
+
+    edited = st.data_editor(
+        df[["__sel__"] + show_cols],
         hide_index=True,
         use_container_width=True,
+        column_config={
+            "__sel__": st.column_config.CheckboxColumn(
+                " ", help="Select a session to show details below", default=False
+            ),
+            "connector_id": st.column_config.NumberColumn("Connector #", help="Connector on EVSE", format="%d"),
+            "Max Power (kW)": st.column_config.NumberColumn("Max Power (kW)", format="%.2f"),
+            "Energy Delivered (kWh)": st.column_config.NumberColumn("Energy Delivered (kWh)", format="%.2f"),
+            "Duration (min)": st.column_config.NumberColumn("Duration (min)", format="%.2f"),
+            "SoC Start": st.column_config.NumberColumn("SoC Start", format="%d"),
+            "SoC End": st.column_config.NumberColumn("SoC End", format="%d"),
+            "Estimated Revenue ($)": st.column_config.NumberColumn(
+                "Estimated Revenue ($)",
+                format="$ %.2f",
+                help="Calculated as: Connection Fee + (kWh * Price/kWh) + (Min * Price/Min)",
+            ),
+        },
+        disabled=[c for c in show_cols],
         height=480,
-        key="v2_sessions_table",
-    )
-    st.caption("Use the selector below to view details for a specific session.")
-
-    # Build a compact label list for single-select
-    labels = []
-    for _, row in df.iterrows():
-        label = f"{row.get('Start Date/Time','')} | {row.get('EVSE','')} | Tx {row.get('transaction_id','')}"
-        labels.append(label)
-
-    # Map labels -> session key
-    label_to_key = dict(zip(labels, df["__session_key__"].tolist()))
-    prev_selected_key = st.session_state.get("v2_selected_session_key", "")
-    default_label = None
-    if prev_selected_key:
-        for label, key in label_to_key.items():
-            if key == prev_selected_key:
-                default_label = label
-                break
-    if default_label is None and labels:
-        default_label = labels[0]
-
-    selected_label = st.selectbox(
-        "Select a session for details",
-        options=labels,
-        index=labels.index(default_label) if default_label in labels else 0,
-        key="v2_sessions_select",
+        key="v2_sessions_editor",
     )
 
-    chosen_key = label_to_key.get(selected_label) if selected_label else df.loc[df.index[0], "__session_key__"]
+    # Enforce single-select in logic (UI may still briefly show multiple checks)
+    sel_idx = edited.index[edited["__sel__"] == True].tolist()
+    if sel_idx:
+        chosen_idx = sel_idx[-1]
+    else:
+        chosen_idx = edited.index[0]
+
+    chosen_key = df.loc[chosen_idx, "__session_key__"]
     st.session_state["v2_selected_session_key"] = chosen_key
 
     sid, tx = chosen_key.split("|", 1)
