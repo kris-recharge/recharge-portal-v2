@@ -297,5 +297,29 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     chosen_key = df.loc[chosen_idx, "__session_key__"]
     st.session_state["v2_selected_session_key"] = chosen_key
 
+    # If multiple boxes are checked (or selection changed), normalize editor state
+    # so only the chosen row remains checked on the next render.
+    editor_state = st.session_state.get(editor_key, {})
+    edited_rows = dict(editor_state.get("edited_rows", {}) or {})
+    # Build a minimal edited_rows that forces only chosen_idx to True
+    normalized_rows = {}
+    for idx in edited.index:
+        if idx == chosen_idx:
+            normalized_rows[idx] = {"__sel__": True}
+        elif edited.loc[idx, "__sel__"]:
+            normalized_rows[idx] = {"__sel__": False}
+
+    should_rerun = False
+    if normalized_rows != edited_rows:
+        st.session_state[editor_key] = {**editor_state, "edited_rows": normalized_rows}
+        should_rerun = True
+
+    # Also rerun if the selected key changed so details update immediately
+    if st.session_state.get("v2_selected_session_key") != prev_selected_key:
+        should_rerun = True
+
+    if should_rerun:
+        st.rerun()
+
     sid, tx = chosen_key.split("|", 1)
     return sid, tx
