@@ -409,10 +409,11 @@ def heatmap_count(heat, title):
     )
     mat.index = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-    # Ensure numeric array (avoid object dtype rendering issues). Also cap zmax
+    # Ensure numeric array (avoid object dtype rendering issues).
     z = mat.to_numpy(dtype=float)
-    # Guard against the all‑zero window (plotly auto with zmax=0 -> weird/blank).  
-    zmax = float(np.nanpercentile(z, 95)) if np.nanmax(z) > 0 else 1.0
+    # Guard against the all‑zero window (plotly auto with zmax=0 -> weird/blank).
+    # Use the true max so the color gradient reflects actual counts.
+    zmax = float(np.nanmax(z)) if np.nanmax(z) > 0 else 1.0
 
     # Explicit white→blue ramp so zero really looks white on dark background
     blues = [[0.0, "#ffffff"], [1.0, "#08519c"]]
