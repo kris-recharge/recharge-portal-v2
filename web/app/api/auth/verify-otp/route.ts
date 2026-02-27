@@ -10,8 +10,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Missing email or token." }, { status: 400 });
     }
 
-    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-    const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+    const supabaseUrl =
+      process.env.NEXT_PUBLIC_SUPABASE_URL ||
+      process.env.SUPABASE_URL ||
+      "";
+    const supabaseAnonKey =
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+      process.env.SUPABASE_ANON_KEY ||
+      "";
 
     if (!supabaseUrl || !supabaseAnonKey) {
       return NextResponse.json(
@@ -44,7 +50,10 @@ export async function POST(req: Request) {
     });
 
     if (error) {
-      return NextResponse.json({ error: error.message }, { status: 401 });
+      return NextResponse.json(
+        { error: error.message || "Supabase OTP verification failed." },
+        { status: 401 }
+      );
     }
 
     return res;
