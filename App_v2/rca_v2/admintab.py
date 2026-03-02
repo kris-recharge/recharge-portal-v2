@@ -81,41 +81,6 @@ def _sb_headers(key: str) -> Dict[str, str]:
 def _sb_table_url(base_url: str, table: str) -> str:
     return f"{base_url.rstrip('/')}/rest/v1/{table}"
 
-def _sb_auth_admin_url(base_url: str) -> str:
-    return f"{base_url.rstrip('/')}/auth/v1/admin/users"
-
-def _sb_auth_get_user_by_email(base_url: str, key: str, email: str) -> Optional[Dict[str, Any]]:
-    """Fetch a Supabase Auth user by email (admin API)."""
-    import requests
-    if not email:
-        return None
-    # Supabase admin API supports search; we filter client-side for exact match
-    q = f"?search={email}"
-    r = requests.get(_sb_auth_admin_url(base_url) + q, headers=_sb_headers(key), timeout=20)
-    r.raise_for_status()
-    data = r.json() or {}
-    users = data.get("users") or data.get("data") or []
-    if isinstance(users, list):
-        for u in users:
-            if str(u.get("email", "")).strip().lower() == email.strip().lower():
-                return u
-    return None
-
-def _sb_auth_create_user(base_url: str, key: str, email: str) -> Dict[str, Any]:
-    """Create a Supabase Auth user (admin API) so OTP can be used."""
-    import requests
-    payload = {"email": email, "email_confirm": True}
-    r = requests.post(_sb_auth_admin_url(base_url), headers=_sb_headers(key), json=payload, timeout=20)
-    # If user already exists, Supabase returns 400/409; caller can ignore if it exists.
-    r.raise_for_status()
-    return r.json()
-
-def _sb_auth_delete_user(base_url: str, key: str, user_id: str) -> None:
-    """Delete a Supabase Auth user by id (admin API)."""
-    import requests
-    r = requests.delete(_sb_auth_admin_url(base_url) + f"/{user_id}", headers=_sb_headers(key), timeout=20)
-    r.raise_for_status()
-
 def _sb_get_users(url: str, key: str) -> pd.DataFrame:
     import requests
     r = requests.get(_sb_table_url(url, "portal_users") + "?select=*", headers=_sb_headers(key), timeout=20)
@@ -235,6 +200,59 @@ def _pricing_payload(
     return {k: v for k, v in row.items() if v is not None}
 
 
+# ---------- Unidentified EVSE detection ----------
+
+def _query_unidentified_evses() -> pd.DataFrame:
+    """Query ocpp_events for station_ids that have sent data but are not yet
+    registered in the EVSE display map.
+
+    Returns a DataFrame with columns:
+        station_id        - raw asset ID from the database
+        Last Seen (AK Local) - most recent data timestamp in Alaska local time
+    """
+    from .constants import get_evse_display
+    from .config import AK_TZ
+
+    known_ids = set(get_evse_display().keys())
+
+    try:
+        conn = get_conn()
+        sql = """
+            SELECT
+                COALESCE(asset_id, action_payload->'data'->'asset'->>'id') AS station_id,
+                MAX(received_at) AS last_seen
+            FROM ocpp_events
+            WHERE COALESCE(asset_id, action_payload->'data'->'asset'->>'id') IS NOT NULL
+            GROUP BY station_id
+            ORDER BY last_seen DESC
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return pd.DataFrame()
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["station_id", "last_seen"])
+    df = df[~df["station_id"].isin(known_ids)].copy()
+
+    if df.empty:
+        return df
+
+    df["last_seen"] = pd.to_datetime(df["last_seen"], utc=True, errors="coerce")
+    df["Last Seen (AK Local)"] = (
+        df["last_seen"].dt.tz_convert(AK_TZ).dt.strftime("%Y-%m-%d %H:%M")
+    )
+    return (
+        df[["station_id", "Last Seen (AK Local)"]]
+        .sort_values("Last Seen (AK Local)", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
 # ==========================================================
 # Public Entry
 # ==========================================================
@@ -258,6 +276,84 @@ def render_admin_tab():
 
     st.divider()
     st.markdown("### EVSE & Locations")
+
+    # ---- Unidentified EVSEs ----
+    st.markdown("#### Unidentified EVSEs")
+    st.caption("Station IDs seen in live data that have not yet been registered.")
+
+    unknown_df = _query_unidentified_evses()
+
+    if unknown_df.empty:
+        st.success("No unidentified EVSEs detected.")
+    else:
+        st.dataframe(unknown_df, use_container_width=True, hide_index=True)
+
+        with st.expander("Register an unidentified EVSE"):
+            unknown_ids = unknown_df["station_id"].tolist()
+            reg_sid_select = st.selectbox(
+                "Select station_id to register",
+                options=[""] + unknown_ids,
+                key="reg_unknown_sid",
+            )
+            manual_sid = st.text_input(
+                "Or enter station_id manually",
+                value="",
+                key="reg_manual_sid",
+            ).strip()
+            sid_to_register = (manual_sid or reg_sid_select).strip()
+
+            st.divider()
+            reg_disp = st.text_input("Charger name (display)", value="", key="reg_disp")
+            reg_loc  = st.text_input("Location (e.g., Fairbanks)", value="", key="reg_loc")
+            reg_platform = st.selectbox(
+                "Platform",
+                ["", "MaxiCharger", "RTM", "RT50", "Autel", "Other"],
+                key="reg_platform",
+            )
+
+            st.divider()
+            st.caption("Connector types — connector 1 = NACS and connector 2 = CCS by default")
+            _conn_opts = ["NACS", "CCS", "CHAdeMO", "J1772", "Other"]
+            c1, c2 = st.columns(2)
+            with c1:
+                conn1_type = st.selectbox("Connector 1 type", _conn_opts, index=0, key="reg_conn1")
+            with c2:
+                conn2_type = st.selectbox("Connector 2 type", _conn_opts, index=1, key="reg_conn2")
+
+            if st.button("Register EVSE"):
+                if not sid_to_register:
+                    st.error("A station_id is required.")
+                elif not reg_disp:
+                    st.error("A charger name is required.")
+                else:
+                    ov = _read_json(OVERRIDES_PATH)
+
+                    ev_map = ov.get("evse_display", {})
+                    lo_map = ov.get("evse_location", {})
+                    pf_map = ov.get("platform_map", {})
+                    ct_map = ov.get("connector_type", {})
+
+                    ev_map[sid_to_register] = reg_disp
+                    if reg_loc:
+                        lo_map[sid_to_register] = reg_loc
+                    if reg_platform:
+                        pf_map[sid_to_register] = reg_platform
+
+                    # Connector type keys stored as stringified tuples so
+                    # get_connector_type() can merge them at runtime.
+                    ct_map[f"('{sid_to_register}', 1)"] = conn1_type
+                    ct_map[f"('{sid_to_register}', 2)"] = conn2_type
+
+                    ov["evse_display"]    = ev_map
+                    ov["evse_location"]   = lo_map
+                    ov["platform_map"]    = pf_map
+                    ov["connector_type"]  = ct_map
+                    _write_json(OVERRIDES_PATH, ov)
+                    st.success(f"Registered '{sid_to_register}' as '{reg_disp}'")
+                    st.rerun()
+
+    st.divider()
+    st.markdown("#### Registered EVSEs")
 
     # Show current table
     df = pd.DataFrame(
@@ -377,7 +473,6 @@ def render_admin_tab():
         name = st.text_input("Name").strip()
         allowed = st.multiselect("Allowed EVSEs", options=sorted(evse_display.keys()))
         is_active = st.checkbox("Active", value=True)
-        sync_auth = st.checkbox("Sync Supabase Auth (create/delete login user)", value=True)
         mode = st.radio("Action", ["Create", "Update (by id)", "Deactivate (by id)"], horizontal=True)
         user_id = st.text_input("Existing user id (for update/deactivate)")
 
@@ -387,19 +482,9 @@ def render_admin_tab():
             else:
                 try:
                     if mode == "Create":
-                        if not email:
-                            st.error("Email is required.")
-                            st.stop()
                         row = {"email": email, "name": name,
                                "allowed_evse_ids": allowed, "active": is_active}
                         out = _sb_insert_user(url, key, row)
-                        if sync_auth and email:
-                            try:
-                                existing = _sb_auth_get_user_by_email(url, key, email)
-                                if not existing:
-                                    _sb_auth_create_user(url, key, email)
-                            except Exception as e:
-                                st.warning(f"Portal user created, but Auth sync failed: {e}")
                         st.success(f"Created {out.get('email', '')}")
                         st.rerun()
                     elif mode.startswith("Update"):
@@ -411,13 +496,6 @@ def render_admin_tab():
                             # remove Nones so we don't overwrite with null unintentionally
                             patch = {k: v for k, v in patch.items() if v is not None}
                             out = _sb_update_user(url, key, user_id, patch)
-                            if sync_auth and email:
-                                try:
-                                    existing = _sb_auth_get_user_by_email(url, key, email)
-                                    if not existing:
-                                        _sb_auth_create_user(url, key, email)
-                                except Exception as e:
-                                    st.warning(f"Updated portal user, but Auth sync failed: {e}")
                             st.success(f"Updated {out.get('email', user_id)}")
                             st.rerun()
                     else:
@@ -425,13 +503,6 @@ def render_admin_tab():
                             st.error("user id required")
                         else:
                             out = _sb_update_user(url, key, user_id, {"active": False})
-                            if sync_auth and email:
-                                try:
-                                    existing = _sb_auth_get_user_by_email(url, key, email)
-                                    if existing and existing.get("id"):
-                                        _sb_auth_delete_user(url, key, existing["id"])
-                                except Exception as e:
-                                    st.warning(f"Deactivated portal user, but Auth delete failed: {e}")
                             st.success(f"Deactivated {out.get('email', user_id)}")
                             st.rerun()
                 except Exception as e:
