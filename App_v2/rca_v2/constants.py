@@ -146,15 +146,59 @@ def _ovr() -> dict:
     except Exception:
         return {}
 
+def _load_chargers_from_db() -> list:
+    """Query public.chargers JOIN public.sites for EVSEs not in the hardcoded map.
+
+    Used to pick up newly-registered EVSEs without a code deploy.
+    Returns an empty list on any error (DB unavailable, missing table, etc.).
+    """
+    known = set(EVSE_DISPLAY.keys())
+    try:
+        from .db import get_conn
+        conn = get_conn()
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT c.external_id,
+                       c.name,
+                       s.name  AS site_name,
+                       c.make,
+                       c.connector_types
+                FROM   public.chargers c
+                LEFT   JOIN public.sites s ON c.site_id = s.id
+                WHERE  c.external_id IS NOT NULL
+            """)
+            rows = cur.fetchall()
+        conn.close()
+        return [
+            {
+                "external_id":     r[0],
+                "name":            r[1] or "",
+                "site_name":       r[2] or "",
+                "make":            r[3] or "",
+                "connector_types": r[4] or {},
+            }
+            for r in rows
+            if r[0] not in known
+        ]
+    except Exception:
+        return []
+
+
 def get_evse_display() -> dict:
+    base = dict(EVSE_DISPLAY)
+    for r in _load_chargers_from_db():
+        if r["external_id"] not in base and r["name"]:
+            base[r["external_id"]] = r["name"]
     ov = _ovr().get("evse_display", {})
-    base = dict(EVSE_DISPLAY)  # existing constant
     base.update(ov)
     return base
 
 def get_platform_map() -> dict:
-    ov = _ovr().get("platform_map", {})
     base = dict(PLATFORM_MAP) if "PLATFORM_MAP" in globals() else {}
+    for r in _load_chargers_from_db():
+        if r["external_id"] not in base and r["make"]:
+            base[r["external_id"]] = r["make"]
+    ov = _ovr().get("platform_map", {})
     base.update(ov)
     return base
 
@@ -162,32 +206,37 @@ def get_archived_station_ids() -> list[str]:
     return list(_ovr().get("archived_station_ids", []))
 
 def get_evse_location() -> dict:
-    ov = _ovr().get("evse_location", {})
     base = dict(EVSE_LOCATION) if "EVSE_LOCATION" in globals() else {}
+    for r in _load_chargers_from_db():
+        if r["external_id"] not in base and r["site_name"]:
+            base[r["external_id"]] = r["site_name"]
+    ov = _ovr().get("evse_location", {})
     base.update(ov)
     return base
 
 
 def get_connector_type() -> dict:
     """
-    Return CONNECTOR_TYPE with any runtime overrides merged in.
+    Return CONNECTOR_TYPE merged with DB connector_types and runtime overrides.
 
-    Overrides schema (runtime_overrides.json):
-      {
-        "connector_type": {
-          "(station_id, connector_id)": "CCS"
-        }
-      }
-
-    NOTE: For practicality we expect overrides to use the same native
-    mapping structure as CONNECTOR_TYPE, i.e. keys are tuples
-    (station_id, connector_id). If the JSON uses string keys, your
-    admin tab can normalize them before writing.
+    Priority (lowest → highest):
+      1. Hardcoded CONNECTOR_TYPE (existing well-known EVSEs)
+      2. DB chargers.connector_types JSONB (new EVSEs registered via admin)
+      3. runtime_overrides.json connector_type (emergency manual overrides)
     """
-    ov = _ovr().get("connector_type", {})
     base = dict(CONNECTOR_TYPE) if "CONNECTOR_TYPE" in globals() else {}
-    # Merge; if ov contains tuple-like string keys this won't match —
-    # we keep the simple case here; admin writer should store tuples.
+    # Layer: DB connector_types JSONB (new EVSEs registered via admin)
+    for r in _load_chargers_from_db():
+        sid = r["external_id"]
+        for cid_str, ctype in (r.get("connector_types") or {}).items():
+            try:
+                key = (sid, int(cid_str))
+                if key not in base:
+                    base[key] = ctype
+            except (ValueError, TypeError):
+                continue
+    # Layer: runtime_overrides (manual overrides, highest priority)
+    ov = _ovr().get("connector_type", {})
     try:
         base.update(ov)
     except Exception:

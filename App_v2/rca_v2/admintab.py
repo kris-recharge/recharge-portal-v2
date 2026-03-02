@@ -146,6 +146,47 @@ def _sb_update_pricing(url: str, key: str, pricing_id: Any, patch: Dict[str, Any
     return r.json()[0] if r.json() else {}
 
 
+def _sb_get_sites(url: str, key: str) -> list:
+    """Fetch all sites from Supabase."""
+    import requests
+    r = requests.get(
+        _sb_table_url(url, "sites") + "?select=id,name",
+        headers=_sb_headers(key),
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json() or []
+
+
+def _sb_find_or_create_site(url: str, key: str, site_name: str) -> str:
+    """Return the UUID of the site matching site_name, creating it if needed."""
+    import requests
+    for s in _sb_get_sites(url, key):
+        if s["name"].strip().lower() == site_name.strip().lower():
+            return s["id"]
+    r = requests.post(
+        _sb_table_url(url, "sites"),
+        headers=_sb_headers(key),
+        json={"name": site_name},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()[0]["id"]
+
+
+def _sb_insert_charger(url: str, key: str, row: dict) -> dict:
+    """Insert a new charger row into Supabase."""
+    import requests
+    r = requests.post(
+        _sb_table_url(url, "chargers"),
+        headers=_sb_headers(key),
+        json=row,
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json()[0] if r.json() else {}
+
+
 def _coerce_numeric(v: Any) -> Optional[float]:
     if v is None:
         return None
@@ -325,32 +366,34 @@ def render_admin_tab():
                     st.error("A station_id is required.")
                 elif not reg_disp:
                     st.error("A charger name is required.")
+                elif not reg_loc:
+                    st.error("A location is required (used to look up or create the site).")
                 else:
-                    ov = _read_json(OVERRIDES_PATH)
-
-                    ev_map = ov.get("evse_display", {})
-                    lo_map = ov.get("evse_location", {})
-                    pf_map = ov.get("platform_map", {})
-                    ct_map = ov.get("connector_type", {})
-
-                    ev_map[sid_to_register] = reg_disp
-                    if reg_loc:
-                        lo_map[sid_to_register] = reg_loc
-                    if reg_platform:
-                        pf_map[sid_to_register] = reg_platform
-
-                    # Connector type keys stored as stringified tuples so
-                    # get_connector_type() can merge them at runtime.
-                    ct_map[f"('{sid_to_register}', 1)"] = conn1_type
-                    ct_map[f"('{sid_to_register}', 2)"] = conn2_type
-
-                    ov["evse_display"]    = ev_map
-                    ov["evse_location"]   = lo_map
-                    ov["platform_map"]    = pf_map
-                    ov["connector_type"]  = ct_map
-                    _write_json(OVERRIDES_PATH, ov)
-                    st.success(f"Registered '{sid_to_register}' as '{reg_disp}'")
-                    st.rerun()
+                    creds = _load_supabase_creds()
+                    if not creds["url"] or not creds["service_key"]:
+                        st.error("Supabase credentials not configured. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars.")
+                    else:
+                        try:
+                            site_id = _sb_find_or_create_site(
+                                creds["url"], creds["service_key"], reg_loc
+                            )
+                            _sb_insert_charger(
+                                creds["url"], creds["service_key"],
+                                {
+                                    "external_id":     sid_to_register,
+                                    "name":            reg_disp,
+                                    "site_id":         site_id,
+                                    "make":            reg_platform or None,
+                                    "connector_types": {
+                                        "1": conn1_type,
+                                        "2": conn2_type,
+                                    },
+                                },
+                            )
+                            st.success(f"Registered '{sid_to_register}' as '{reg_disp}' at {reg_loc}")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Failed to register EVSE: {exc}")
 
     st.divider()
     st.markdown("#### Registered EVSEs")
