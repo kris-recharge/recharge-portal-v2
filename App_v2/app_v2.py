@@ -163,14 +163,10 @@ if allowed_ids_set is not None:
     allowed_ids_set = {str(x) for x in allowed_ids_set if str(x).strip() != ""}
 
 if is_portal_context:
-    # Optional: superadmin bypass (comma-separated emails)
-    superadmins = {
-        e.strip().lower()
-        for e in (os.getenv("RCA_SUPERADMIN_EMAILS", "") or "").split(",")
-        if e.strip()
-    }
+    # ReCharge Alaska staff (@rechargealaska.net) bypass the EVSE allow-list and can see all EVSEs.
+    _is_superadmin = bool(portal_email and portal_email.strip().lower().endswith("@rechargealaska.net"))
 
-    if portal_email and portal_email.strip().lower() in superadmins:
+    if _is_superadmin:
         # Superadmins can see all EVSEs
         st.session_state["__portal_no_access"] = False
         st.session_state["__portal_allowed_station_ids"] = None
@@ -527,18 +523,6 @@ try:
         can_admin = True
 except Exception:
     can_admin = False
-
-# Optional superadmin bypass (comma-separated emails)
-try:
-    _superadmins = {
-        e.strip().lower()
-        for e in (os.getenv("RCA_SUPERADMIN_EMAILS", "") or "").split(",")
-        if e.strip()
-    }
-    if portal_email and portal_email.strip().lower() in _superadmins:
-        can_admin = True
-except Exception:
-    pass
 
 TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Export"]
 if can_admin:

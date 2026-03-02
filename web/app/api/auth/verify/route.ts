@@ -29,14 +29,9 @@ export async function GET(req: Request) {
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
   const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-  // NOTE: your VPS `.env` currently uses `SUPABASE_SERVICE_ROLL_KEY` (ROLL),
-  // but the conventional name is `SUPABASE_SERVICE_ROLE_KEY` (ROLE).
-  // Accept either so a small typo doesn't silently disable authorization.
   const supabaseServiceRoleKey =
     process.env.SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.SUPABASE_SERVICE_ROLL_KEY ||
     process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY ||
-    process.env.NEXT_PUBLIC_SUPABASE_SERVICE_ROLL_KEY ||
     "";
 
   if (!supabaseUrl || !supabaseAnonKey) {
