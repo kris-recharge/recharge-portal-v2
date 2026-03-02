@@ -223,308 +223,58 @@ def prep_sessions_sheet(
 ) -> pd.DataFrame:
     """Prepare Sessions sheet.
 
-    Requirements from Kris:
-      - remove redundant connector column D (connector #)
-      - remove redundant asset_id/station_id column (they called it Column K earlier)
-      - keep friendly EVSE name
+    Columns produced (in order):
+      Start Time (local) | End Time (local) | EVSE | Connector Type |
+      Max Power (kW) | Duration (min) | Energy Delivered (kWh) |
+      SoC Start (%) | SoC End (%) | ID Tag | Authorize (raw) | Auth Method |
+      Estimated Revenue ($) | transaction_id
 
-    Because column names vary between local/cloud, this function is defensive.
+    Auth enrichment joins authorize_methods on:
+      1. (station_id, transaction_id)  — primary, for completed sessions
+      2. (ID Tag → id_tag_vid)         — fallback for VID-initiated sessions
+
+    Columns intentionally removed:
+      - Auth Method Confidence  (not useful for reporting)
+      - connector_id            (redundant given Connector Type)
+      - Attempted (<1 kWh)      (removed per user request)
+      - Outcome                 (removed per user request)
     """
 
     out = df.copy()
 
-    # Normalize station id column
-    station_col = _first_existing(out, [
-        "station_id",
-        "asset_id",
-        "evse_id",
-        "station",
-    ])
-
-    # Add/normalize friendly name
+    # --- Station id → EVSE friendly name ---
+    station_col = _first_existing(out, ["station_id", "asset_id", "evse_id", "station"])
     if station_col:
         out["EVSE"] = out[station_col].map(evse_display).fillna(out[station_col])
 
-    # Convert time columns to local
-    out = _convert_time_cols(
-        out,
-        tz_name=tz_name,
-        cols=["timestamp", "received_at", "ts"],
-        assume_utc_for_naive=True,
-    )
+    # --- Convert UTC timestamps to local ---
+    out = _convert_time_cols(out, tz_name=tz_name, cols=["timestamp", "received_at", "ts"], assume_utc_for_naive=True)
 
-    # Prefer consistent column names if present
+    # --- Rename columns to export-friendly labels ---
     rename_map = {}
-    # Start
     for c in ["start_time", "start", "Start Date/Time", "Start Time"]:
         if c in out.columns:
             rename_map[c] = "Start Time (local)"
             break
-    # End
     for c in ["end_time", "end", "End Date/Time", "End Time"]:
         if c in out.columns:
             rename_map[c] = "End Time (local)"
             break
-
-    # Energy
     if "energy_kwh" in out.columns:
         rename_map["energy_kwh"] = "Energy Delivered (kWh)"
     elif "kwh" in out.columns:
         rename_map["kwh"] = "Energy Delivered (kWh)"
-
-    # Duration
     if "duration_min" in out.columns:
         rename_map["duration_min"] = "Duration (min)"
-
-    # SoC
     if "soc_start" in out.columns:
         rename_map["soc_start"] = "SoC Start (%)"
     if "soc_end" in out.columns:
         rename_map["soc_end"] = "SoC End (%)"
-
-    # Id Tag
     if "id_tag" in out.columns:
         rename_map["id_tag"] = "ID Tag"
-
     out = out.rename(columns=rename_map)
 
-    # --- Authorization columns (raw + guessed method) ---
-    # Kris wants both:
-    #  - the raw authorize string (ID Tag)
-    #  - a best-guess method/category (RFID / CC / AutoCharge / App / Unknown)
-
-    # Ensure a stable raw authorize column.
-    if "ID Tag" in out.columns and "Authorize (raw)" not in out.columns:
-        out["Authorize (raw)"] = out["ID Tag"].where(out["ID Tag"].notna(), pd.NA)
-
-    # If the upstream already provided a method, normalize its label.
-    if "authorization_method" in out.columns and "Auth Method (guess)" not in out.columns:
-        out["Auth Method (guess)"] = out["authorization_method"]
-
-    # Otherwise, try to look it up from an authorize_methods dataframe if provided.
-    # We want exports to be a *passthrough* from Supabase:
-    #  - Sessions `ID Tag` is often a VID:* token
-    #  - authorize_methods has the effective token (id_tag_effective) + authorization_method
-    # So we:
-    #   1) merge by (station_id, transaction_id) where available
-    #   2) fallback merge by VID token (ID Tag -> authorize_methods.id_tag_vid)
-    #   3) final fallback merge by effective token (ID Tag -> authorize_methods.id_tag_effective)
-    if authorize_methods_df is not None and not authorize_methods_df.empty:
-        try:
-            am = authorize_methods_df.copy()
-
-            # Normalize station id column name to station_id
-            if "station_id" not in am.columns and "asset_id" in am.columns:
-                am = am.rename(columns={"asset_id": "station_id"})
-
-            # Only keep what we need (defensive)
-            keep = [
-                c
-                for c in [
-                    "station_id",
-                    "transaction_id",
-                    "connector_id",
-                    "authorize_received_at",
-                    "id_tag",
-                    "id_tags",
-                    "id_tag_effective",
-                    "id_tag_vid",
-                    "authorization_method",
-                    "confidence",
-                ]
-                if c in am.columns
-            ]
-            am = am[keep]
-
-            # Coerce types
-            if "station_id" in am.columns:
-                am["station_id"] = am["station_id"].astype(str)
-            if "transaction_id" in am.columns:
-                am["transaction_id"] = am["transaction_id"].astype(str)
-            if "id_tag_vid" in am.columns:
-                am["id_tag_vid"] = am["id_tag_vid"].astype(str)
-            if "id_tag_effective" in am.columns:
-                am["id_tag_effective"] = am["id_tag_effective"].astype(str)
-
-            # Keep the latest row per key when timestamps exist
-            if "authorize_received_at" in am.columns:
-                am["authorize_received_at"] = pd.to_datetime(am["authorize_received_at"], errors="coerce")
-                am = am.sort_values("authorize_received_at")
-
-            # Build two lookup tables:
-            # - txn_lookup: (station_id, transaction_id) -> method/token
-            # - vid_lookup: id_tag_vid -> method/token
-            txn_lookup = None
-            if "station_id" in am.columns and "transaction_id" in am.columns:
-                txn_cols = [c for c in ["station_id", "transaction_id", "id_tag_effective", "authorization_method", "confidence"] if c in am.columns]
-                txn_lookup = am[txn_cols].dropna(subset=["station_id", "transaction_id"], how="any")
-                # prefer latest per (station_id, transaction_id)
-                txn_lookup = txn_lookup.drop_duplicates(subset=["station_id", "transaction_id"], keep="last")
-
-            vid_lookup = None
-            if "id_tag_vid" in am.columns:
-                vid_cols = [c for c in ["id_tag_vid", "id_tag_effective", "authorization_method", "confidence"] if c in am.columns]
-                vid_lookup = am[vid_cols].dropna(subset=["id_tag_vid"], how="any")
-                # prefer latest per VID
-                vid_lookup = vid_lookup.drop_duplicates(subset=["id_tag_vid"], keep="last")
-
-            eff_lookup = None
-            if "id_tag_effective" in am.columns:
-                eff_cols = [c for c in ["id_tag_effective", "authorization_method", "confidence"] if c in am.columns]
-                eff_lookup = am[eff_cols].dropna(subset=["id_tag_effective"], how="any")
-                eff_lookup = eff_lookup.drop_duplicates(subset=["id_tag_effective"], keep="last")
-
-            out_id = out.copy()
-
-            # Determine station id column present in sessions df
-            sess_station_col = station_col if station_col in out_id.columns else (
-                "station_id" if "station_id" in out_id.columns else ("asset_id" if "asset_id" in out_id.columns else None)
-            )
-
-            if sess_station_col:
-                out_id[sess_station_col] = out_id[sess_station_col].astype(str)
-
-            if "transaction_id" in out_id.columns:
-                out_id["transaction_id"] = out_id["transaction_id"].astype(str)
-
-            if "ID Tag" in out_id.columns:
-                out_id["ID Tag"] = out_id["ID Tag"].astype(str)
-
-            # 1) Merge by transaction_id when available
-            if txn_lookup is not None and sess_station_col and "transaction_id" in out_id.columns:
-                out_id = out_id.merge(
-                    txn_lookup,
-                    how="left",
-                    left_on=[sess_station_col, "transaction_id"],
-                    right_on=["station_id", "transaction_id"],
-                    suffixes=("", "_txn"),
-                )
-
-            # 2) Fallback by VID token (ID Tag)
-            if vid_lookup is not None and "ID Tag" in out_id.columns:
-                out_id = out_id.merge(
-                    vid_lookup,
-                    how="left",
-                    left_on="ID Tag",
-                    right_on="id_tag_vid",
-                    suffixes=("", "_vid"),
-                )
-
-            # 3) Final fallback by effective token (rare, but supports non-VID sessions)
-            if eff_lookup is not None and "ID Tag" in out_id.columns:
-                out_id = out_id.merge(
-                    eff_lookup,
-                    how="left",
-                    left_on="ID Tag",
-                    right_on="id_tag_effective",
-                    suffixes=("", "_eff"),
-                )
-
-            # Coalesce method/confidence/effective token from txn -> vid -> eff
-            def _coalesce_cols(df: pd.DataFrame, base: str, candidates: list[str]) -> None:
-                if base not in df.columns:
-                    df[base] = pd.NA
-                s = df[base]
-                for c in candidates:
-                    if c in df.columns:
-                        s = s.where(s.notna() & (s.astype(str).str.lower() != "nan"), df[c])
-                df[base] = s
-
-            _coalesce_cols(out_id, "_auth_method", ["authorization_method", "authorization_method_txn", "authorization_method_vid", "authorization_method_eff"])
-            _coalesce_cols(out_id, "_auth_conf", ["confidence", "confidence_txn", "confidence_vid", "confidence_eff"])
-            _coalesce_cols(out_id, "_auth_effective", ["id_tag_effective", "id_tag_effective_txn", "id_tag_effective_vid"])
-
-            # Populate export columns
-            out_id["Auth Method (guess)"] = out_id.get("Auth Method (guess)", pd.NA)
-            out_id["Auth Method (guess)"] = out_id["Auth Method (guess)"].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
-            out_id["Auth Method (guess)"] = out_id["Auth Method (guess)"].where(out_id["Auth Method (guess)"].notna(), out_id["_auth_method"])
-
-            if "Auth Method Confidence" not in out_id.columns:
-                out_id["Auth Method Confidence"] = out_id["_auth_conf"]
-            else:
-                out_id["Auth Method Confidence"] = out_id["Auth Method Confidence"].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
-                out_id["Auth Method Confidence"] = out_id["Auth Method Confidence"].where(out_id["Auth Method Confidence"].notna(), out_id["_auth_conf"])
-
-            # Prefer showing the effective token in Authorize (raw) when available.
-            # Only overwrite when current value is missing OR is a VID:* token.
-            if "Authorize (raw)" in out_id.columns:
-                eff = out_id["_auth_effective"] if "_auth_effective" in out_id.columns else pd.NA
-                try:
-                    is_vid = out_id["Authorize (raw)"].astype(str).str.startswith("VID:")
-                except Exception:
-                    is_vid = False
-                out_id["Authorize (raw)"] = out_id["Authorize (raw)"].where(
-                    out_id["Authorize (raw)"].notna() & (~is_vid),
-                    eff,
-                )
-
-            # Clean up temporary/join columns (keep transaction_id/connector_id for reporting)
-            drop_extra = [
-                "station_id",
-                "station_id_txn",
-                "id_tag_vid",
-                "id_tag_effective",
-                "id_tag_effective_txn",
-                "id_tag_effective_vid",
-                "authorization_method",
-                "authorization_method_txn",
-                "authorization_method_vid",
-                "authorization_method_eff",
-                "confidence",
-                "confidence_txn",
-                "confidence_vid",
-                "confidence_eff",
-                "_auth_method",
-                "_auth_conf",
-                "_auth_effective",
-            ]
-            out = out_id.drop(columns=[c for c in drop_extra if c in out_id.columns], errors="ignore")
-
-        except Exception:
-            # If anything goes wrong, keep export working without auth enrichment.
-            pass
-
-
-    # Normalize placeholder strings that can appear after merges
-    for c in ["Auth Method (guess)", "Auth Method Confidence"]:
-        if c in out.columns:
-            out[c] = out[c].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
-
-    # Final fallback heuristic: fill anything still missing.
-    # IMPORTANT: If authorize_methods_df was provided and produced values,
-    # we do NOT overwrite those with heuristics.
-    if (
-        "Auth Method (guess)" not in out.columns
-        or out["Auth Method (guess)"].isna().any()
-        or (out["Auth Method (guess)"].astype(str).str.lower() == "nan").any()
-    ):
-        def _guess_auth_method(x: Any) -> str:
-            try:
-                s = str(x)
-            except Exception:
-                return "Unknown"
-            if not s or s.lower() == "nan":
-                return "Unknown"
-            if s.startswith("VID:"):
-                return "AutoCharge"
-            # 14-char hex tokens match CC reader in LynkWell-confirmed data
-            if re.fullmatch(r"[0-9A-Fa-f]{14}", s):
-                return "CC"
-            # 20-char opaque A–Z0–9 tokens match App authorization
-            if re.fullmatch(r"[A-Z0-9]{20}", s):
-                return "App"
-            # other common RFID-like hex tokens
-            if re.fullmatch(r"[0-9A-Fa-f]{8,32}", s):
-                return "RFID"
-            return "Unknown"
-
-        if "ID Tag" in out.columns:
-            guessed = out["ID Tag"].apply(_guess_auth_method)
-            if "Auth Method (guess)" not in out.columns:
-                out["Auth Method (guess)"] = guessed
-            else:
-                out["Auth Method (guess)"] = out["Auth Method (guess)"].fillna(guessed)
-
+    # --- SoC normalisation (percent → fraction for Excel percentage formatting) ---
     def _soc_to_fraction(val: Any) -> Any:
         try:
             x = float(val)
@@ -532,10 +282,8 @@ def prep_sessions_sheet(
             return val
         if pd.isna(x):
             return x
-        # Already fraction
         if 0.0 <= x <= 1.0:
             return x
-        # Percent -> fraction
         if 1.0 < x <= 100.0:
             return x / 100.0
         return x
@@ -544,62 +292,183 @@ def prep_sessions_sheet(
         if soc_col in out.columns:
             out[soc_col] = out[soc_col].apply(_soc_to_fraction)
 
-    # Flag attempted/failed sessions (keeps them visible in export without forcing them into totals).
-    # Convention: anything under 1 kWh is considered an "attempt" for reporting.
-    if "Energy Delivered (kWh)" in out.columns:
+    # --- Authorization enrichment ---
+    # Populate two columns from the authorize_methods table:
+    #   Authorize (raw)  — id_tag presented at the charger (app token / CC token / VID)
+    #   Auth Method      — "App", "CC", or "AutoCharge" pulled directly from the DB;
+    #                      heuristic fallback only for unmatched rows
+    #
+    # Root cause of previous blank column: sessions have VID tokens in ID Tag;
+    # old code replaced them with id_tag_effective from the join, but many
+    # authorize_methods rows have null transaction_id so the join produced no match
+    # → the VID got replaced with NaN → blank export column.
+    #
+    # Fix: pull id_tag (not id_tag_effective) and use a clean two-step join.
+
+    def _clean_str(series: pd.Series) -> pd.Series:
+        """Strip and blank-out null-like strings for reliable joining."""
+        return series.astype(str).str.strip().replace({"nan": "", "None": "", "none": "", "NaN": ""})
+
+    if authorize_methods_df is not None and not authorize_methods_df.empty:
         try:
-            out["Attempted (<1 kWh)"] = pd.to_numeric(out["Energy Delivered (kWh)"], errors="coerce").fillna(0) < 1
+            am = authorize_methods_df.copy()
+            if "station_id" not in am.columns and "asset_id" in am.columns:
+                am = am.rename(columns={"asset_id": "station_id"})
+
+            # Normalise join-key columns
+            for col in ["station_id", "transaction_id", "id_tag_vid"]:
+                if col in am.columns:
+                    am[col] = _clean_str(am[col])
+
+            # Determine session station_id column
+            sess_sid = station_col if station_col and station_col in out.columns else \
+                _first_existing(out, ["station_id", "asset_id"])
+
+            work = out.copy()
+            if sess_sid and sess_sid in work.columns:
+                work[sess_sid] = _clean_str(work[sess_sid])
+            if "transaction_id" in work.columns:
+                work["transaction_id"] = _clean_str(work["transaction_id"])
+            if "ID Tag" in work.columns:
+                work["ID Tag"] = _clean_str(work["ID Tag"])
+
+            work["_auth_matched"] = False
+
+            # --- Join 1: (station_id, transaction_id) ---
+            # Reliable for all sessions that completed a transaction.
+            if sess_sid and "transaction_id" in am.columns and "transaction_id" in work.columns:
+                am_txn = (
+                    am[am["transaction_id"].str.len() > 0]
+                    [[c for c in ["station_id", "transaction_id", "id_tag", "authorization_method"] if c in am.columns]]
+                    .drop_duplicates(subset=["station_id", "transaction_id"], keep="last")
+                )
+                if not am_txn.empty:
+                    merged = work.merge(
+                        am_txn.rename(columns={"id_tag": "_am_tag", "authorization_method": "_am_method"}),
+                        how="left",
+                        left_on=[sess_sid, "transaction_id"],
+                        right_on=["station_id", "transaction_id"],
+                        suffixes=("", "_amj"),
+                    )
+                    # Drop the extra station_id column produced by the merge
+                    merged = merged.drop(columns=[c for c in ["station_id_amj", "station_id"] if c in merged.columns and c != sess_sid], errors="ignore")
+                    matched = (
+                        merged["_am_tag"].notna()
+                        & (merged["_am_tag"].astype(str).str.lower() != "nan")
+                        & (merged["_am_tag"].astype(str) != "")
+                    )
+                    work.loc[matched.values, "Authorize (raw)"] = merged.loc[matched, "_am_tag"].values
+                    work.loc[matched.values, "Auth Method"] = merged.loc[matched, "_am_method"].values
+                    work.loc[matched.values, "_auth_matched"] = True
+
+            # --- Join 2: ID Tag → id_tag_vid ---
+            # Catches VID-initiated sessions where transaction_id was null in authorize_methods.
+            if "id_tag_vid" in am.columns and "ID Tag" in work.columns:
+                am_vid = (
+                    am[am["id_tag_vid"].str.len() > 0]
+                    [[c for c in ["id_tag_vid", "id_tag", "authorization_method"] if c in am.columns]]
+                    .drop_duplicates(subset=["id_tag_vid"], keep="last")
+                    .rename(columns={"id_tag": "_am_tag_vid", "authorization_method": "_am_method_vid"})
+                )
+                if not am_vid.empty:
+                    unmatched = ~work["_auth_matched"]
+                    if unmatched.any():
+                        merged_vid = work[unmatched].merge(
+                            am_vid, how="left", left_on="ID Tag", right_on="id_tag_vid"
+                        )
+                        vid_matched = (
+                            merged_vid["_am_tag_vid"].notna()
+                            & (merged_vid["_am_tag_vid"].astype(str).str.lower() != "nan")
+                            & (merged_vid["_am_tag_vid"].astype(str) != "")
+                        )
+                        um_idx = work[unmatched].index
+                        work.loc[um_idx[vid_matched.values], "Authorize (raw)"] = merged_vid.loc[vid_matched, "_am_tag_vid"].values
+                        work.loc[um_idx[vid_matched.values], "Auth Method"] = merged_vid.loc[vid_matched, "_am_method_vid"].values
+                        work.loc[um_idx[vid_matched.values], "_auth_matched"] = True
+
+            work = work.drop(columns=["_auth_matched"], errors="ignore")
+            out = work
+
         except Exception:
             pass
 
-    # Drop columns Kris called redundant
-    # - Connector number (often connector_id or connector_number)
-    # - Remove connector_id only if both connector type and transaction id are present
+    # --- Fallback heuristic for unmatched rows ---
+    # Only fills Auth Method when the DB join left it blank.
+    # Patterns confirmed against LynkWell authorize_methods data:
+    #   VID:*               → AutoCharge  (vehicle-initiated)
+    #   14-char hex         → CC          (payment terminal / credit card)
+    #   20-char A-Z0-9      → App         (mobile app token)
+    def _guess_auth_method(x: Any) -> str:
+        try:
+            s = str(x).strip()
+        except Exception:
+            return "Unknown"
+        if not s or s.lower() in ("nan", "none", ""):
+            return "Unknown"
+        if s.startswith("VID:"):
+            return "AutoCharge"
+        if re.fullmatch(r"[0-9A-Fa-f]{14}", s):
+            return "CC"
+        if re.fullmatch(r"[A-Z0-9]{20}", s):
+            return "App"
+        if re.fullmatch(r"[0-9A-Fa-f]{8,32}", s):
+            return "RFID"
+        return "Unknown"
+
+    if "ID Tag" in out.columns:
+        need_guess = (
+            "Auth Method" not in out.columns
+            or out["Auth Method"].isna()
+            | out["Auth Method"].astype(str).str.lower().isin(["nan", "none", ""])
+        )
+        if need_guess.any() if hasattr(need_guess, "any") else need_guess:
+            guessed = out["ID Tag"].apply(_guess_auth_method)
+            if "Auth Method" not in out.columns:
+                out["Auth Method"] = guessed
+            else:
+                mask = out["Auth Method"].isna() | out["Auth Method"].astype(str).str.lower().isin(["nan", "none", ""])
+                out.loc[mask, "Auth Method"] = guessed[mask]
+
+    # --- Drop unwanted columns ---
     drop_cols = []
+    # Connector number variants (always remove)
     drop_cols += [c for c in ["connector_num", "connector_number", "connector", "Connector #"] if c in out.columns]
-
-    # Keep connector_id for reporting (Kris wants it in the export).
-    has_connector_type = any(c in out.columns for c in ["connector_type", "Connector Type"])
-    has_txn = any(c in out.columns for c in ["transaction_id", "Transaction ID"])
-    # Intentionally do NOT drop connector_id.
-
-    # Remove the raw station id columns if we have friendly EVSE,
-    # but only if the column is exactly asset_id or station_id
+    # connector_id — removed per user request (Connector Type is sufficient)
+    drop_cols += [c for c in ["connector_id", "Connector ID"] if c in out.columns]
+    # Columns removed per user request
+    drop_cols += [c for c in ["Outcome", "outcome", "Attempted (<1 kWh)", "Auth Method Confidence",
+                               "Auth Method (guess)"] if c in out.columns]
+    # Raw station id when friendly EVSE name is present
     if "EVSE" in out.columns and station_col in {"station_id", "asset_id"} and station_col in out.columns:
         drop_cols.append(station_col)
-
-    # Also drop any explicitly requested "asset_id" column
     if "asset_id" in out.columns:
         drop_cols.append("asset_id")
+    # Leftover join columns
+    drop_cols += [c for c in ["authorization_method", "id_tag_vid", "id_tag_effective",
+                               "id_tag_effective_txn", "id_tag_effective_vid",
+                               "confidence"] if c in out.columns]
 
     out = out.drop(columns=[c for c in drop_cols if c in out.columns], errors="ignore")
 
-    # Prefer a stable export column order.
+    # --- Final column ordering ---
     preferred = [
         "Start Time (local)",
         "End Time (local)",
         "EVSE",
         "Connector Type",
         "Max Power (kW)",
-        "Energy Delivered (kWh)",
         "Duration (min)",
+        "Energy Delivered (kWh)",
         "SoC Start (%)",
         "SoC End (%)",
         "SoC Start",
         "SoC End",
         "ID Tag",
         "Authorize (raw)",
-        "Auth Method (guess)",
-        "Auth Method Confidence",
+        "Auth Method",
         "Estimated Revenue ($)",
         "transaction_id",
-        "connector_id",
-        # Add the new flag at the end of preferred columns
-        "Attempted (<1 kWh)",
-    ]
-
-    # Some datasets use different casing/labels; allow those too.
-    preferred += [
+        # Alternate column name variants (pushed to end if present)
         "connector_type",
         "max_power_kw",
         "Max Power",
@@ -610,19 +479,9 @@ def prep_sessions_sheet(
         "soc_end",
         "id_tag",
         "Transaction ID",
-        "Connector ID",
     ]
 
     out = _order_cols(out, preferred)
-
-    # If connector_id exists, place it immediately after transaction_id if both exist.
-    cols = list(out.columns)
-    if "connector_id" in cols:
-        if "transaction_id" in cols:
-            cols.remove("connector_id")
-            cols.insert(cols.index("transaction_id") + 1, "connector_id")
-            out = out[cols]
-
     return out
 
 
