@@ -215,7 +215,7 @@ def render_sidebar(*, allowed_evse_ids: Optional[list[str]] = None, user_email_o
 
 def sessions_table_single_select(session_summary: pd.DataFrame):
     """
-    Render the sessions table with a single-select checkbox column and return
+    Render the sessions table with single-row selection and return
     (station_id, transaction_id) for the selected row. If nothing is selected,
     the newest (top) session is used.
 
@@ -245,21 +245,13 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
     ]
     show_cols = [c for c in show_cols if c in df.columns]
 
-    # Stable key to track selection across reruns
-    df["__session_key__"] = df["station_id"].astype(str) + "|" + df["transaction_id"].astype(str)
-
-    # Use a session-scoped key so we can control which row is selected on each rerun
-    prev_selected_key = st.session_state.get("v2_selected_session_key", "")
-    df["__sel__"] = df["__session_key__"].eq(prev_selected_key)
-
-    edited = st.data_editor(
-        df[["__sel__"] + show_cols],
+    event = st.dataframe(
+        df[show_cols],
         hide_index=True,
         use_container_width=True,
+        on_select="rerun",
+        selection_mode="single-row",
         column_config={
-            "__sel__": st.column_config.CheckboxColumn(
-                " ", help="Select a session to show details below", default=False
-            ),
             "connector_id": st.column_config.NumberColumn("Connector #", help="Connector on EVSE", format="%d"),
             "Max Power (kW)": st.column_config.NumberColumn("Max Power (kW)", format="%.2f"),
             "Energy Delivered (kWh)": st.column_config.NumberColumn("Energy Delivered (kWh)", format="%.2f"),
@@ -272,20 +264,11 @@ def sessions_table_single_select(session_summary: pd.DataFrame):
                 help="Calculated as: Connection Fee + (kWh * Price/kWh) + (Min * Price/Min)",
             ),
         },
-        disabled=[c for c in show_cols],
         height=480,
-        key="v2_sessions_editor",
     )
 
-    # Enforce single-select in logic (UI may still briefly show multiple checks)
-    sel_idx = edited.index[edited["__sel__"] == True].tolist()
-    if sel_idx:
-        chosen_idx = sel_idx[-1]
-    else:
-        chosen_idx = edited.index[0]
+    selected_rows = event.selection.rows
+    chosen_idx = selected_rows[0] if selected_rows else 0
 
-    chosen_key = df.loc[chosen_idx, "__session_key__"]
-    st.session_state["v2_selected_session_key"] = chosen_key
-
-    sid, tx = chosen_key.split("|", 1)
-    return sid, tx
+    row = df.iloc[chosen_idx]
+    return str(row["station_id"]), str(row["transaction_id"])
