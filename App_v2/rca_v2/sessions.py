@@ -1,18 +1,27 @@
 import numpy as np
 import pandas as pd
 import os
+import time
 
 from .config import AK_TZ
 from .constants import EVSE_LOCATION, CONNECTOR_TYPE
 
 
+# Module-level pricing cache — pricing changes rarely so a 1-hour TTL avoids
+# a DB round trip on every sessions cache refresh without going stale.
+_pricing_cache: dict = {"df": None, "ts": 0.0}
+_PRICING_TTL = 3600.0  # seconds
+
 
 def _load_evse_pricing_from_db() -> pd.DataFrame:
     """Best-effort loader for public.evse_pricing from Postgres.
 
-    Used by build_sessions() when the caller does not provide pricing_df.
-    If DATABASE_URL is missing or DB libs are unavailable, returns empty.
+    Results are cached in-process for _PRICING_TTL seconds so that the
+    sessions cache refreshing every 5 minutes doesn't trigger a DB round trip.
     """
+    now = time.monotonic()
+    if _pricing_cache["df"] is not None and (now - _pricing_cache["ts"]) < _PRICING_TTL:
+        return _pricing_cache["df"]
     try:
         db_url = os.environ.get('DATABASE_URL')
         if not db_url:
@@ -35,6 +44,8 @@ def _load_evse_pricing_from_db() -> pd.DataFrame:
         for c in ("effective_start", "effective_end"):
             if c in df.columns:
                 df[c] = pd.to_datetime(df[c], errors="coerce", utc=True)
+        _pricing_cache["df"] = df
+        _pricing_cache["ts"] = now
         return df
     except Exception:
         return pd.DataFrame()

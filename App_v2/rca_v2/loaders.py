@@ -955,27 +955,38 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             max_rows,
         )
 
-        placeholders = _make_placeholders(len(stations)) if stations else ""
         between = _between_placeholders()
 
-        # Broaden to allow both direct and webhook-wrapped StatusNotification events.
-        station_expr = "COALESCE(asset_id, action_payload->'data'->'asset'->>'id')"
+        # Rewrite station filter as an OR split instead of COALESCE(asset_id, ...) IN (...)
+        # so Postgres can use the idx_oe_asset_action_received index on asset_id directly.
+        # COALESCE in the WHERE clause prevents index usage; OR allows a bitmap index scan.
         is_statusnotification = "(action = 'StatusNotification' OR (action IS NULL AND action_payload->'data'->'log'->>'action' = 'StatusNotification'))"
 
+        if stations:
+            ph = _make_placeholders(len(stations))
+            station_filter = f"""(
+                asset_id IN ({ph})
+                OR (asset_id IS NULL AND action_payload->'data'->'asset'->>'id' IN ({ph}))
+            ) AND """
+            station_params = list(stations) + list(stations)
+        else:
+            station_filter = ""
+            station_params = []
+
         sql = f"""
-          SELECT {station_expr} AS station_id,
+          SELECT COALESCE(asset_id, action_payload->'data'->'asset'->>'id') AS station_id,
                  connector_id,
                  {_ts_col()} AS timestamp,
                  (action_payload->>'status') AS status,
                  (action_payload->>'errorCode') AS error_code,
                  (action_payload->>'vendorErrorCode') AS vendor_error_code
           FROM ocpp_events
-          WHERE { (f"{station_expr} IN ({placeholders}) AND " if stations else "") } {is_statusnotification}
+          WHERE {station_filter}{is_statusnotification}
             AND {_ts_col()} BETWEEN {between}
           ORDER BY {_ts_col()} DESC
           {limit_clause}
         """
-        params = (list(stations) if stations else []) + [start_utc, end_utc]
+        params = station_params + [start_utc, end_utc]
 
         conn = get_conn()
         try:
@@ -988,20 +999,14 @@ def load_status_history(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
             try:
                 conn2 = get_conn()
                 cur = conn2.cursor()
-                # Build the same WHERE clause, but only return counts + min/max.
-                where_station = ""
-                params2 = []
-                if stations:
-                    where_station = f"{station_expr} IN ({placeholders}) AND "
-                    params2.extend(list(stations))
-                params2.extend([start_utc, end_utc])
+                params2 = station_params + [start_utc, end_utc]
 
                 diag_sql = f"""
                   SELECT count(*) AS n,
                          min({_ts_col()}) AS min_ts,
                          max({_ts_col()}) AS max_ts
                   FROM ocpp_events
-                  WHERE {where_station}{is_statusnotification}
+                  WHERE {station_filter}{is_statusnotification}
                     AND {_ts_col()} BETWEEN {between}
                 """
                 cur.execute(diag_sql, tuple(params2))
@@ -1210,23 +1215,35 @@ def load_connectivity(stations, start_utc: str, end_utc: str) -> pd.DataFrame:
         # Supabase/Postgres: derive connectivity from OCPP events.
         # Autel: Heartbeat + BootNotification
         # Tritium: MeterValues + BootNotification (treat MeterValues as heartbeat)
-        placeholders = _make_placeholders(len(stations)) if stations else ""
         between = _between_placeholders()
 
-        station_expr = "COALESCE(asset_id, action_payload->'data'->'asset'->>'id')"
-        action_expr = "COALESCE(action, action_payload->'data'->'log'->>'action')"
-        is_relevant = f"{action_expr} IN ('BootNotification','Heartbeat','MeterValues')"
+        # OR-split station filter so Postgres can use idx_oe_asset_action_received
+        # on the asset_id branch instead of evaluating COALESCE row-by-row.
+        # OR-split action filter for the same reason (enables idx_oe_action_received).
+        if stations:
+            ph = _make_placeholders(len(stations))
+            station_filter = f"""(
+                asset_id IN ({ph})
+                OR (asset_id IS NULL AND action_payload->'data'->'asset'->>'id' IN ({ph}))
+            ) AND """
+            station_params = list(stations) + list(stations)
+        else:
+            station_filter = ""
+            station_params = []
 
         sql = f"""
-          SELECT {station_expr} AS station_id,
-                 {action_expr} AS event,
+          SELECT COALESCE(asset_id, action_payload->'data'->'asset'->>'id') AS station_id,
+                 COALESCE(action, action_payload->'data'->'log'->>'action') AS event,
                  {_ts_col()} AS timestamp
           FROM ocpp_events
-          WHERE { (f"{station_expr} IN ({placeholders}) AND " if stations else "") } {is_relevant}
+          WHERE {station_filter}(
+              action IN ('BootNotification','Heartbeat','MeterValues')
+              OR (action IS NULL AND action_payload->'data'->'log'->>'action' IN ('BootNotification','Heartbeat','MeterValues'))
+          )
             AND {_ts_col()} BETWEEN {between}
           ORDER BY {_ts_col()} DESC
         """
-        params = (list(stations) if stations else []) + [start_utc, end_utc]
+        params = station_params + [start_utc, end_utc]
 
         conn = get_conn()
         try:
