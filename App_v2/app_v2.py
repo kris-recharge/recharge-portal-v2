@@ -1,5 +1,6 @@
 import os
 import json
+import concurrent.futures as _cf
 
 import streamlit as st
 st.set_page_config(page_title="ReCharge Alaska — Portal v2", layout="wide")
@@ -528,16 +529,48 @@ TAB_TITLES = ["Charging Sessions", "Status History", "Connectivity", "Data Expor
 if can_admin:
     TAB_TITLES.append("Admin")
 
+# --------------------------------------------------------------------------
+# Parallel data prefetch
+# Compute stations_key once and fire all three loaders concurrently so that
+# overall wall-clock time is max(each_loader) instead of sum(all_loaders).
+# Each loader opens its own DB connection; they don't share state.
+# --------------------------------------------------------------------------
+stations_key = _make_station_key(stations)
+
+_prefetch_mv     = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+_prefetch_status = pd.DataFrame()
+_prefetch_conn   = pd.DataFrame()
+
+try:
+    with _cf.ThreadPoolExecutor(max_workers=3) as _pool:
+        _f_mv     = _pool.submit(load_mv_auth_and_sessions, stations_key, start_utc, end_utc)
+        _f_status = _pool.submit(cached_status_history,     stations_key, start_utc, end_utc)
+        _f_conn   = _pool.submit(cached_connectivity,       stations_key, start_utc, end_utc)
+        try:
+            _prefetch_mv = _f_mv.result()
+        except Exception:
+            _prefetch_mv = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+        try:
+            _prefetch_status = _f_status.result()
+        except Exception:
+            _prefetch_status = pd.DataFrame()
+        try:
+            _prefetch_conn = _f_conn.result()
+        except Exception:
+            _prefetch_conn = pd.DataFrame()
+except Exception:
+    # Fallback: sequential loading if threading is unavailable
+    _prefetch_mv     = load_mv_auth_and_sessions(stations_key, start_utc, end_utc)
+    _prefetch_status = cached_status_history(stations_key, start_utc, end_utc)
+    _prefetch_conn   = cached_connectivity(stations_key, start_utc, end_utc)
+
 _tabs = st.tabs(TAB_TITLES)
 t1, t2, t3, t4 = _tabs[0], _tabs[1], _tabs[2], _tabs[3]
 t_admin = _tabs[4] if can_admin and len(_tabs) > 4 else None
 
 with t1:
     st.subheader("Charging Sessions")
-    with st.spinner("Loading data…"):
-        # Use a cached loader so that interactive clicks re-use data for the same filters.
-        stations_key = _make_station_key(stations)
-        mv, auth, sess, heat = load_mv_auth_and_sessions(stations_key, start_utc, end_utc)
+    mv, auth, sess, heat = _prefetch_mv
     # Defensive: re-apply EVSE filter at the session level (guards against loader quirks)
     if isinstance(stations, (list, tuple, set)) and len(stations) > 0 and "station_id" in sess.columns:
         _wanted = {str(s) for s in stations}
@@ -891,8 +924,7 @@ with t2:
     with c2:
         show_fault_status = st.checkbox("Show Fault Status", value=False)
 
-    stations_key = _make_station_key(stations)
-    status_df = cached_status_history(stations_key, start_utc, end_utc)
+    status_df = _prefetch_status
     if status_df.empty:
         st.info("No status notifications in this window for the selected EVSE.")
     else:
@@ -971,8 +1003,7 @@ with t2:
 
 with t3:
     st.subheader("Connectivity")
-    stations_key = _make_station_key(stations)
-    conn_df = cached_connectivity(stations_key, start_utc, end_utc)
+    conn_df = _prefetch_conn
     if conn_df.empty:
         st.info("No connectivity events in this window.")
     else:
