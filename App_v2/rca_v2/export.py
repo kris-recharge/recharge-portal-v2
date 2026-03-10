@@ -298,12 +298,15 @@ def prep_sessions_sheet(
     #   Auth Method      — "App", "CC", or "AutoCharge" pulled directly from the DB;
     #                      heuristic fallback only for unmatched rows
     #
-    # Root cause of previous blank column: sessions have VID tokens in ID Tag;
-    # old code replaced them with id_tag_effective from the join, but many
-    # authorize_methods rows have null transaction_id so the join produced no match
-    # → the VID got replaced with NaN → blank export column.
+    # Three-step join to populate Authorize (raw) and Auth Method from
+    # public.authorize_methods:
     #
-    # Fix: pull id_tag (not id_tag_effective) and use a clean two-step join.
+    #   Join 1 – (station_id, transaction_id)   : sessions with a transaction ID
+    #   Join 2 – ID Tag → id_tag_vid            : VID-initiated sessions
+    #   Join 3 – (station_id, ID Tag) → id_tag  : direct token match (CC/App
+    #                                              without prior VID pre-auth)
+    #
+    # Each join only runs on rows still unmatched by the previous step.
 
     def _clean_str(series: pd.Series) -> pd.Series:
         """Strip and blank-out null-like strings for reliable joining."""
@@ -385,6 +388,37 @@ def prep_sessions_sheet(
                         work.loc[um_idx[vid_matched.values], "Authorize (raw)"] = merged_vid.loc[vid_matched, "_am_tag_vid"].values
                         work.loc[um_idx[vid_matched.values], "Auth Method"] = merged_vid.loc[vid_matched, "_am_method_vid"].values
                         work.loc[um_idx[vid_matched.values], "_auth_matched"] = True
+
+            # --- Join 3: (station_id, ID Tag) → (station_id, id_tag) ---
+            # Catches sessions where the ID Tag IS the raw authorization token
+            # (e.g. CC card tapped without a prior VID pre-auth, or App token
+            # presented directly).  Only runs on rows still unmatched after
+            # Joins 1 & 2.
+            if sess_sid and "id_tag" in am.columns and "ID Tag" in work.columns:
+                am_direct = (
+                    am[am["id_tag"].str.len() > 0]
+                    [[c for c in ["station_id", "id_tag", "authorization_method"] if c in am.columns]]
+                    .drop_duplicates(subset=["station_id", "id_tag"], keep="last")
+                    .rename(columns={"id_tag": "_am_tag_direct", "authorization_method": "_am_method_direct"})
+                )
+                if not am_direct.empty:
+                    unmatched = ~work["_auth_matched"]
+                    if unmatched.any():
+                        merged_direct = work[unmatched].merge(
+                            am_direct,
+                            how="left",
+                            left_on=[sess_sid, "ID Tag"],
+                            right_on=["station_id", "_am_tag_direct"],
+                        )
+                        direct_matched = (
+                            merged_direct["_am_tag_direct"].notna()
+                            & (merged_direct["_am_tag_direct"].astype(str).str.lower() != "nan")
+                            & (merged_direct["_am_tag_direct"].astype(str) != "")
+                        )
+                        um_idx = work[unmatched].index
+                        work.loc[um_idx[direct_matched.values], "Authorize (raw)"] = merged_direct.loc[direct_matched, "_am_tag_direct"].values
+                        work.loc[um_idx[direct_matched.values], "Auth Method"] = merged_direct.loc[direct_matched, "_am_method_direct"].values
+                        work.loc[um_idx[direct_matched.values], "_auth_matched"] = True
 
             work = work.drop(columns=["_auth_matched"], errors="ignore")
             out = work
