@@ -407,6 +407,7 @@ def _load_authorize_methods_for_export(stations, start_iso: str, end_iso: str) -
         transaction_id::text AS transaction_id,
         authorize_received_at,
         id_tag,
+        id_tag_vid,
         authorization_method,
         confidence
       FROM public.authorize_methods
