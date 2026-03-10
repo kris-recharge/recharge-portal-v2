@@ -225,7 +225,7 @@ def prep_sessions_sheet(
 
     Columns produced (in order):
       Start Time (local) | End Time (local) | EVSE | Connector Type |
-      Max Power (kW) | Duration (min) | Energy Delivered (kWh) |
+      Max Power (kW) | Energy Delivered (kWh) | Duration (min) |
       SoC Start (%) | SoC End (%) | ID Tag | Authorize (raw) | Auth Method |
       Estimated Revenue ($) | transaction_id
 
@@ -457,8 +457,8 @@ def prep_sessions_sheet(
         "EVSE",
         "Connector Type",
         "Max Power (kW)",
-        "Duration (min)",
         "Energy Delivered (kWh)",
+        "Duration (min)",
         "SoC Start (%)",
         "SoC End (%)",
         "SoC Start",
