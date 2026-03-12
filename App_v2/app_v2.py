@@ -1072,6 +1072,7 @@ with t3:
                 st.info("No BootNotification events in this window for the selected EVSE.")
             else:
                 outages = pd.DataFrame(rows)
+                outages = outages.sort_values("Date/Time (AK Local)", ascending=False, kind="mergesort")
                 st.dataframe(outages, use_container_width=True, hide_index=True)
 
                 # Outage frequency summary
